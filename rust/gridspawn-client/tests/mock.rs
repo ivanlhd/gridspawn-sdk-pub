@@ -996,10 +996,105 @@ async fn player_assertions() {
         2,
         "never retried"
     );
+    // A refused token is refreshed once and the call repeated; refused again,
+    // the error is returned and the session is kept.
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(token_body(
+            "access-1",
+            "refresh-1",
+            600,
+        )))
+        .mount(&server)
+        .await;
     let error = client.player_assertion(CHALLENGE).await.unwrap_err();
     assert_eq!(api(error).code, ErrorCode::LoginRequired);
+    assert_eq!(
+        requests(&server, "/oauth/token").await.len(),
+        1,
+        "one refresh"
+    );
+    let sent = requests(&server, "/v1/auth/player-assertions").await;
+    assert_eq!(sent.len(), 4);
+    assert_eq!(sent[3].headers["authorization"], "Bearer access-1");
     assert!(client.is_signed_in());
     assert_no_origin(&server).await;
+}
+
+/// The rule: nothing depends on this machine's clock agreeing with the
+/// servers. A session stored while the clock was an hour ahead (or restored
+/// after the clock was set back) looks fresh locally although the token is
+/// expired; the service refuses it, and the client refreshes once and goes on.
+#[tokio::test]
+async fn a_token_the_local_clock_thinks_fresh_is_refreshed_when_refused() {
+    let server = server().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(token_body(
+            "access-1",
+            "refresh-1",
+            600,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/player-assertions"))
+        .and(header("authorization", "Bearer access-1"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "playerAssertion": "assertion-1", "tokenType": "t", "expiresIn": 60
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/player-assertions"))
+        .respond_with(auth_error(401, "login_required", "auth/login_required"))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/v1/presence"))
+        .and(header("authorization", "Bearer access-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true, "expiresAt": 1})))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/v1/presence"))
+        .respond_with(edge_error(401, "presence/token_invalid"))
+        .mount(&server)
+        .await;
+
+    // Stored with an hour left by the local clock: no refresh at restore.
+    let client = client(&server, store_with(stored(3600, "refresh-0"))).await;
+    client.restore().await.unwrap();
+    assert!(requests(&server, "/oauth/token").await.is_empty());
+    let assertion = client.player_assertion(CHALLENGE).await.unwrap();
+    assert_eq!(assertion.as_str(), "assertion-1");
+    assert_eq!(requests(&server, "/oauth/token").await.len(), 1);
+    // From now on the new token is used; no second refresh.
+    client.player_assertion(CHALLENGE).await.unwrap();
+    assert_eq!(requests(&server, "/oauth/token").await.len(), 1);
+
+    // Presence on the player's token: the same rule (presence/token_invalid).
+    let client = self::client(&server, store_with(stored(3600, "refresh-0"))).await;
+    client.restore().await.unwrap();
+    let presence = client.presence();
+    presence
+        .set(gridspawn_client::Presence::new().details("Skewed clock"))
+        .await
+        .unwrap();
+    assert_eq!(requests(&server, "/oauth/token").await.len(), 2);
+    assert_no_origin(&server).await;
+}
+
+/// The other direction: a session stored while the clock was behind looks
+/// expired locally; restore refreshes it (no harm), and nothing fails.
+#[tokio::test]
+async fn a_token_the_local_clock_thinks_expired_is_refreshed_at_restore() {
+    let server = assertion_server(Duration::ZERO).await;
+    let client = client(&server, store_with(stored(-3600, "refresh-0"))).await;
+    client.restore().await.unwrap();
+    assert_eq!(requests(&server, "/oauth/token").await.len(), 1);
+    client.player_assertion(CHALLENGE).await.unwrap();
+    assert_eq!(requests(&server, "/oauth/token").await.len(), 1);
 }
 
 // ---- sessions ---------------------------------------------------------------
@@ -1469,6 +1564,16 @@ async fn presence_re_send_retries_429_and_stops_on_a_refusal() {
         .respond_with(edge_error(401, "presence/token_invalid"))
         .mount(&server)
         .await;
+    // A refused token is refreshed once and the update repeated (refused again here).
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(token_body(
+            "access-1",
+            "refresh-1",
+            600,
+        )))
+        .mount(&server)
+        .await;
     let client = client(&server, store_with(stored(3600, "refresh-0"))).await;
     client.restore().await.unwrap();
     let presence = client.presence();
@@ -1492,7 +1597,8 @@ async fn presence_re_send_retries_429_and_stops_on_a_refusal() {
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(!presence.is_active());
-    assert_eq!(requests(&server, PRESENCE).await.len(), 3);
+    assert_eq!(requests(&server, PRESENCE).await.len(), 4);
+    assert_eq!(requests(&server, "/oauth/token").await.len(), 1);
 }
 
 #[tokio::test]

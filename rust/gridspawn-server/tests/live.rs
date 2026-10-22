@@ -9,7 +9,8 @@
 
 use gridspawn_server::{
     AdmitGuest, Client, CreateSession, Credential, Environment, Error, ErrorCode, IdempotencyKey,
-    IdentityKind, Module, Post, Presence,
+    IdentityKind, Module, Post, Presence, Rolloff, VoiceConfig, VoicePlayerState, VoicePosition,
+    VoiceRoom,
 };
 
 fn env(names: &[&str]) -> Option<String> {
@@ -125,6 +126,161 @@ async fn live_test_application() {
         assert_eq!(code(error), ErrorCode::FeatureNotFound);
     }
     eprintln!("club grant ok; post answered feature_not_found as expected");
+}
+
+/// The voice rules against development (the test application has voice on).
+/// Named rooms are off there, so the managed room is `match`. Whether the
+/// rules are enforced once a player joins voice is checked by the voice
+/// crate's live tests, which run a voice client.
+#[tokio::test]
+async fn live_voice_rules() {
+    let (Some(path), Some(app_id)) = (
+        env(&[
+            "GRIDSPAWN_TEST_CREDENTIAL_FILE",
+            "GRIDSPAWN_TEST_SERVER_CREDENTIAL_FILE",
+        ]),
+        env(&["GRIDSPAWN_TEST_APP_ID"]),
+    ) else {
+        eprintln!("skipped: GRIDSPAWN_TEST_CREDENTIAL_FILE / GRIDSPAWN_TEST_APP_ID not set");
+        return;
+    };
+    let credential = Credential::from_file(&path).expect("credential");
+    let client = Client::builder(app_id, Environment::Development, credential)
+        .connect()
+        .await
+        .expect("bootstrap");
+    let create_key = key("rust-voice");
+    let session = client
+        .create_session(CreateSession::new(create_key.as_str(), create_key.clone()))
+        .await
+        .expect("create");
+    let _renewer = session.spawn_renewer();
+    let guest_key = key("rust-voice-guest");
+    let guest = session
+        .admit_guest(AdmitGuest::new(
+            format!("fixture-{}", guest_key.as_str()),
+            "Voice Fixture",
+            guest_key,
+        ))
+        .await
+        .expect("guest");
+    let voice = session.voice();
+
+    let ack = voice
+        .configure(
+            &VoiceConfig::new().room(
+                "match",
+                VoiceRoom::hybrid(2.0, 20.0)
+                    .rolloff(Rolloff::Inverse)
+                    .hysteresis(2.0),
+            ),
+        )
+        .await
+        .expect("configure");
+    eprintln!("configure: {ack:?}");
+    assert!(
+        !ack.enforced,
+        "no player has joined voice: no voice server yet"
+    );
+
+    let ack = voice
+        .set_player_state(&guest.id, &VoicePlayerState::new().channels(["team:red"]))
+        .await
+        .expect("state");
+    assert!(!ack.overtaken);
+    let ack = voice.mute(&guest.id, true).await.expect("mute");
+    eprintln!("state and mute: {ack:?}");
+    voice.mute(&guest.id, false).await.expect("unmute");
+    voice
+        .publish_positions(&[VoicePosition::planar(&guest.id, 1.0, 2.0).yaw(0.5)])
+        .await
+        .expect("positions");
+
+    // The publisher, for half a second.
+    let publisher = voice.spawn_position_publisher(10);
+    publisher
+        .update(&guest.id, [3.0, 0.0, 4.0], Some(0.0))
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert!(
+        publisher.last_error().is_none(),
+        "{:?}",
+        publisher.last_error()
+    );
+    drop(publisher);
+    eprintln!("positions and publisher ok");
+
+    // Refusals: an unknown participant, and an older sequence number.
+    let stranger = gridspawn_server::ParticipantId::new("gsp1.notadmittedhere");
+    assert_eq!(
+        code(
+            voice
+                .set_player_state(&stranger, &VoicePlayerState::new())
+                .await
+                .unwrap_err()
+        ),
+        ErrorCode::VoiceParticipantNotFound
+    );
+    let stale = raw_state(
+        &client_parts(&path),
+        session.id().as_str(),
+        guest.id.as_str(),
+        1,
+    )
+    .await;
+    assert_eq!(stale, (409, "voice/stale_sequence".to_owned()));
+    let unknown_field = raw_state(
+        &client_parts(&path),
+        session.id().as_str(),
+        guest.id.as_str(),
+        0,
+    )
+    .await;
+    assert_eq!(unknown_field, (400, "voice/invalid_request".to_owned()));
+    eprintln!("voice refusals as expected");
+}
+
+/// The server credential's header value and the edge, for the raw requests
+/// that the crate never sends (an old sequence number, an unknown field).
+fn client_parts(path: &str) -> (String, String) {
+    let credential = std::fs::read_to_string(path).expect("credential");
+    (
+        format!("GridspawnServer {}", credential.trim()),
+        "https://sdk.gridspawn.net".to_owned(),
+    )
+}
+
+/// PUT a player state by hand: `seq` 1 (older than anything the crate
+/// sends), or with `seq` 0 an unknown field. Returns (status, error code).
+async fn raw_state(
+    (authorization, base): &(String, String),
+    session: &str,
+    participant: &str,
+    seq: u64,
+) -> (u16, String) {
+    let body = if seq == 0 {
+        serde_json::json!({"channels": [], "unknownField": true})
+    } else {
+        serde_json::json!({"seq": seq, "channels": []})
+    };
+    let response = reqwest::Client::new()
+        .put(format!(
+            "{base}/v1/server/sessions/{session}/participants/{participant}/voice"
+        ))
+        .header("Authorization", authorization)
+        .json(&body)
+        .send()
+        .await
+        .expect("raw request");
+    let status = response.status().as_u16();
+    let value: serde_json::Value = response.json().await.expect("JSON answer");
+    (
+        status,
+        value["error"]["code"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+    )
 }
 
 #[tokio::test]

@@ -213,9 +213,24 @@ impl Client {
         idempotency_key: Option<&IdempotencyKey>,
         retry: bool,
     ) -> Result<T, Error> {
+        self.edge_send_counted(method, route, path, body, idempotency_key, retry)
+            .await
+            .0
+    }
+
+    /// As `edge_send`, with the number of attempts made.
+    pub(crate) async fn edge_send_counted<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        route: &'static str,
+        path: &str,
+        body: Option<&Value>,
+        idempotency_key: Option<&IdempotencyKey>,
+        retry: bool,
+    ) -> (Result<T, Error>, u32) {
         self.inner
             .http
-            .send(Call {
+            .send_counted(Call {
                 service: Service::Edge,
                 method,
                 url: endpoint(&self.inner.sdk_base, path),

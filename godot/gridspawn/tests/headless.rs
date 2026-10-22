@@ -17,8 +17,16 @@
 //!   tone through a custom input (Godot's headless audio driver has no
 //!   microphone), and each checks it receives and plays the other's tone.
 //!   Then B leaves and joins again while A stays, and both check again.
+//! - `headless_voice_rules`: the game server configures `match` with
+//!   channels, both players in one channel. Each instance checks the room's
+//!   rules and the other's display name, hears the other; the game server
+//!   moves B to another channel (both get `audibility_changed(false)` and
+//!   hear nothing), then back (heard again). Run twice: server-spatialized
+//!   (binding a node is refused) and client-spatialized (not secrecy-safe,
+//!   the other is bound to a 3D node).
 
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     process::Stdio,
@@ -106,6 +114,21 @@ struct Setup {
     example: PathBuf,
 }
 
+/// This machine's load (Linux `/proc/loadavg`), printed at the start and the
+/// end of each test: a slow run on a busy host is visible at a glance. The
+/// instances print their own join timings (`INFO join_ms`).
+fn host_load() -> String {
+    fs::read_to_string("/proc/loadavg")
+        .map(|load| load.trim().to_owned())
+        .unwrap_or_else(|_| "n/a (no /proc/loadavg)".to_owned())
+}
+
+impl Drop for Setup {
+    fn drop(&mut self) {
+        eprintln!("host load at the end: {}", host_load());
+    }
+}
+
 /// The Godot binary, a game session, and the example project with the addon
 /// installed and imported. `None` when the test is not configured.
 async fn setup() -> Option<Setup> {
@@ -119,6 +142,7 @@ async fn setup() -> Option<Setup> {
         );
         return None;
     };
+    eprintln!("host load at the start: {}", host_load());
     let server = gridspawn_server::Client::builder(
         app_id.clone(),
         gridspawn_server::Environment::Development,
@@ -150,23 +174,31 @@ async fn setup() -> Option<Setup> {
     })
 }
 
-/// A guest of the session and a voice ticket for them.
-async fn voice_ticket(session: &gridspawn_server::Session, name: &str) -> String {
+/// A guest of the session.
+async fn guest(session: &gridspawn_server::Session, name: &str) -> gridspawn_server::Participant {
     let key = gridspawn_server::IdempotencyKey::random();
-    let guest = session
+    session
         .admit_guest(gridspawn_server::AdmitGuest::new(
             format!("fixture-{key}"),
             name,
             key,
         ))
         .await
-        .expect("admit guest");
+        .expect("admit guest")
+}
+
+async fn ticket(guest: &gridspawn_server::Participant) -> String {
     guest
         .issue_ticket(&[gridspawn_server::Module::Voice])
         .await
         .expect("ticket")
         .as_str()
         .to_owned()
+}
+
+/// A guest of the session and a voice ticket for them.
+async fn voice_ticket(session: &gridspawn_server::Session, name: &str) -> String {
+    ticket(&guest(session, name).await).await
 }
 
 fn lines<'a>(output: &'a str, prefix: &str) -> Vec<&'a str> {
@@ -251,24 +283,244 @@ async fn headless_voice() {
         }
         eprintln!("{name} RESULT {}", lines(output, "RESULT ").join(" | "));
     }
-    const HEARD: [&str; 4] = [
-        "joined match",
-        "participant_joined display_name_empty=true",
-        "network sent=true received=true",
-        "hears_other_tone=true",
-    ];
-    let checked_again = &HEARD[1..];
-    let mut stay: Vec<&str> = HEARD.to_vec();
+    // Each sees the other's display name (from the voice roster).
+    let heard = |other: &'static str| {
+        [
+            "joined match",
+            other,
+            "network sent=true received=true",
+            "hears_other_tone=true",
+        ]
+    };
+    let (sees_b, sees_a) = (
+        heard("participant_joined display_name=Voice B"),
+        heard("participant_joined display_name=Voice A"),
+    );
+    let mut stay: Vec<&str> = sees_b.to_vec();
     stay.push("participant_left");
-    stay.extend_from_slice(checked_again);
+    stay.extend_from_slice(&sees_b[1..]);
     stay.extend_from_slice(&["left left", "done"]);
-    let mut rejoin: Vec<&str> = HEARD.to_vec();
+    let mut rejoin: Vec<&str> = sees_a.to_vec();
     rejoin.push("left left");
-    rejoin.extend_from_slice(&HEARD);
+    rejoin.extend_from_slice(&sees_a);
     rejoin.extend_from_slice(&["left left", "done"]);
     for ((name, code, output), expected) in runs.into_iter().zip([stay, rejoin]) {
         let results = lines(output, "RESULT ");
         assert_eq!(code, 0, "Godot {name} failed:\n{output}");
         assert_eq!(results, expected, "Godot {name}");
     }
+}
+
+/// Runs Godot and streams its output lines (tagged) into `lines`.
+fn spawn_godot(
+    bin: &str,
+    example: &Path,
+    envs: &[(&str, String)],
+    tag: &'static str,
+    lines: tokio::sync::mpsc::UnboundedSender<(&'static str, String)>,
+) -> tokio::process::Child {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut command = tokio::process::Command::new(bin);
+    command
+        .arg("--headless")
+        .arg("--path")
+        .arg(example)
+        .arg("res://tests/voice_rules_test.tscn")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().expect("Godot could not start");
+    for stream in [
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let lines = lines.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stream).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let _ = lines.send((tag, line));
+            }
+        });
+    }
+    child
+}
+
+/// One run of the rules test; `spatial` is "server" or "client".
+async fn rules_run(spatial: &'static str) {
+    use gridspawn_server::{VoiceConfig, VoicePlayerState, VoiceRoom};
+    let Some(setup) = setup().await else { return };
+    let voice = setup.session.voice();
+    let room = if spatial == "client" {
+        VoiceRoom::channels().spatial_client()
+    } else {
+        VoiceRoom::channels()
+    };
+    voice
+        .configure(&VoiceConfig::new().room("match", room))
+        .await
+        .expect("configure");
+    let (a, b) = (
+        guest(&setup.session, "Voice A").await,
+        guest(&setup.session, "Voice B").await,
+    );
+    let red = VoicePlayerState::new().channels(["team:red"]);
+    let blue = VoicePlayerState::new().channels(["team:blue"]);
+    for player in [&a, &b] {
+        voice
+            .set_player_state(&player.id, &red)
+            .await
+            .expect("state");
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let env = |ticket: String, tone: &str, expect: &str| {
+        vec![
+            ("GRIDSPAWN_TEST_APP_ID", setup.app_id.clone()),
+            ("GRIDSPAWN_TEST_TICKET", ticket),
+            ("GRIDSPAWN_TEST_TONE_HZ", tone.to_owned()),
+            ("GRIDSPAWN_TEST_EXPECT_HZ", expect.to_owned()),
+            ("GRIDSPAWN_TEST_SPATIAL", spatial.to_owned()),
+        ]
+    };
+    let mut godot_a = spawn_godot(
+        &setup.bin,
+        &setup.example,
+        &env(ticket(&a).await, "440", "660"),
+        "A",
+        tx.clone(),
+    );
+    let mut godot_b = spawn_godot(
+        &setup.bin,
+        &setup.example,
+        &env(ticket(&b).await, "660", "440"),
+        "B",
+        tx.clone(),
+    );
+    drop(tx);
+    let mut output: HashMap<&str, Vec<String>> = HashMap::new();
+    let phase_done = |output: &HashMap<&str, Vec<String>>, marker: &str| {
+        ["A", "B"].iter().all(|who| {
+            output
+                .get(who)
+                .is_some_and(|lines| lines.iter().any(|l| l.trim() == marker))
+        })
+    };
+    let (mut moved, mut back) = (false, false);
+    let collect = async {
+        while let Some((who, line)) = rx.recv().await {
+            if line.contains("RESULT") || line.contains("INFO") || line.contains("ERROR") {
+                eprintln!("{spatial} {who}: {}", line.trim());
+            }
+            output.entry(who).or_default().push(line);
+            if !moved && phase_done(&output, "RESULT phase1_done") {
+                moved = true;
+                voice.set_player_state(&b.id, &blue).await.expect("move B");
+                eprintln!("harness: B moved to team:blue");
+            }
+            if !back && phase_done(&output, "RESULT phase2_done") {
+                back = true;
+                voice
+                    .set_player_state(&b.id, &red)
+                    .await
+                    .expect("move B back");
+                eprintln!("harness: B back to team:red");
+            }
+        }
+    };
+    let finished = tokio::time::timeout(Duration::from_secs(200), collect)
+        .await
+        .is_ok();
+    if !finished {
+        for (who, text) in &output {
+            let _ = fs::write(
+                profile_dir().join(format!("godot-rules-{spatial}-{who}.log")),
+                text.join("\n"),
+            );
+        }
+        panic!("the rules test ({spatial}) did not finish within 200 s");
+    }
+    let codes = (
+        godot_a.wait().await.expect("A").code(),
+        godot_b.wait().await.expect("B").code(),
+    );
+    let room_line = if spatial == "client" {
+        "room managed=true mode=channels spatial=client secrecy_safe=false is_secrecy_safe=false"
+    } else {
+        "room managed=true mode=channels spatial=server secrecy_safe=true is_secrecy_safe=true"
+    };
+    let bind_line = if spatial == "client" {
+        "bound"
+    } else {
+        "bind_refused voice/not_client_spatial"
+    };
+    for ((who, code), other) in [("A", codes.0), ("B", codes.1)]
+        .into_iter()
+        .zip(["Voice B", "Voice A"])
+    {
+        let text = output.get(who).cloned().unwrap_or_default().join("\n");
+        let _ = fs::write(
+            profile_dir().join(format!("godot-rules-{spatial}-{who}.log")),
+            &text,
+        );
+        for line in lines(&text, "INFO ") {
+            eprintln!("{spatial} {who} INFO {line}");
+        }
+        let results = lines(&text, "RESULT ");
+        eprintln!("{spatial} {who} RESULT {}", results.join(" | "));
+        assert_eq!(code, Some(0), "Godot {who} failed:\n{text}");
+        // Order-independent: the room, the name and the binding arrive as they come.
+        let name_line = format!("participant_joined display_name={other}");
+        for wanted in [room_line, name_line.as_str(), bind_line] {
+            assert!(
+                results.contains(&wanted),
+                "{who}: missing {wanted:?} in {results:?}"
+            );
+        }
+        // The phases, in order.
+        let phases: Vec<&str> = results
+            .iter()
+            .copied()
+            .filter(|l| {
+                l.starts_with("hears_other_tone")
+                    || l.starts_with("phase")
+                    || l.starts_with("audibility")
+                    || l.starts_with("left")
+                    || *l == "done"
+                    || l.starts_with("joined")
+            })
+            .collect();
+        assert_eq!(
+            phases,
+            [
+                "joined match",
+                "hears_other_tone=true",
+                "phase1_done",
+                "audibility audible=false",
+                "hears_other_tone=false",
+                "phase2_done",
+                "audibility audible=true",
+                "hears_other_tone=true",
+                "left left",
+                "done",
+            ],
+            "{who}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn headless_voice_rules() {
+    rules_run("server").await;
+    rules_run("client").await;
 }

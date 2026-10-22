@@ -1,15 +1,16 @@
 # gridspawn-server
 
 Rust server SDK for Gridspawn: game sessions, player and guest admission,
-client tickets, and posting to your game's club. Server-side only — the
-credential must never ship in a game client.
+client tickets, player presence, voice rules (who hears whom), and posting to
+your game's club. Server-side only — the credential must never ship in a game
+client.
 
 It speaks the wire protocol one to one: `02-sessions.md` (sessions,
 admission, tickets) and `05-club.md` (club posts) in the protocol docs
 (`docs/protocol/` in the public repository). Requests never carry an `Origin`
 header.
 
-Status: 0.2.0, source only, not on crates.io yet. Licence: MIT OR Apache-2.0
+Status: 0.3.0, source only, not on crates.io yet. Licence: MIT OR Apache-2.0
 (see the end of this file).
 MSRV: Rust 1.83 for the library (the tests' dev-dependencies need a newer
 toolchain).
@@ -138,6 +139,78 @@ participant.clear_presence().await?;          // when the player leaves
 - Limits: 5 writes per 20 s per player, and 3,000 per minute per app and
   environment. Over them: `RateLimited` with `retry_after`.
 
+## Decide who hears whom (voice rules)
+
+Players in a session talk in its voice rooms (the game client joins with
+`gridspawn-voice` or the Godot addon). Your server decides who hears whom: the
+voice service forwards nothing for a pair that may not hear each other, so a
+modified client cannot listen in.
+
+```rust
+use gridspawn_server::{Module, Rolloff, VoiceConfig, VoicePlayerState, VoiceRoom};
+
+let voice = session.voice();
+voice.configure(&VoiceConfig::new().room(
+    "match",
+    VoiceRoom::hybrid(2.0, 25.0).rolloff(Rolloff::Inverse).hysteresis(2.0),
+)).await?;
+
+// For each player, BEFORE their voice ticket:
+voice.set_player_state(&guest.id, &VoicePlayerState::new().channels(["team:red"])).await?;
+let ticket = guest.issue_ticket(&[Module::Voice]).await?;
+
+// Positions (proximity and hybrid rooms), from your game loop:
+let positions = voice.spawn_position_publisher(10);       // sends ≤ 10 times a second
+positions.update(&guest.id, [x, y, z], Some(yaw))?;        // cheap: every tick
+// 2D game: positions.update_planar(&guest.id, x, y, None)?   (sent as [x, 0, y])
+
+voice.mute(&guest.id, true).await?;                        // authoritative mute
+```
+
+- **Rooms:** `VoiceRoom::open()`, `channels()`, `proximity(min, max)` or
+  `hybrid(min, max)` (a shared channel at full volume, or range). Distances
+  are in metres; full volume up to `min`, silent beyond `max`
+  (`+ hysteresis` to leave range). `spatial_client()` lets the game client
+  place voices itself: no range culling, so it is **not secrecy-safe** (for
+  co-op and social games). `max_audible_speakers` (default 16) keeps the
+  closest. Dead and spectating players: `Ghosts` (by default they hear the
+  living and speak only to each other).
+- **Rooms today:** players can join only the room `match` until named rooms
+  are enabled on the voice service. Configuring `match` puts it under your
+  rules.
+- **The player state is required.** In a room you configured, a player
+  without a state hears no one and is heard by no one. Call
+  `set_player_state` before `issue_ticket` with `Module::Voice`. After a
+  session handle has configured voice, the crate logs a warning when it
+  issues a voice ticket for a player whose state it never sent.
+- **Positions:** right-handed, y up; `yaw` in radians, 0 facing −z and
+  growing to the left (Godot's `rotation.y`). The pan is computed in the x/z
+  plane, so 2D games send `[x, 0, y]` (`VoicePosition::planar`,
+  `update_planar`). A position counts fully for 1 s after it arrives and
+  fades out over the next 2 s: the publisher re-sends every player's latest
+  position each tick (use 2 Hz or more).
+- **`VoiceAck::enforced`** is false until the first player of the session
+  joins voice (no voice server is assigned before that), or while the voice
+  server's link to the rules is down. It is information, not an error.
+- **Keep the lease alive** (`spawn_renewer`): when it lapses, the rules go
+  stale and everyone is silent 3 s later.
+- **Sessions longer than 24 hours:** today the renewals keep the rules alive
+  for 24 h after the last `configure`. Call `configure` again before that if
+  your game sends no other voice updates.
+- **Ordering:** state and position updates carry an increasing sequence
+  number (the wall clock in ms, or one more than the last), so an older
+  update never replaces a newer one: it answers `VoiceStaleSequence`. A
+  retried update that meets it reports `VoiceAck::overtaken` instead of an
+  error.
+- **Limits:** configure 5 per 10 s per session; state 10/s per player and
+  200/s per session; positions 20 batches per 2 s per session (1–256
+  players each); mute 20/s per session. Over them: `RateLimited` with
+  `retry_after`; the publisher waits it out by itself.
+- `VoiceConfig::from_json` reads a configuration in its wire shape, for
+  example from a file. The `blocking` client has `voice_configure`,
+  `voice_set_player_state`, `voice_mute` and `voice_publish_positions` (no
+  background publisher there).
+
 ## Retries
 
 - Network errors, timeouts and HTTP 5xx are retried (`RetryPolicy`: 3
@@ -153,19 +226,24 @@ participant.clear_presence().await?;          // when the player leaves
 ## Errors
 
 `Error::Api` carries an `ApiError` with `service`, `status`, `code`
-(`ErrorCode`), `wire_code`, `message`, `request_id`, `retry_after` and
-`field`.
+(`ErrorCode`), `wire_code`, `message`, `request_id`, `retry_after`, `field`
+and `reason`.
 `Error::is_retryable()` tells whether a later retry with the same key makes
 sense.
 
 | `ErrorCode` | Wire code | What to do |
 |---|---|---|
 | `FeatureNotFound` | `feature_not_found` (404) | Add a destination for the feature in the Dev Hub, turn posting on, or allow test servers |
-| `RateLimited` | `rate_limited`, `presence/rate_limited` (429) | Wait (`retry_after` when sent); posts: 120/min per app and 30/min per feature; presence: 5 writes per 20 s per player |
+| `RateLimited` | `rate_limited`, `presence/rate_limited`, `voice/rate_limited` (429) | Wait (`retry_after` when sent); posts: 120/min per app and 30/min per feature; presence: 5 writes per 20 s per player; voice: see its limits |
 | `PresenceInvalidRequest` / `PresenceTextNotAllowed` | `presence/invalid_request` / `presence/text_not_allowed` (400) | Fix the field in `ApiError::field` |
 | `PresenceScopeDenied` | `presence/scope_denied` (403) | No `presence.write` (or `presence.party`) consent, or the presence module is off |
 | `PresenceGuestNotSupported` | `presence/guest_not_supported` (403) | Guests have no presence |
 | `PresenceAccountUnavailable` | `presence/account_unavailable` (403) | The player's account is not active |
+| `VoiceInvalidRequest` | `voice/invalid_request` (400) | Fix the field in `ApiError::field` (`reason` says why) |
+| `VoiceStaleSequence` | `voice/stale_sequence` (409) | A newer update was already accepted; nothing to do |
+| `VoiceParticipantNotFound` | `voice/participant_not_found` (404) | The player is not admitted to this session (or left) |
+| `VoiceModuleDisabled` | `voice/module_disabled` (403) | Turn voice on for the app and environment in the Dev Hub |
+| `VoiceUnavailable` | `voice/unavailable` (503) | Retried automatically; try again later |
 | `GrantInvalid` | `grant_invalid` (401) | Key revoked or app turned off (one automatic refresh already happened) |
 | `AuthenticationRequired` | `server/authentication_required` (401) | Wrong, revoked or expired key, or the environment is off |
 | `ScopeDenied` | `server/scope_denied` (403) | The key lacks the scope (`club.post` / `session.manage`) |
@@ -174,7 +252,7 @@ sense.
 | `ContentRejected(code)` | `title_too_long`, … (400) | Fix the post |
 | `ChatUnavailable` | `club_*chat_unavailable`, `chat_unavailable` | Chat delivery is down; retry later |
 | `IdempotencyConflict` | `request/idempotency_conflict` (409) | Same key, different body: use a new key |
-| `SessionNotFound` | `session/not_found` (404) | The session ended or the id is wrong |
+| `SessionNotFound` | `session/not_found`, `voice/session_not_found` (404) | The session ended or the id is wrong |
 | `ServiceNotReady` | `service/not_ready` (503) | Retried automatically; try again later |
 | `Other(code)` | anything else | Kept verbatim |
 

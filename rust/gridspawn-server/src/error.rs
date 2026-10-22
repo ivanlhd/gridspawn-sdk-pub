@@ -101,11 +101,15 @@ pub struct ApiError {
     /// posting limits are fixed one-minute windows without it).
     pub retry_after: Option<Duration>,
     /// The request field the error is about (`error.field`), when the service
-    /// names one (presence payload errors).
+    /// names one (presence and voice payload errors).
     pub field: Option<String>,
+    /// Why that field was refused (`error.reason`, voice payload errors), for
+    /// example `count` or `range`.
+    pub reason: Option<String>,
 }
 
-/// The documented error codes of protocols 02 and 03 (edge) and 05 (Core).
+/// The documented error codes of protocols 02 and 03 and the voice routes
+/// (edge), and of 05 (Core).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ErrorCode {
@@ -171,7 +175,19 @@ pub enum ErrorCode {
     PresenceGuestNotSupported,
     /// `presence/account_unavailable`: the player's account is not active.
     PresenceAccountUnavailable,
-    /// `rate_limited`, `presence/rate_limited`, or any 429 without a code (nginx).
+    /// `voice/invalid_request`: the voice body broke a rule
+    /// ([`ApiError::field`] and [`ApiError::reason`] when known).
+    VoiceInvalidRequest,
+    /// `voice/stale_sequence`: a newer update was already accepted.
+    VoiceStaleSequence,
+    /// `voice/participant_not_found`: not admitted to this session (or gone).
+    VoiceParticipantNotFound,
+    /// `voice/module_disabled`: voice is off for the application and environment.
+    VoiceModuleDisabled,
+    /// `voice/unavailable` (503): voice control is temporarily unreachable.
+    VoiceUnavailable,
+    /// `rate_limited`, `presence/rate_limited`, `voice/rate_limited`, or any
+    /// 429 without a code (nginx).
     RateLimited,
     /// Any other code, kept verbatim.
     Other(String),
@@ -193,10 +209,12 @@ impl ErrorCode {
         match code {
             "server/authentication_required" => Self::AuthenticationRequired,
             "server/scope_denied" => Self::ScopeDenied,
-            "server/browser_forbidden" | "game_server_browser_forbidden" => Self::BrowserForbidden,
+            "server/browser_forbidden"
+            | "game_server_browser_forbidden"
+            | "voice/browser_forbidden" => Self::BrowserForbidden,
             "service/not_ready" => Self::ServiceNotReady,
             "session/invalid_request" => Self::SessionInvalidRequest,
-            "session/not_found" => Self::SessionNotFound,
+            "session/not_found" | "voice/session_not_found" => Self::SessionNotFound,
             "session/capability_denied" => Self::CapabilityDenied,
             "session/assertion_invalid" => Self::AssertionInvalid,
             "session/assertion_replayed" => Self::AssertionReplayed,
@@ -221,7 +239,12 @@ impl ErrorCode {
             "presence/scope_denied" => Self::PresenceScopeDenied,
             "presence/guest_not_supported" => Self::PresenceGuestNotSupported,
             "presence/account_unavailable" => Self::PresenceAccountUnavailable,
-            "rate_limited" | "presence/rate_limited" => Self::RateLimited,
+            "voice/invalid_request" => Self::VoiceInvalidRequest,
+            "voice/stale_sequence" => Self::VoiceStaleSequence,
+            "voice/participant_not_found" => Self::VoiceParticipantNotFound,
+            "voice/module_disabled" => Self::VoiceModuleDisabled,
+            "voice/unavailable" => Self::VoiceUnavailable,
+            "rate_limited" | "presence/rate_limited" | "voice/rate_limited" => Self::RateLimited,
             other if CONTENT_CODES.contains(&other) => Self::ContentRejected(other.to_owned()),
             other => Self::Other(other.to_owned()),
         }
@@ -259,6 +282,11 @@ impl ErrorCode {
             Self::PresenceScopeDenied => "presence/scope_denied",
             Self::PresenceGuestNotSupported => "presence/guest_not_supported",
             Self::PresenceAccountUnavailable => "presence/account_unavailable",
+            Self::VoiceInvalidRequest => "voice/invalid_request",
+            Self::VoiceStaleSequence => "voice/stale_sequence",
+            Self::VoiceParticipantNotFound => "voice/participant_not_found",
+            Self::VoiceModuleDisabled => "voice/module_disabled",
+            Self::VoiceUnavailable => "voice/unavailable",
             Self::RateLimited => "rate_limited",
         }
     }
@@ -305,6 +333,11 @@ mod tests {
             "presence/scope_denied",
             "presence/guest_not_supported",
             "presence/account_unavailable",
+            "voice/invalid_request",
+            "voice/stale_sequence",
+            "voice/participant_not_found",
+            "voice/module_disabled",
+            "voice/unavailable",
             "rate_limited",
         ] {
             let mapped = ErrorCode::from_wire(code);
@@ -323,6 +356,13 @@ mod tests {
             ErrorCode::from_wire("presence/rate_limited"),
             ErrorCode::RateLimited
         );
+        for (alias, code) in [
+            ("voice/browser_forbidden", ErrorCode::BrowserForbidden),
+            ("voice/session_not_found", ErrorCode::SessionNotFound),
+            ("voice/rate_limited", ErrorCode::RateLimited),
+        ] {
+            assert_eq!(ErrorCode::from_wire(alias), code, "{alias}");
+        }
         for code in CONTENT_CODES {
             assert_eq!(
                 ErrorCode::from_wire(code),

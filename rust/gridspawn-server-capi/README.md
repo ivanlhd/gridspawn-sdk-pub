@@ -4,7 +4,7 @@ C ABI for [`gridspawn-server`](../gridspawn-server): Gridspawn's server SDK
 for C, C++ and Unreal. Server-side only. Linux is built and tested; other
 platforms are not yet.
 
-Status: 0.1.0, source only. Licence: MIT OR Apache-2.0 (see the end of this
+Status: 0.2.0, source only. Licence: MIT OR Apache-2.0 (see the end of this
 file). ABI version 1 (`GS_ABI_VERSION`). The rules are the preamble of
 `include/gridspawn_server.h`.
 
@@ -39,6 +39,37 @@ cc -std=c99 examples/c/club_post.c -Iinclude target/release/libgridspawn_server_
 GRIDSPAWN_APP_ID=game-… GRIDSPAWN_ENVIRONMENT=development \
 GRIDSPAWN_CREDENTIAL_FILE=/path/to/0600-key-file ./club_post patch-notes
 ```
+
+## Voice rules (who hears whom)
+
+The same rules as `gridspawn-server`'s `session.voice()` (its README has the
+details: rooms, the player state that must come first, positions, limits):
+
+```c
+GsVoiceAck ack;
+gs_voice_configure(session, "{\"rooms\": {\"match\": {\"mode\": \"channels\"}}}", &ack, &error);
+
+GsVoicePlayerState state;
+gs_voice_player_state_init(&state);              /* alive, may speak, every room */
+const char *channels[] = {"team:red"};
+state.channels = channels; state.channels_len = 1;
+gs_voice_set_player_state(session, player_id, &state, &ack, &error);  /* before the voice ticket */
+
+GsVoicePublisher *positions;
+gs_voice_publisher_spawn(session, 10, &positions, &error);
+gs_voice_publisher_update(positions, player_id, x, y, z, yaw, true, &error);  /* every tick; 2D: (x, 0, y) */
+gs_voice_mute(session, player_id, true, NULL, &error);
+gs_voice_publisher_free(positions);
+```
+
+- `gs_voice_configure` takes the configuration as JSON in its wire shape and
+  checks it before sending.
+- `GsVoiceAck.enforced` is false until the first player of the session joins
+  voice. That is not an error.
+- Errors: `GS_ERROR_CODE_VOICE_*`, plus `gs_error_field` and
+  `gs_error_reason` for invalid bodies.
+- `gs_voice_publisher_last_error` returns the last batch's failure (free it
+  with `gs_error_free`).
 
 ## Rules in short
 

@@ -45,6 +45,13 @@ use crate::{
 pub(crate) const SEND_PAYLOAD_TYPE: u8 = 111;
 const OPUS_FMTP: &str = "minptime=10;useinbandfec=1";
 
+/// What our producer tells the SFU. Never `allowedPeerIds`: in game-session
+/// rooms who hears whom belongs to the game server (the SFU refuses it with
+/// `sdk_server_authority`).
+fn produce_app_data() -> serde_json::Value {
+    json!({ "type": "voice", "routeClass": "room" })
+}
+
 fn media_error(error: impl std::fmt::Display) -> VoiceError {
     VoiceError::TransportFailed(error.to_string())
 }
@@ -219,7 +226,7 @@ impl SendLeg {
                         "encodings": [{ "ssrc": ssrc, "dtx": true }],
                         "rtcp": { "cname": cname, "reducedSize": true }
                     },
-                    "appData": { "type": "voice", "routeClass": "room" }
+                    "appData": produce_app_data()
                 }),
             )
             .await?;
@@ -264,6 +271,18 @@ pub(crate) struct RecvLeg {
     sections: Vec<RecvSection>,
     connected: bool,
     next_mid: u32,
+    /// Test-only: the next this many rounds fail before touching the connection.
+    #[cfg(test)]
+    fail_rounds: u32,
+}
+
+/// How an added consumer's section got in.
+#[derive(Debug)]
+pub(crate) enum Added {
+    /// At the first round.
+    First,
+    /// At the second; the first failed with this.
+    Retried(VoiceError),
 }
 
 impl RecvLeg {
@@ -287,6 +306,8 @@ impl RecvLeg {
             sections: Vec::new(),
             connected: false,
             next_mid: 0,
+            #[cfg(test)]
+            fail_rounds: 0,
         })
     }
 
@@ -294,7 +315,11 @@ impl RecvLeg {
         &self.transport.id
     }
 
-    /// Adds one consumer's section and renegotiates.
+    /// Adds one consumer's section and renegotiates, once more if the first
+    /// round fails. When both fail, the section is closed (inactive: the
+    /// connection may already have it, and its mid is never reused) and the
+    /// error returned; the leg is stable and later additions still work.
+    /// Nothing is dropped silently: the caller reports either outcome.
     pub async fn add(
         &mut self,
         signaling: &Signaling,
@@ -302,7 +327,19 @@ impl RecvLeg {
         codec: OpusCodec,
         ssrc: u32,
         cname: String,
-    ) -> Result<(), VoiceError> {
+    ) -> Result<Added, VoiceError> {
+        self.add_with(Some(signaling), room_id, codec, ssrc, cname)
+            .await
+    }
+
+    async fn add_with(
+        &mut self,
+        signaling: Option<&Signaling>,
+        room_id: &str,
+        codec: OpusCodec,
+        ssrc: u32,
+        cname: String,
+    ) -> Result<Added, VoiceError> {
         self.sections.push(RecvSection {
             mid: self.next_mid.to_string(),
             codec,
@@ -311,7 +348,20 @@ impl RecvLeg {
             active: true,
         });
         self.next_mid += 1;
-        self.renegotiate(signaling, room_id).await
+        let first = match self.renegotiate(signaling, room_id).await {
+            Ok(()) => return Ok(Added::First),
+            Err(error) => error,
+        };
+        tracing::warn!(error = %first, "voice receive renegotiation for a new speaker failed; retrying once");
+        match self.renegotiate(signaling, room_id).await {
+            Ok(()) => Ok(Added::Retried(first)),
+            Err(error) => {
+                if let Some(section) = self.sections.iter_mut().rev().find(|s| s.ssrc == ssrc) {
+                    section.active = false;
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Turns a consumer's section inactive (its mid is not reused). A failed
@@ -331,22 +381,28 @@ impl RecvLeg {
             }
         }
         if changed {
-            self.renegotiate(signaling, room_id).await?;
+            self.renegotiate(Some(signaling), room_id).await?;
         }
         Ok(())
     }
 
     async fn renegotiate(
         &mut self,
-        signaling: &Signaling,
+        signaling: Option<&Signaling>,
         room_id: &str,
     ) -> Result<(), VoiceError> {
+        #[cfg(test)]
+        if self.fail_rounds > 0 {
+            self.fail_rounds -= 1;
+            return Err(VoiceError::TransportFailed("injected failure".into()));
+        }
         let offer = sdp::recv_offer(&self.transport, &self.sections);
         if let Err(error) = self.apply_offer(offer).await {
             self.rollback().await;
             return Err(error);
         }
         if !self.connected {
+            let signaling = signaling.ok_or(VoiceError::NotReady)?;
             let local = self
                 .pc
                 .local_description()
@@ -424,6 +480,55 @@ mod tests {
 
     /// Regression: a refused offer left the receive leg in have-remote-offer
     /// and every later offer failed; the rollback brings it back to stable.
+    /// A failed add round is retried once; failed twice, the section is
+    /// closed (never left active, never dropped) and the error returned, and
+    /// the next speaker is still added.
+    #[tokio::test]
+    async fn a_failed_add_is_retried_once_then_closed() {
+        let (events, _) = mpsc::unbounded_channel();
+        let mut leg = RecvLeg::open(test_transport(), 100, events).await.unwrap();
+        // As after connectTransport: no signaling needed in this test.
+        leg.connected = true;
+
+        leg.fail_rounds = 1;
+        let added = leg
+            .add_with(None, "room", test_opus(), 1111, "a".into())
+            .await
+            .unwrap();
+        assert!(matches!(added, Added::Retried(_)), "{added:?}");
+
+        leg.fail_rounds = 2;
+        let error = leg
+            .add_with(None, "room", test_opus(), 2222, "b".into())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("injected"), "{error}");
+
+        let added = leg
+            .add_with(None, "room", test_opus(), 3333, "c".into())
+            .await
+            .unwrap();
+        assert!(matches!(added, Added::First));
+        let state: Vec<(&str, u32, bool)> = leg
+            .sections
+            .iter()
+            .map(|s| (s.mid.as_str(), s.ssrc, s.active))
+            .collect();
+        assert_eq!(
+            state,
+            [("0", 1111, true), ("1", 2222, false), ("2", 3333, true)]
+        );
+        leg.close().await;
+    }
+
+    /// The game server decides who hears whom: our producer never names listeners.
+    #[test]
+    fn the_producer_never_sends_allowed_peer_ids() {
+        let app_data = produce_app_data();
+        assert_eq!(app_data, json!({ "type": "voice", "routeClass": "room" }));
+        assert!(app_data.get("allowedPeerIds").is_none());
+    }
+
     #[tokio::test]
     async fn a_refused_offer_is_rolled_back() {
         let good = sdp::recv_offer(&test_transport(), &[open_section("1")]);

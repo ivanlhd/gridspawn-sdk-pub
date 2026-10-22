@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use crate::{
     AdmitGuest, AdmitParticipant, ClientBuilder, ClientTicket, CreateSession, Error,
-    IdempotencyKey, Lease, Module, Participant, ParticipantRef, Post, PostReceipt, Presence,
-    PresenceAck, Session,
+    IdempotencyKey, Lease, Module, Participant, ParticipantId, ParticipantRef, Post, PostReceipt,
+    Presence, PresenceAck, Session, VoiceAck, VoiceConfig, VoicePlayerState, VoicePosition,
 };
 
 pub struct Client {
@@ -82,6 +82,48 @@ impl Client {
 
     pub fn clear_presence(&self, participant: &ParticipantRef) -> Result<(), Error> {
         self.runtime.block_on(participant.clear_presence())
+    }
+
+    /// As [`crate::VoiceControl::configure`].
+    pub fn voice_configure(
+        &self,
+        session: &Session,
+        config: &VoiceConfig,
+    ) -> Result<VoiceAck, Error> {
+        self.runtime.block_on(session.voice().configure(config))
+    }
+
+    /// As [`crate::VoiceControl::set_player_state`]: before the player's voice ticket.
+    pub fn voice_set_player_state(
+        &self,
+        session: &Session,
+        participant: &ParticipantId,
+        state: &VoicePlayerState,
+    ) -> Result<VoiceAck, Error> {
+        self.runtime
+            .block_on(session.voice().set_player_state(participant, state))
+    }
+
+    /// As [`crate::VoiceControl::mute`].
+    pub fn voice_mute(
+        &self,
+        session: &Session,
+        participant: &ParticipantId,
+        muted: bool,
+    ) -> Result<VoiceAck, Error> {
+        self.runtime
+            .block_on(session.voice().mute(participant, muted))
+    }
+
+    /// As [`crate::VoiceControl::publish_positions`]. There is no background
+    /// publisher here: call it several times a second yourself.
+    pub fn voice_publish_positions(
+        &self,
+        session: &Session,
+        positions: &[VoicePosition],
+    ) -> Result<VoiceAck, Error> {
+        self.runtime
+            .block_on(session.voice().publish_positions(positions))
     }
 }
 

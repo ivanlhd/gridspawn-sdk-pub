@@ -69,9 +69,10 @@ typedef enum GsIdentityKind {
   GS_IDENTITY_KIND_SERVER_VERIFIED_GUEST = 1,
 } GsIdentityKind;
 
-// The documented error codes (protocol 02 and 05). GS_ERROR_CODE_NONE when
-// the status is not GS_STATUS_API; GS_ERROR_CODE_OTHER for codes this
-// version does not know (see gs_error_wire_code).
+// The documented error codes (protocol 02 and 05, and the voice routes).
+// GS_ERROR_CODE_NONE when the status is not GS_STATUS_API;
+// GS_ERROR_CODE_OTHER for codes this version does not know (see
+// gs_error_wire_code). New codes are added after OTHER.
 typedef enum GsErrorCode {
   GS_ERROR_CODE_NONE = 0,
   GS_ERROR_CODE_AUTHENTICATION_REQUIRED = 1,
@@ -100,6 +101,14 @@ typedef enum GsErrorCode {
   GS_ERROR_CODE_CHAT_UNAVAILABLE = 24,
   GS_ERROR_CODE_RATE_LIMITED = 25,
   GS_ERROR_CODE_OTHER = 26,
+  // voice/invalid_request: see gs_error_field and gs_error_reason.
+  GS_ERROR_CODE_VOICE_INVALID_REQUEST = 27,
+  // voice/stale_sequence: a newer update was already accepted.
+  GS_ERROR_CODE_VOICE_STALE_SEQUENCE = 28,
+  GS_ERROR_CODE_VOICE_PARTICIPANT_NOT_FOUND = 29,
+  GS_ERROR_CODE_VOICE_MODULE_DISABLED = 30,
+  // voice/unavailable (503), retryable.
+  GS_ERROR_CODE_VOICE_UNAVAILABLE = 31,
 } GsErrorCode;
 
 // A connected client. Thread-safe. Free with gs_client_free.
@@ -119,6 +128,9 @@ typedef struct GsRenewer GsRenewer;
 
 // A game session. Free with gs_session_free.
 typedef struct GsSession GsSession;
+
+// Sends the latest position of each player at a fixed rate. gs_voice_publisher_free stops it.
+typedef struct GsVoicePublisher GsVoicePublisher;
 
 // Options for gs_client_connect. Fill with gs_client_options_init first.
 typedef struct GsClientOptions {
@@ -189,6 +201,42 @@ typedef struct GsAdmitParticipant {
   // NULL = absent
   const char *team;
 } GsAdmitParticipant;
+
+// A player's voice state. Fill with gs_voice_player_state_init first (alive,
+// may speak, no channels, every room).
+typedef struct GsVoicePlayerState {
+  // NULL = every configured room; otherwise rooms_len room names (0-4).
+  const char *const *rooms;
+  size_t rooms_len;
+  // channels_len keys (0-8), for example "team:red"; NULL when 0.
+  const char *const *channels;
+  size_t channels_len;
+  bool alive;
+  bool spectator;
+  bool can_speak;
+  // NULL = none. Players in different scenes never hear each other.
+  const char *scene;
+} GsVoicePlayerState;
+
+// The answer to a voice update.
+typedef struct GsVoiceAck {
+  // The rules are enforced now (false until a player of the session joins
+  // voice, or while the voice server's link is down). Not an error.
+  bool enforced;
+  // A retried update met "a newer update was already accepted": it landed
+  // earlier or was replaced; enforced is false then.
+  bool overtaken;
+} GsVoiceAck;
+
+// One player's position: right-handed, y up, metres. yaw (radians, used when
+// has_yaw) is where they face: 0 faces -z, growing turns left. 2D games send
+// (x, 0, y): the pan is computed in the x/z plane.
+typedef struct GsVoicePosition {
+  const char *participant_id;
+  double position[3];
+  double yaw;
+  bool has_yaw;
+} GsVoicePosition;
 
 #ifdef __cplusplus
 extern "C" {
@@ -316,6 +364,71 @@ enum GsStatus gs_issue_ticket(struct GsParticipant *participant,
 
 void gs_participant_free(struct GsParticipant *participant);
 
+// Defaults: every room, no channels, alive, not a spectator, may speak, no scene.
+void gs_voice_player_state_init(struct GsVoicePlayerState *state);
+
+// Replaces the session's voice rooms. config_json is the wire shape, for
+// example {"rooms": {"match": {"mode": "channels"}}}; it is checked before
+// sending. ack_out may be NULL.
+enum GsStatus gs_voice_configure(struct GsSession *session,
+                                 const char *config_json,
+                                 struct GsVoiceAck *ack_out,
+                                 struct GsError **error);
+
+// Sets one player's state. Call it before issuing the player's voice ticket:
+// in a managed room a player without a state hears no one and is heard by
+// no one. state->rooms NULL = every room; non-NULL with rooms_len 0 = no
+// room. ack_out may be NULL.
+enum GsStatus gs_voice_set_player_state(struct GsSession *session,
+                                        const char *participant_id,
+                                        const struct GsVoicePlayerState *state,
+                                        struct GsVoiceAck *ack_out,
+                                        struct GsError **error);
+
+// The authoritative mute (also after the player reconnects). ack_out may be NULL.
+enum GsStatus gs_voice_mute(struct GsSession *session,
+                            const char *participant_id,
+                            bool muted,
+                            struct GsVoiceAck *ack_out,
+                            struct GsError **error);
+
+// One batch of 1-256 positions. A position counts fully for 1 s after it
+// arrives: send several times a second, or use gs_voice_publisher_spawn.
+// ack_out may be NULL.
+enum GsStatus gs_voice_publish_positions(struct GsSession *session,
+                                         const struct GsVoicePosition *positions,
+                                         size_t count,
+                                         struct GsVoiceAck *ack_out,
+                                         struct GsError **error);
+
+// Starts a publisher on the client's runtime: hz times a second (1-10; 2 or
+// more keeps every position inside the 1 s hold) it sends the latest
+// position of every player given to gs_voice_publisher_update.
+enum GsStatus gs_voice_publisher_spawn(struct GsSession *session,
+                                       uint32_t hz,
+                                       struct GsVoicePublisher **out,
+                                       struct GsError **error);
+
+// A player's latest position (cheap; call every tick). Checked here. Never
+// blocks, so it may be called from anywhere.
+enum GsStatus gs_voice_publisher_update(struct GsVoicePublisher *publisher,
+                                        const char *participant_id,
+                                        double x,
+                                        double y,
+                                        double z,
+                                        double yaw,
+                                        bool has_yaw,
+                                        struct GsError **error);
+
+// Stops sending this player's position (range audibility fades out 1-3 s later).
+void gs_voice_publisher_remove(struct GsVoicePublisher *publisher, const char *participant_id);
+
+// The failure of the last batch: a new GsError to free with gs_error_free,
+// or NULL when the last batch was sent (or for a NULL publisher).
+struct GsError *gs_voice_publisher_last_error(const struct GsVoicePublisher *publisher);
+
+void gs_voice_publisher_free(struct GsVoicePublisher *publisher);
+
 enum GsStatus gs_error_status(const struct GsError *error);
 
 enum GsErrorCode gs_error_code(const struct GsError *error);
@@ -334,6 +447,13 @@ const char *gs_error_request_id(const struct GsError *error);
 
 // -1 when absent (neither service sends Retry-After today).
 int64_t gs_error_retry_after_ms(const struct GsError *error);
+
+// The request field the error is about (voice and presence payload
+// errors); NULL when the service named none.
+const char *gs_error_field(const struct GsError *error);
+
+// Why that field was refused (voice payload errors), e.g. "count"; NULL when absent.
+const char *gs_error_reason(const struct GsError *error);
 
 // Network errors, timeouts, 5xx and 429.
 bool gs_error_is_retryable(const struct GsError *error);

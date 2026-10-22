@@ -3,7 +3,7 @@
 Player sign-in with the system browser, player assertions for your game
 server, joining game sessions, and in-game voice, for Godot 4.3 and later.
 
-Status: 0.2.1. Builds for Windows x86_64 and Linux x86_64. Licence: MIT OR
+Status: 0.3.0. Builds for Windows x86_64 and Linux x86_64. Licence: MIT OR
 Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`). The bundled Rust bindings for
 Godot are MPL-2.0, and the voice code includes WebRTC audio processing,
 Abseil and libopus: see `THIRD-PARTY.md`.
@@ -116,24 +116,64 @@ func _ready() -> void:
 
 | Method | Result |
 |---|---|
-| `join()` | `joined(room)` or `error(code, message)` |
+| `join()` | Enters the room `room` → `joined(room)` or `error(code, message)` |
 | `leave()` | `left(reason)` |
 | `is_joined() -> bool` | Immediate |
 | `set_muted(muted)`, `is_muted()` | This player's microphone |
-| `set_deafened(deafened)` | Silences everyone else for this player |
+| `set_deafened(deafened)` | Silences everyone else for this player (the audio still arrives) |
 | `set_push_to_talk(enabled)`, `set_transmitting(on)` | Push-to-talk and the key's state |
-| `set_player_volume(participant_id, gain)` | 0.0 to 2.0, this player's preference |
-| `get_participants() -> Array[Dictionary]` | `participant_id`, `display_name`, `speaking`, `gain` |
+| `set_player_volume(participant_id, volume)` | 0.0 to 2.0, this player's preference |
+| `set_player_muted(participant_id, muted)` | Mutes one player for this player only; the voice server stops sending their audio here |
+| `get_participants() -> Array[Dictionary]` | `participant_id`, `display_name`, `speaking`, `volume`, `audible`, `gain`, `pan`, `server_muted`, `locally_muted` |
 | `get_local_participant_id() -> String` | This player's own id in the speaking signals |
+| `get_room_config() -> Dictionary` | `managed`, and with rules `mode`, `spatial`, `secrecy_safe`, `max_participants` |
+| `is_secrecy_safe() -> bool` | False only in client-spatialized rooms |
+| `bind_participant(participant_id, node)`, `unbind_participant(participant_id)` | Client-spatialized rooms: play a player's voice from a `Node3D` |
 | `get_input_devices()`, `set_input_device(name)` | Godot's microphone selection |
 | `get_output_devices()`, `set_output_device(name)` | Godot's output device (the whole game's) |
 | `get_stats() -> Dictionary` | Counters for diagnostics |
 
 Also `participant_joined(participant_id, display_name)`,
 `participant_left(participant_id)`, `speaking_started(participant_id)` and
-`speaking_stopped(participant_id)`, for other players and for this player.
+`speaking_stopped(participant_id)`, for other players and for this player;
+and the game server's rules (below): `audibility_changed(participant_id,
+audible, gain, pan)`, `room_config_changed(config)`,
+`authority_changed(available)` and `server_mute_changed(participant_id,
+muted)`.
+
+**Players:**
+- Show `display_name` only. `participant_id` is the id your game server got
+  when it admitted the player, so you can match voices to players; never
+  show it.
+- Everyone in the room is listed, also players who are not speaking.
+
+**Who hears whom** is decided by your game server (`gridspawn-server`:
+channels such as teams, proximity, dead and spectating players, and an
+authoritative mute). The voice server sends nothing for a pair that may not
+hear each other, so a modified client cannot listen in. Each player gets a
+`gain` and, with positions and a facing, a `pan` per speaker; the addon plays
+voices in stereo with them. Without rules from your game server, everyone in
+the room hears everyone.
+- `room`: `match` exists in every session. Other rooms exist when your game
+  server configured them (and the voice service has named rooms on).
+  Otherwise `join()` fails with `voice/room_not_supported` or
+  `voice/room_not_configured`; a full room answers `voice/room_full`.
+- `server_mute_changed(id, true)` with this player's own id: the game server
+  muted this player. Unmuting is refused (`voice/server_muted`) until it
+  unmutes.
+- `authority_changed(false)`: the rules cannot be reached for a while, and
+  nothing is forwarded (it fails closed). `authority_changed(true)` when
+  they are back.
+- **Client-spatialized rooms** (`spatial = "client"`): the voice server sends
+  every stream the channels allow, at gain 1 without pan.
+  `bind_participant(id, node)` plays that player through an
+  `AudioStreamPlayer3D` that follows `node`, so Godot's 3D audio places it.
+  These rooms are **not secrecy-safe** (`is_secrecy_safe()` is false): a
+  modified client hears everyone its channels allow, so say so in your UI.
+  In other rooms `bind_participant` fails with `voice/not_client_spatial`.
 
 Inspector properties:
+- `room`: the voice room `join()` enters (`match`).
 - `echo_cancellation`, `noise_suppression`, `auto_gain`: on by default. Echo
   cancellation uses everything the game plays (the Master bus) as its
   reference, so when a player uses speakers instead of a headset, the others
@@ -145,16 +185,10 @@ Inspector properties:
 - `input_source`: **Custom** sends samples you push with `push_input()`
   (mono, 48 kHz) instead of the microphone.
 
-Limits of this version:
-- One voice room per game session, where everyone hears everyone.
-- `participant_id` is opaque and never for display. `display_name` is still
-  empty; names come with a later server update.
-- Deafening is local: the audio still arrives, it is not played.
-- Proximity, groups and server mute come later.
-
 Voice error codes start with `voice/` (for example `voice/not_attached`,
 `voice/microphone_unavailable`, `voice/module_unavailable`,
-`voice/transport_failed`), or are `network`.
+`voice/room_not_configured`, `voice/room_full`, `voice/server_muted`,
+`voice/not_client_spatial`, `voice/transport_failed`), or are `network`.
 
 ## Where the sign-in is kept
 

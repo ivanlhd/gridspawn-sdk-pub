@@ -230,12 +230,19 @@ impl Source {
         }
     }
 
-    async fn token(&self) -> Result<Zeroizing<String>, Error> {
+    /// Runs `call` with the token. The player's token is refreshed once and
+    /// the call repeated when the service refuses it (`presence/token_invalid`).
+    async fn authorized<T, F, Fut>(&self, call: F) -> Result<T, Error>
+    where
+        F: Fn(Zeroizing<String>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, Error>>,
+    {
         match self {
-            Self::Player(client) => client.valid_access_token().await,
-            Self::Session(session) => Ok(Zeroizing::new(
-                session.grant(Module::Presence).await?.as_str().to_owned(),
-            )),
+            Self::Player(client) => client.with_access_token(call).await,
+            Self::Session(session) => {
+                let grant = session.grant(Module::Presence).await?;
+                call(Zeroizing::new(grant.as_str().to_owned())).await
+            }
         }
     }
 
@@ -252,18 +259,24 @@ impl Source {
     }
 
     async fn put(&self, body: &Value) -> Result<PresenceAck, Error> {
-        let token = self.token().await?;
+        let url = self.url()?;
         let response: SetResponse = self
-            .client()
-            .inner
-            .http
-            .send(Call {
-                service: Service::Edge,
-                method: Method::PUT,
-                url: self.url()?,
-                route: "PUT {presence}",
-                bearer: Some(&token),
-                body: Body::Json(body),
+            .authorized(|token| {
+                let url = url.clone();
+                async move {
+                    self.client()
+                        .inner
+                        .http
+                        .send(Call {
+                            service: Service::Edge,
+                            method: Method::PUT,
+                            url,
+                            route: "PUT {presence}",
+                            bearer: Some(&token),
+                            body: Body::Json(body),
+                        })
+                        .await
+                }
             })
             .await?;
         if !response.ok || response.expires_at <= 0 {
@@ -275,18 +288,24 @@ impl Source {
     }
 
     async fn delete(&self) -> Result<(), Error> {
-        let token = self.token().await?;
+        let url = self.url()?;
         let response: ClearResponse = self
-            .client()
-            .inner
-            .http
-            .send(Call {
-                service: Service::Edge,
-                method: Method::DELETE,
-                url: self.url()?,
-                route: "DELETE {presence}",
-                bearer: Some(&token),
-                body: Body::None,
+            .authorized(|token| {
+                let url = url.clone();
+                async move {
+                    self.client()
+                        .inner
+                        .http
+                        .send(Call {
+                            service: Service::Edge,
+                            method: Method::DELETE,
+                            url,
+                            route: "DELETE {presence}",
+                            bearer: Some(&token),
+                            body: Body::None,
+                        })
+                        .await
+                }
             })
             .await?;
         if !response.ok {

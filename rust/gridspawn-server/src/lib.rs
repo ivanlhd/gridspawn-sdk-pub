@@ -7,6 +7,7 @@
 //!   `docs/protocol/02-sessions.md`;
 //! - player presence set by the game server —
 //!   `docs/protocol/03-presence.md`;
+//! - voice rules: who hears whom in a session's voice rooms ([`Session::voice`]);
 //! - posts to the game's club with a club grant —
 //!   `docs/protocol/05-club.md`.
 //!
@@ -44,6 +45,7 @@ mod http;
 mod presence;
 mod session;
 mod types;
+mod voice;
 
 #[cfg(feature = "blocking")]
 pub mod blocking;
@@ -58,3 +60,7 @@ pub use session::{
     ParticipantId, RenewerHandle, Session, SessionId,
 };
 pub use types::{Environment, IdempotencyKey, Module, RetryPolicy};
+pub use voice::{
+    Ghosts, PositionPublisher, Rolloff, Spatial, VoiceAck, VoiceConfig, VoiceControl, VoiceMode,
+    VoicePlayerState, VoicePosition, VoiceRoom,
+};

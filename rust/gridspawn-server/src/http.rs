@@ -58,6 +58,14 @@ impl Http {
     }
 
     pub async fn send<T: DeserializeOwned>(&self, call: Call<'_>) -> Result<T, Error> {
+        self.send_counted(call).await.0
+    }
+
+    /// As `send`, with the number of attempts made (1 without a retry).
+    pub async fn send_counted<T: DeserializeOwned>(
+        &self,
+        call: Call<'_>,
+    ) -> (Result<T, Error>, u32) {
         let attempts = if call.retry {
             self.retry.max_attempts.max(1)
         } else {
@@ -74,14 +82,14 @@ impl Http {
                 request_id = tracing::field::Empty,
             );
             match self.once::<T>(&call).instrument(span.clone()).await {
-                Ok(value) => return Ok(value),
+                Ok(value) => return (Ok(value), attempt),
                 Err(error) if attempt < attempts && error.transport_retryable() => {
                     let wait = self.retry.backoff(attempt);
                     tracing::warn!(parent: &span, %error, ?wait, "gridspawn request failed; retrying");
                     tokio::time::sleep(wait).await;
                     attempt += 1;
                 }
-                Err(error) => return Err(error),
+                Err(error) => return (Err(error), attempt),
             }
         }
     }
@@ -153,21 +161,23 @@ fn api_error(
     header_request_id: Option<String>,
 ) -> ApiError {
     let text = |value: Option<&Value>| value.and_then(Value::as_str).map(str::to_owned);
-    let (code, message, field, body_request_id) = match serde_json::from_slice::<Value>(body) {
-        Ok(Value::Object(map)) => {
-            let (code, message, field) = match map.get("error") {
-                Some(Value::Object(error)) => (
-                    text(error.get("code")),
-                    text(error.get("message")),
-                    text(error.get("field")),
-                ),
-                Some(Value::String(code)) => (Some(code.clone()), None, None),
-                _ => (text(map.get("code")), None, None),
-            };
-            (code, message, field, text(map.get("requestId")))
-        }
-        _ => (None, None, None, None),
-    };
+    let (code, message, field, reason, body_request_id) =
+        match serde_json::from_slice::<Value>(body) {
+            Ok(Value::Object(map)) => {
+                let (code, message, field, reason) = match map.get("error") {
+                    Some(Value::Object(error)) => (
+                        text(error.get("code")),
+                        text(error.get("message")),
+                        text(error.get("field")),
+                        text(error.get("reason")),
+                    ),
+                    Some(Value::String(code)) => (Some(code.clone()), None, None, None),
+                    _ => (text(map.get("code")), None, None, None),
+                };
+                (code, message, field, reason, text(map.get("requestId")))
+            }
+            _ => (None, None, None, None, None),
+        };
     let wire_code = code.unwrap_or_else(|| {
         if status == StatusCode::TOO_MANY_REQUESTS {
             "rate_limited".to_owned()
@@ -188,5 +198,6 @@ fn api_error(
             .and_then(|value| value.trim().parse::<u64>().ok())
             .map(Duration::from_secs),
         field,
+        reason,
     }
 }

@@ -103,7 +103,7 @@ func _on_participant_joined(participant_id: String, display_name: String) -> voi
 	if _other != "" or _step != "wait_other":
 		return
 	_other = participant_id
-	print("RESULT participant_joined display_name_empty=%s" % display_name.is_empty())
+	print("RESULT participant_joined display_name=" + display_name)
 	_step = "listen"
 	get_tree().create_timer(1.0).timeout.connect(_start_listening)
 

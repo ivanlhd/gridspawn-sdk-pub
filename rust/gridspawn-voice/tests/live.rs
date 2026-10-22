@@ -25,6 +25,35 @@ fn env(name: &str) -> Option<String> {
 struct Fixture {
     server: gridspawn_server::Session,
     client: Client,
+    /// (client, admission ms, consume-existing-speakers ms) per join.
+    joins: Mutex<Vec<(String, u128, u128)>>,
+}
+
+/// This machine's load (Linux `/proc/loadavg`): a slow run on a busy host is
+/// told apart from a service problem at a glance.
+fn host_load() -> String {
+    std::fs::read_to_string("/proc/loadavg")
+        .map(|load| load.trim().to_owned())
+        .unwrap_or_else(|_| "n/a (no /proc/loadavg)".to_owned())
+}
+
+/// At the end of every test: the load again, and every join's admission and
+/// consume times.
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let joins = self.joins.lock().unwrap();
+        let table: Vec<String> = joins
+            .iter()
+            .map(|(name, admission, consume)| {
+                format!("{name}: admission {admission} ms, consume {consume} ms")
+            })
+            .collect();
+        eprintln!(
+            "host load at the end: {}; joins: {}",
+            host_load(),
+            table.join("; ")
+        );
+    }
 }
 
 async fn fixture() -> Option<Fixture> {
@@ -35,6 +64,7 @@ async fn fixture() -> Option<Fixture> {
         eprintln!("skipped: GRIDSPAWN_TEST_APP_ID / GRIDSPAWN_TEST_CREDENTIAL_FILE not set");
         return None;
     };
+    eprintln!("host load at the start: {}", host_load());
     let server = gridspawn_server::Client::builder(
         app_id.clone(),
         gridspawn_server::Environment::Development,
@@ -61,21 +91,24 @@ async fn fixture() -> Option<Fixture> {
     Some(Fixture {
         server: session,
         client,
+        joins: Mutex::new(Vec::new()),
     })
 }
 
 impl Fixture {
-    async fn attach(&self, name: &str) -> AttachedSession {
+    async fn admit(&self, name: &str) -> gridspawn_server::Participant {
         let key = gridspawn_server::IdempotencyKey::random();
-        let guest = self
-            .server
+        self.server
             .admit_guest(gridspawn_server::AdmitGuest::new(
                 format!("voice-{key}"),
                 name,
                 key,
             ))
             .await
-            .expect("guest");
+            .expect("guest")
+    }
+
+    async fn attach_guest(&self, guest: &gridspawn_server::Participant) -> AttachedSession {
         let ticket = guest
             .issue_ticket(&[gridspawn_server::Module::Voice])
             .await
@@ -83,10 +116,43 @@ impl Fixture {
         self.client.attach(ticket.as_str()).await.expect("attach")
     }
 
+    async fn attach(&self, name: &str) -> AttachedSession {
+        let guest = self.admit(name).await;
+        self.attach_guest(&guest).await
+    }
+
     async fn join(&self, name: &str) -> (AttachedSession, VoiceSession) {
         let started = Instant::now();
         let attached = self.attach(name).await;
         let attach_time = started.elapsed();
+        (
+            attached.clone(),
+            self.voice_join(name, &attached, attach_time).await,
+        )
+    }
+
+    /// Joins voice for a guest admitted earlier (its state already set).
+    async fn join_guest(
+        &self,
+        name: &str,
+        guest: &gridspawn_server::Participant,
+    ) -> (AttachedSession, VoiceSession) {
+        let started = Instant::now();
+        let attached = self.attach_guest(guest).await;
+        let attach_time = started.elapsed();
+        (
+            attached.clone(),
+            self.voice_join(name, &attached, attach_time).await,
+        )
+    }
+
+    async fn voice_join(
+        &self,
+        name: &str,
+        attached: &AttachedSession,
+        attach_time: Duration,
+    ) -> VoiceSession {
+        let started = Instant::now();
         let options = VoiceOptions::default()
             .transmit(TransmitMode::Continuous)
             // Tones are steady: noise suppression and gain control would reshape them.
@@ -96,21 +162,33 @@ impl Fixture {
                     .noise_suppression(false)
                     .auto_gain(false),
             );
-        let voice = VoiceSession::join(&self.client, &attached, options)
+        let voice = VoiceSession::join(&self.client, attached, options)
             .await
             .expect("voice join");
-        let steps: Vec<String> = voice
-            .join_timings()
+        let timings = voice.join_timings();
+        let step_ms = |prefix: &str| {
+            timings
+                .iter()
+                .filter(|(step, _)| step.starts_with(prefix))
+                .map(|(_, took)| took.as_millis())
+                .sum::<u128>()
+        };
+        self.joins.lock().unwrap().push((
+            name.to_owned(),
+            step_ms("admission"),
+            step_ms("consume existing"),
+        ));
+        let steps: Vec<String> = timings
             .iter()
             .map(|(step, took)| format!("{step} {}", took.as_millis()))
             .collect();
         eprintln!(
             "{name}: guest + ticket + attach {} ms; join {} ms: {}",
             attach_time.as_millis(),
-            (started.elapsed() - attach_time).as_millis(),
+            started.elapsed().as_millis(),
             steps.join(", ")
         );
-        (attached, voice)
+        voice
     }
 }
 
@@ -223,6 +301,15 @@ async fn three_speakers_mute_and_rejoin() {
         pump(c.clone(), 800.0),
     );
     tokio::time::sleep(Duration::from_secs(6)).await;
+    for (name, me) in [("A", &a), ("B", &b), ("C", &c)] {
+        let stats = me.stats();
+        eprintln!(
+            "{name} ({}) received {:?}, concealed {:?}",
+            me.local_id(),
+            stats.packets_received,
+            stats.frames_concealed
+        );
+    }
 
     // Each hears the two others, each with its own tone, and not itself.
     for (pump, me, tones) in [
@@ -450,4 +537,215 @@ async fn long_session_renews() {
     }
     a.leave().await;
     b.leave().await;
+}
+
+/// RTP packets `listener` has received from `speaker` so far.
+fn rx(listener: &VoiceSession, speaker: &str) -> u64 {
+    listener
+        .stats()
+        .packets_received
+        .get(speaker)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Packets from `speaker` that reach `listener` in `window` (after `settle`).
+async fn rx_during(
+    listener: &VoiceSession,
+    speaker: &str,
+    settle: Duration,
+    window: Duration,
+) -> u64 {
+    tokio::time::sleep(settle).await;
+    let before = rx(listener, speaker);
+    tokio::time::sleep(window).await;
+    rx(listener, speaker) - before
+}
+
+/// How long until `listener` gets packets from `speaker` (at most 5 s).
+async fn time_to_audio(listener: &VoiceSession, speaker: &str) -> Option<Duration> {
+    let started = Instant::now();
+    let before = rx(listener, speaker);
+    while started.elapsed() < Duration::from_secs(5) {
+        if rx(listener, speaker) > before {
+            return Some(started.elapsed());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    None
+}
+
+/// The game server's rules, end to end on the room `match` (named rooms are
+/// off on development): a hybrid room (channels, or range 2–20 m, linear).
+/// Inaudible pairs must deliver zero packets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_rules_channels_proximity_and_mutes() {
+    use gridspawn_server::{VoiceConfig, VoicePlayerState, VoiceRoom};
+    let Some(f) = fixture().await else { return };
+    let voice = f.server.voice();
+    let ack = voice
+        .configure(&VoiceConfig::new().room("match", VoiceRoom::hybrid(2.0, 20.0)))
+        .await
+        .expect("configure");
+    assert!(!ack.enforced, "nobody in voice yet: {ack:?}");
+
+    // A and C share a channel; B has its own and starts out of range; D gets
+    // no state at all.
+    let (ga, gb, gc, gd) = (
+        f.admit("Rules A").await,
+        f.admit("Rules B").await,
+        f.admit("Rules C").await,
+        f.admit("Rules D").await,
+    );
+    for (guest, team) in [(&ga, "team:red"), (&gb, "team:blue"), (&gc, "team:red")] {
+        voice
+            .set_player_state(&guest.id, &VoicePlayerState::new().channels([team]))
+            .await
+            .expect("state");
+    }
+    let positions = voice.spawn_position_publisher(10);
+    positions
+        .update(&ga.id, [0.0, 0.0, 0.0], Some(0.0))
+        .unwrap();
+    positions.update(&gb.id, [100.0, 0.0, 0.0], None).unwrap();
+    positions.update(&gc.id, [0.0, 0.0, 1.0], None).unwrap();
+
+    let (_sa, a) = f.join_guest("Rules A", &ga).await;
+    let (_sb, b) = f.join_guest("Rules B", &gb).await;
+    let (_sc, c) = f.join_guest("Rules C", &gc).await;
+    let (_sd, d) = f.join_guest("Rules D", &gd).await;
+    let (pa, pb, pc, pd) = (
+        pump(a.clone(), 440.0),
+        pump(b.clone(), 600.0),
+        pump(c.clone(), 800.0),
+        pump(d.clone(), 300.0),
+    );
+    let mut a_events = a.events();
+    let mut c_events = c.events();
+    let ack = voice
+        .set_player_state(&ga.id, &VoicePlayerState::new().channels(["team:red"]))
+        .await
+        .expect("state again");
+    eprintln!("after the joins: {ack:?}");
+    assert!(ack.enforced, "enforced once players are in voice");
+
+    // Roster: the game server's participant ids, with display names.
+    assert_eq!(a.local_id(), ga.id.as_str());
+    let seen: HashMap<String, Option<String>> = a
+        .participants()
+        .into_iter()
+        .map(|p| (p.id, p.display_name))
+        .collect();
+    for (guest, name) in [(&gb, "Rules B"), (&gc, "Rules C"), (&gd, "Rules D")] {
+        assert_eq!(
+            seen.get(guest.id.as_str()),
+            Some(&Some(name.to_owned())),
+            "A's roster: {seen:?}"
+        );
+    }
+
+    // Channels: A hears C, not B (other channel, out of range), not D (no state).
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let (b_id, c_id, d_id) = (gb.id.as_str(), gc.id.as_str(), gd.id.as_str());
+    assert!(
+        hears(&tail(&pa, c_id, 2), 800.0, &[440.0, 600.0, 300.0]),
+        "A hears C"
+    );
+    for (from, label) in [(b_id, "B"), (d_id, "D")] {
+        let got = rx_during(&a, from, Duration::ZERO, Duration::from_secs(2)).await;
+        assert_eq!(got, 0, "A must receive nothing from {label}");
+    }
+    assert_eq!(
+        rx_during(&d, ga.id.as_str(), Duration::ZERO, Duration::from_secs(2)).await,
+        0,
+        "D hears no one"
+    );
+    assert!(!a.participant(b_id).unwrap().audible);
+    eprintln!("channels: A hears C only; B and D send A zero packets");
+
+    // Proximity: B walks to 10 m, inside the range.
+    positions.update(&gb.id, [10.0, 0.0, 0.0], None).unwrap();
+    let took = time_to_audio(&a, b_id).await.expect("B audible at 10 m");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let b_info = a.participant(b_id).unwrap();
+    let curve = 1.0 - (10.0 - 2.0) / (20.0 - 2.0);
+    eprintln!(
+        "B at 10 m: first packet {took:?}, gain {} (curve {curve:.4}), pan {:?}",
+        b_info.gain, b_info.pan
+    );
+    assert!(b_info.audible);
+    assert!(
+        (b_info.gain - curve).abs() <= 1.0 / 32.0 + 1e-6,
+        "gain {}",
+        b_info.gain
+    );
+    assert!(
+        hears(&tail(&pa, b_id, 1), 600.0, &[440.0, 800.0, 300.0]),
+        "A hears B"
+    );
+    // And back out of range: silent again.
+    positions.update(&gb.id, [100.0, 0.0, 0.0], None).unwrap();
+    assert_eq!(
+        rx_during(&a, b_id, Duration::from_secs(1), Duration::from_secs(2)).await,
+        0,
+        "B out of range"
+    );
+
+    // Server mute of C.
+    voice.mute(&gc.id, true).await.expect("mute");
+    wait_for(&mut a_events, |e| matches!(e, VoiceEvent::ServerMuted { participant, muted: true } if participant == c_id)).await;
+    wait_for(&mut c_events, |e| {
+        matches!(e, VoiceEvent::LocalServerMuted { muted: true })
+    })
+    .await;
+    let refused = c
+        .set_muted(false)
+        .await
+        .expect_err("unmute while server-muted");
+    assert_eq!(refused.code(), "voice/server_muted");
+    assert_eq!(
+        rx_during(&a, c_id, Duration::from_millis(500), Duration::from_secs(2)).await,
+        0,
+        "C server-muted"
+    );
+    voice.mute(&gc.id, false).await.expect("unmute");
+    wait_for(&mut c_events, |e| {
+        matches!(e, VoiceEvent::LocalServerMuted { muted: false })
+    })
+    .await;
+    c.set_muted(false).await.expect("unmute after the server");
+    assert!(time_to_audio(&a, c_id).await.is_some(), "C back");
+    eprintln!("server mute: events, refusal, zero packets, and back");
+
+    // Local mute of C by A: zero packets, then back.
+    a.set_participant_muted(c_id, true)
+        .await
+        .expect("local mute");
+    assert!(a.participant(c_id).unwrap().locally_muted);
+    assert_eq!(
+        rx_during(&a, c_id, Duration::from_millis(500), Duration::from_secs(2)).await,
+        0,
+        "C muted by A"
+    );
+    a.set_participant_muted(c_id, false)
+        .await
+        .expect("local unmute");
+    assert!(time_to_audio(&a, c_id).await.is_some(), "C back for A");
+    // Unmuting someone the server keeps inaudible is not an error; they come
+    // back when the server allows.
+    a.set_participant_muted(b_id, true).await.expect("mute B");
+    a.set_participant_muted(b_id, false)
+        .await
+        .expect("unmute B while out of range");
+    positions.update(&gb.id, [5.0, 0.0, 0.0], None).unwrap();
+    assert!(time_to_audio(&a, b_id).await.is_some(), "B in range again");
+    eprintln!("local mute: zero packets, back, and unmute while inaudible is fine");
+
+    drop(positions);
+    for p in [pa, pb, pc, pd] {
+        p.task.abort();
+    }
+    for v in [a, b, c, d] {
+        v.leave().await;
+    }
 }

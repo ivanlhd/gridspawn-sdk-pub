@@ -25,15 +25,19 @@
 //! # Ok(()) }
 //! ```
 //!
-//! Limits of this version (the backend's, today): one room per game session
-//! where everyone hears everyone; participants are opaque ids with no display
-//! names; deafening is local; no server mute or audibility events.
+//! Who hears whom is decided by the game server (`gridspawn-server`'s
+//! `session.voice()`): channels, proximity, dead and spectating players, and
+//! the authoritative mute. The voice service forwards nothing for a pair that
+//! may not hear each other; this client applies the gain and pan it sends
+//! ([`VoiceEvent::Audibility`], [`VoiceSession::pull_mix_stereo`]). Without
+//! server rules, everyone in the room hears everyone.
 
 mod admission;
 mod audio;
 mod error;
 mod jitter;
 mod media;
+mod roster;
 mod sdp;
 mod session;
 mod signaling;
@@ -43,6 +47,7 @@ pub mod devices;
 
 pub use audio::AudioOptions;
 pub use error::VoiceError;
+pub use roster::RoomConfig;
 pub use session::{
     ParticipantInfo, TransmitMode, VoiceEvent, VoiceOptions, VoiceSession, VoiceStats,
 };

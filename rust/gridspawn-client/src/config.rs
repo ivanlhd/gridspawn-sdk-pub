@@ -221,6 +221,7 @@ impl ClientBuilder {
                 http,
                 store,
                 session: Mutex::new(None),
+                fresh_until: Mutex::new(None),
                 refresh: Mutex::new(None),
                 events,
             }),
@@ -359,6 +360,10 @@ pub(crate) struct Inner {
     pub store: Arc<dyn TokenStore>,
     /// The held session (§6: "signed in" means this is `Some`).
     pub session: Mutex<Option<StoredSession>>,
+    /// Until when the held access token counts as fresh, on the monotonic
+    /// clock, with the token it is about. The stored Unix expiry is only read
+    /// once, when a session is restored.
+    pub fresh_until: Mutex<Option<(zeroize::Zeroizing<String>, tokio::time::Instant)>>,
     /// The refresh in flight, if any; concurrent callers wait for the same one.
     pub refresh: Mutex<Option<watch::Receiver<RefreshResult>>>,
     pub events: broadcast::Sender<AuthEvent>,

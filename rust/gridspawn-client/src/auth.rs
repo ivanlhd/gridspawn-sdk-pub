@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeSet,
     fmt,
+    future::Future,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -23,7 +24,9 @@ use crate::{
 };
 
 /// Refresh when the access token has less than this left.
-const REFRESH_MARGIN_SECS: i64 = 30;
+const REFRESH_MARGIN: Duration = Duration::from_secs(30);
+/// The longest a restored access token is trusted without a refresh.
+const MAX_RESTORED_FRESHNESS: i64 = 24 * 3600;
 /// The server keeps an authorization request for 10 minutes.
 const MAX_SIGN_IN_WAIT: Duration = Duration::from_secs(600);
 
@@ -220,8 +223,10 @@ struct TokenUser {
 }
 
 impl TokenResponse {
-    /// 01 §2: Bearer, both tokens non-empty, `expires_in > 0`, a subject and a display name.
-    fn into_session(self) -> Result<StoredSession, Error> {
+    /// 01 §2: Bearer, both tokens non-empty, `expires_in > 0`, a subject and a
+    /// display name. Also how long the access token lasts from now (the
+    /// server's `expires_in`, for the monotonic freshness).
+    fn into_session(self) -> Result<(StoredSession, Duration), Error> {
         let valid = self.token_type == "Bearer"
             && !self.access_token.is_empty()
             && !self.refresh_token.is_empty()
@@ -232,17 +237,25 @@ impl TokenResponse {
             return Err(Error::InvalidResponse("invalid token response"));
         }
         let scopes: BTreeSet<&str> = self.scope.split_whitespace().collect();
-        Ok(StoredSession {
-            access_expires_at: now() + self.expires_in.min(1.0e9) as i64,
-            scopes: scopes.into_iter().map(str::to_owned).collect(),
-            user: User {
-                display_name: self.user.display_name,
-                subject: self.user.subject,
-                avatar_object_path: self.user.avatar_object_path.filter(|path| !path.is_empty()),
+        let valid_for = Duration::from_secs_f64(self.expires_in.min(1.0e9));
+        Ok((
+            StoredSession {
+                // Stored for the next launch only (see `Client::restore`).
+                access_expires_at: now() + valid_for.as_secs() as i64,
+                scopes: scopes.into_iter().map(str::to_owned).collect(),
+                user: User {
+                    display_name: self.user.display_name,
+                    subject: self.user.subject,
+                    avatar_object_path: self
+                        .user
+                        .avatar_object_path
+                        .filter(|path| !path.is_empty()),
+                },
+                access_token: self.access_token,
+                refresh_token: self.refresh_token,
             },
-            access_token: self.access_token,
-            refresh_token: self.refresh_token,
-        })
+            valid_for,
+        ))
     }
 }
 
@@ -259,8 +272,13 @@ fn now() -> i64 {
         .map_or(0, |elapsed| elapsed.as_secs() as i64)
 }
 
-fn fresh(session: &StoredSession) -> bool {
-    !session.access_token.is_empty() && session.access_expires_at > now() + REFRESH_MARGIN_SECS
+/// The service refused the player's access token: expired or revoked,
+/// whatever this machine's clock said about it.
+fn token_refused(error: &Error) -> bool {
+    matches!(
+        error.api_code(),
+        Some(ErrorCode::LoginRequired | ErrorCode::PresenceTokenInvalid)
+    )
 }
 
 /// A refusal that ends the session (§6).
@@ -315,7 +333,13 @@ impl Client {
             });
         }
         *lock(&self.inner.session) = Some(stored.clone());
-        if fresh(&stored) {
+        // The stored expiry was written with this machine's clock, so its
+        // difference from this clock is the remaining lifetime as far as this
+        // machine can tell. It is read once, here; if the clock moved since,
+        // a refused token is refreshed on first use (`with_access_token`).
+        let remaining = (stored.access_expires_at - now()).clamp(0, MAX_RESTORED_FRESHNESS);
+        self.mark_fresh(&stored, Duration::from_secs(remaining as u64));
+        if self.is_fresh(&stored) {
             return Ok(Restore::SignedIn(stored.user.clone()));
         }
         match self.refreshed(&stored).await {
@@ -407,21 +431,28 @@ impl Client {
                 reason: "32-256 characters of A-Z a-z 0-9 . _ ~ -",
             });
         }
-        let token = self.valid_access_token().await?;
         let mut url = endpoint(&self.inner.auth_base, "/v1/auth/player-assertions");
         url.query_pairs_mut()
             .append_pair("client_id", &self.inner.app_id)
             .append_pair("environment", self.inner.environment.as_str());
+        let body = json!({ "audience": "game_server", "challenge": challenge });
         let response: AssertionResponse = self
-            .inner
-            .http
-            .send(Call {
-                service: Service::Auth,
-                method: Method::POST,
-                url,
-                route: "POST /v1/auth/player-assertions",
-                bearer: Some(&token),
-                body: Body::Json(&json!({ "audience": "game_server", "challenge": challenge })),
+            .with_access_token(|token| {
+                let url = url.clone();
+                let body = &body;
+                async move {
+                    self.inner
+                        .http
+                        .send(Call {
+                            service: Service::Auth,
+                            method: Method::POST,
+                            url,
+                            route: "POST /v1/auth/player-assertions",
+                            bearer: Some(&token),
+                            body: Body::Json(body),
+                        })
+                        .await
+                }
             })
             .await?;
         let value = Zeroizing::new(response.player_assertion);
@@ -438,6 +469,7 @@ impl Client {
     /// revoke is returned, but the local session is gone either way.
     pub async fn sign_out(&self) -> Result<(), Error> {
         let held = lock(&self.inner.session).take();
+        *lock(&self.inner.fresh_until) = None;
         let session = match held {
             Some(session) => Some(session),
             None => self.store_call(|store| store.load()).await.ok().flatten(),
@@ -475,9 +507,10 @@ impl Client {
                 ],
             )
             .await?;
-        let session = response.into_session()?;
+        let (session, valid_for) = response.into_session()?;
         let user = session.user.clone();
         *lock(&self.inner.session) = Some(session.clone());
+        self.mark_fresh(&session, valid_for);
         self.persist(&session).await;
         let _ = self.inner.events.send(AuthEvent::SignedIn(user.clone()));
         Ok(user)
@@ -551,11 +584,57 @@ impl Client {
         let held = lock(&self.inner.session)
             .clone()
             .ok_or(Error::SignInRequired)?;
-        if fresh(&held) {
+        if self.is_fresh(&held) {
             return Ok(Zeroizing::new(held.access_token.clone()));
         }
         let session = self.refreshed(&held).await?;
         Ok(Zeroizing::new(session.access_token.clone()))
+    }
+
+    /// Runs `call` with the player's access token. When the service refuses
+    /// the token as expired or invalid, refreshes once and runs it again: the
+    /// local clock may have been wrong about the token's freshness.
+    pub(crate) async fn with_access_token<T, F, Fut>(&self, call: F) -> Result<T, Error>
+    where
+        F: Fn(Zeroizing<String>) -> Fut,
+        Fut: Future<Output = Result<T, Error>>,
+    {
+        let token = self.valid_access_token().await?;
+        match call(token).await {
+            Err(error) if token_refused(&error) => {
+                let held = lock(&self.inner.session)
+                    .clone()
+                    .ok_or(Error::SignInRequired)?;
+                tracing::debug!(%error, "the access token was refused; refreshing once");
+                match self.refreshed(&held).await {
+                    Ok(session) => call(Zeroizing::new(session.access_token.clone())).await,
+                    // The session is over: say so.
+                    Err(refresh) if ends_session(&refresh) => Err(refresh),
+                    // The refresh could not run (offline, 5xx): the refusal stands.
+                    Err(_) => Err(error),
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// The held access token counts as fresh for `valid_for` from now
+    /// (monotonic clock).
+    fn mark_fresh(&self, session: &StoredSession, valid_for: Duration) {
+        *lock(&self.inner.fresh_until) = Some((
+            Zeroizing::new(session.access_token.clone()),
+            Instant::now() + valid_for,
+        ));
+    }
+
+    fn is_fresh(&self, session: &StoredSession) -> bool {
+        !session.access_token.is_empty()
+            && lock(&self.inner.fresh_until)
+                .as_ref()
+                .is_some_and(|(token, until)| {
+                    token.as_str() == session.access_token
+                        && *until > Instant::now() + REFRESH_MARGIN
+                })
     }
 
     /// One refresh at a time: concurrent callers wait for the same one. It runs
@@ -626,7 +705,7 @@ impl Client {
                 .is_some_and(|held| held.refresh_token == refresh_token)
         };
         match response.and_then(TokenResponse::into_session) {
-            Ok(session) => {
+            Ok((session, valid_for)) => {
                 let replaced = {
                     let mut held = lock(&self.inner.session);
                     let replaced = still_held(&held);
@@ -635,6 +714,9 @@ impl Client {
                     }
                     replaced
                 };
+                if replaced {
+                    self.mark_fresh(&session, valid_for);
+                }
                 if !replaced {
                     // Signed out (or in again) meanwhile: drop the new token.
                     let _ = self.revoke(&session.refresh_token).await;

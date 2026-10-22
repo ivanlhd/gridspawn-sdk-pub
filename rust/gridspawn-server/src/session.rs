@@ -15,6 +15,7 @@ use crate::{
     client::{segment, Client},
     error::Error,
     types::{bounded, token_char, IdempotencyKey, Module},
+    voice::{self, VoiceShared},
 };
 
 /// 02 §1. Create with [`CreateSession::new`] and the builder methods.
@@ -193,6 +194,7 @@ impl Client {
             client: self.clone(),
             id: lease.session_id.clone(),
             lease: Arc::new(Mutex::new(Some(lease))),
+            voice: VoiceShared::default(),
         })
     }
 
@@ -202,6 +204,7 @@ impl Client {
             client: self.clone(),
             id,
             lease: Arc::new(Mutex::new(None)),
+            voice: VoiceShared::default(),
         }
     }
 }
@@ -225,6 +228,9 @@ pub struct Session {
     client: Client,
     id: SessionId,
     lease: Arc<Mutex<Option<Lease>>>,
+    /// Voice sequence numbers and the admission-rule bookkeeping, shared by
+    /// this handle's clones and its participants.
+    voice: VoiceShared,
 }
 
 impl Session {
@@ -234,6 +240,10 @@ impl Session {
 
     pub(crate) fn client(&self) -> &Client {
         &self.client
+    }
+
+    pub(crate) fn voice_shared(&self) -> &VoiceShared {
+        &self.voice
     }
 
     /// The last lease seen; `None` for a [`Client::session`] handle until it renews.
@@ -360,6 +370,7 @@ impl Session {
             display_name: response.display_name,
             client: self.client.clone(),
             session_id: self.id.clone(),
+            voice: self.voice.clone(),
         })
     }
 }
@@ -564,6 +575,7 @@ pub struct Participant {
     pub display_name: Option<String>,
     client: Client,
     session_id: SessionId,
+    voice: VoiceShared,
 }
 
 impl Participant {
@@ -577,6 +589,11 @@ impl Participant {
 
     /// 02 §5: a single-use ticket for 1–3 modules. Never retried: each call
     /// issues a new ticket.
+    ///
+    /// With voice in a managed room, set the player's voice state first
+    /// ([`crate::VoiceControl::set_player_state`]): a participant without one
+    /// hears no one and is heard by no one. This logs a warning when this
+    /// session handle configured voice but never sent this player's state.
     pub async fn issue_ticket(&self, modules: &[Module]) -> Result<ClientTicket, Error> {
         let mut names: Vec<&str> = modules.iter().map(|module| module.as_str()).collect();
         names.sort_unstable();
@@ -586,6 +603,9 @@ impl Participant {
                 field: "modules",
                 reason: "1-3 different modules",
             });
+        }
+        if modules.contains(&Module::Voice) {
+            voice::warn_if_stateless(&self.voice, &self.id);
         }
         let response: TicketResponse = self
             .client

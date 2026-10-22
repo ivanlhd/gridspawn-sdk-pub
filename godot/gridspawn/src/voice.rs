@@ -7,7 +7,9 @@
 //! - echo reference: an `AudioEffectCapture` on the Master bus, so the echo
 //!   canceller also removes the game's own sounds;
 //! - playback: one `AudioStreamPlayer` with an `AudioStreamGenerator` per
-//!   participant, on `output_bus`.
+//!   participant, on `output_bus`, in stereo with the server's pan; in
+//!   client-spatialized rooms, an `AudioStreamPlayer3D` that follows the node
+//!   given to `bind_participant`.
 //!
 //! The network runs on the `GridspawnClient` node's runtime.
 
@@ -16,20 +18,22 @@ use std::{collections::HashMap, sync::mpsc};
 use godot::{
     classes::{
         AudioEffect, AudioEffectCapture, AudioServer, AudioStreamGenerator,
-        AudioStreamGeneratorPlayback, AudioStreamMicrophone, AudioStreamPlayer, INode,
-        ProjectSettings,
+        AudioStreamGeneratorPlayback, AudioStreamMicrophone, AudioStreamPlayer,
+        AudioStreamPlayer3D, INode, ProjectSettings,
     },
     prelude::*,
 };
-use gridspawn_voice::{AudioOptions, TransmitMode, VoiceEvent, VoiceOptions, VoiceSession};
+use gridspawn_voice::{
+    AudioOptions, RoomConfig, TransmitMode, VoiceEvent, VoiceOptions, VoiceSession,
+};
 use tokio::{runtime::Handle, task::JoinHandle};
 
 use crate::GridspawnClient;
 
 /// The voice core's sample rate (mono).
 const RATE: f64 = 48_000.0;
-/// The only room the backend serves today.
-const ROOM: &str = "match";
+/// Every game session has this room.
+const DEFAULT_ROOM: &str = "match";
 /// Playback buffer per participant. Larger survives longer frame hitches,
 /// smaller adds less delay.
 const PLAYBACK_BUFFER_SECONDS: f32 = 0.1;
@@ -153,8 +157,26 @@ impl Tap {
     }
 }
 
+/// How one participant is played.
+enum Player {
+    /// Stereo, with the server's pan.
+    Flat(Gd<AudioStreamPlayer>),
+    /// Mono into Godot's 3D audio, following a node of the game's scene
+    /// (client-spatialized rooms only).
+    Spatial(Gd<AudioStreamPlayer3D>, Gd<Node3D>),
+}
+
+impl Player {
+    fn free(&mut self) {
+        match self {
+            Self::Flat(player) => player.queue_free(),
+            Self::Spatial(player, _) => player.queue_free(),
+        }
+    }
+}
+
 struct Remote {
-    player: Gd<AudioStreamPlayer>,
+    player: Player,
     playback: Gd<AudioStreamGeneratorPlayback>,
 }
 
@@ -167,6 +189,10 @@ pub struct GridspawnVoice {
     /// The `GridspawnClient` node (the `Gridspawn` autoload).
     #[export]
     client_path: NodePath,
+    /// The voice room `join()` enters: `match` (every session has it) or a
+    /// room your game server configured.
+    #[export]
+    room: GString,
     #[export]
     input_source: VoiceInput,
     /// The microphone's bus. Created, muted, when it does not exist.
@@ -208,6 +234,7 @@ impl INode for GridspawnVoice {
         let (outcomes_tx, outcomes_rx) = mpsc::channel();
         Self {
             client_path: NodePath::from("/root/Gridspawn"),
+            room: GString::from(DEFAULT_ROOM),
             input_source: VoiceInput::Microphone,
             input_bus: StringName::from("GridspawnVoiceInput"),
             output_bus: StringName::from("Master"),
@@ -259,10 +286,27 @@ impl GridspawnVoice {
     fn speaking_stopped(participant_id: GString);
     #[signal]
     fn error(code: GString, message: GString);
+    /// The room's rules arrived or changed: `{mode, spatial, secrecy_safe,
+    /// max_participants, managed}` (as `get_room_config()`).
+    #[signal]
+    fn room_config_changed(config: VarDictionary);
+    /// False while the voice service's rules are unreachable: nothing is
+    /// forwarded then (fail closed). True when they are back.
+    #[signal]
+    fn authority_changed(available: bool);
+    /// The game server's decision for one other player changed: whether this
+    /// player hears them, the gain (0–1, times the local volume) and the pan
+    /// (−1 left … 1 right, or null without one).
+    #[signal]
+    fn audibility_changed(participant_id: GString, audible: bool, gain: f32, pan: Variant);
+    /// The game server muted or unmuted a player (this player's own id when
+    /// it is this player; unmuting is then refused with `voice/server_muted`).
+    #[signal]
+    fn server_mute_changed(participant_id: GString, muted: bool);
 
-    /// Joins the attached session's voice room → `joined` | `error`. This
-    /// version has one room per session ("match"), where everyone hears
-    /// everyone.
+    /// Joins the attached session's voice room `room` → `joined` | `error`.
+    /// Who hears whom is decided by your game server (channels, proximity,
+    /// mutes); without its rules everyone in the room hears everyone.
     #[func]
     fn join(&mut self) {
         if self.session.is_some() || self.joining {
@@ -290,7 +334,8 @@ impl GridspawnVoice {
                     .noise_suppression(self.noise_suppression)
                     .auto_gain(self.auto_gain),
             )
-            .transmit(self.transmit_mode());
+            .transmit(self.transmit_mode())
+            .room(self.room.to_string());
         self.joining = true;
         self.cancel_join = false;
         let outcomes = self.outcomes_tx.clone();
@@ -372,8 +417,29 @@ impl GridspawnVoice {
         }
     }
 
-    /// `[{participant_id, display_name, speaking, gain}]`. `participant_id`
-    /// is opaque, never for display; `display_name` is empty in this version.
+    /// Mutes one other player for this player only: the voice server stops
+    /// sending their audio here. Unmuting someone the game server currently
+    /// keeps inaudible is fine: they are heard again when it allows.
+    #[func]
+    fn set_player_muted(&mut self, participant_id: GString, muted: bool) {
+        let (Some(session), Some(handle)) = (self.session.clone(), self.handle.as_ref()) else {
+            return;
+        };
+        let outcomes = self.outcomes_tx.clone();
+        let id = participant_id.to_string();
+        handle.spawn(async move {
+            if let Err(error) = session.set_participant_muted(&id, muted).await {
+                let _ = outcomes.send(Outcome::Warning(format!("player mute: {error}")));
+            }
+        });
+    }
+
+    /// `[{participant_id, display_name, speaking, volume, audible, gain, pan,
+    /// server_muted, locally_muted}]`, everyone else in the room.
+    /// `participant_id` is the id your game server got when it admitted the
+    /// player: never show it, show `display_name`. `volume` is this player's
+    /// own setting (`set_player_volume`); `gain` and `pan` (null without one)
+    /// are the game server's.
     #[func]
     fn get_participants(&self) -> Array<VarDictionary> {
         let mut list = Array::new();
@@ -393,10 +459,82 @@ impl GridspawnVoice {
                     .to_variant(),
             );
             put(&mut entry, "speaking", participant.speaking.to_variant());
-            put(&mut entry, "gain", participant.volume.to_variant());
+            put(&mut entry, "volume", participant.volume.to_variant());
+            put(&mut entry, "audible", participant.audible.to_variant());
+            put(&mut entry, "gain", participant.gain.to_variant());
+            put(&mut entry, "pan", pan_variant(participant.pan));
+            put(
+                &mut entry,
+                "server_muted",
+                participant.server_muted.to_variant(),
+            );
+            put(
+                &mut entry,
+                "locally_muted",
+                participant.locally_muted.to_variant(),
+            );
             list.push(&entry);
         }
         list
+    }
+
+    /// The room's rules: `{mode, spatial, secrecy_safe, max_participants,
+    /// managed}`. `managed` is false (and the rest absent) while the room has
+    /// no rules from the game server: everyone hears everyone. Proximity
+    /// distances stay on the game server.
+    #[func]
+    fn get_room_config(&self) -> VarDictionary {
+        room_dictionary(self.session.as_ref().and_then(VoiceSession::room_config))
+    }
+
+    /// False only in client-spatialized rooms, where a modified client could
+    /// hear everyone its channels allow: label such rooms in your UI.
+    #[func]
+    fn is_secrecy_safe(&self) -> bool {
+        self.session
+            .as_ref()
+            .and_then(VoiceSession::room_config)
+            .is_none_or(|config| config.secrecy_safe)
+    }
+
+    /// Client-spatialized rooms only (`spatial = "client"`): plays this
+    /// player's voice through an `AudioStreamPlayer3D` that follows `node`,
+    /// with Godot's 3D attenuation. Elsewhere: `error("voice/not_client_spatial")`.
+    #[func]
+    fn bind_participant(&mut self, participant_id: GString, node: Gd<Node3D>) {
+        let spatial = self
+            .session
+            .as_ref()
+            .and_then(VoiceSession::room_config)
+            .is_some_and(|config| config.spatial == "client");
+        if !spatial {
+            self.emit_error(
+                "voice/not_client_spatial",
+                "bind_participant works in client-spatialized rooms only; the game server places voices here.",
+            );
+            return;
+        }
+        let id = participant_id.to_string();
+        if let Some(mut remote) = self.remotes.remove(&id) {
+            remote.player.free();
+        }
+        self.add_player(&id, Some(node));
+    }
+
+    /// Plays this player's voice without 3D placement again.
+    #[func]
+    fn unbind_participant(&mut self, participant_id: GString) {
+        let id = participant_id.to_string();
+        let bound = matches!(
+            self.remotes.get(&id).map(|remote| &remote.player),
+            Some(Player::Spatial(..))
+        );
+        if bound {
+            if let Some(mut remote) = self.remotes.remove(&id) {
+                remote.player.free();
+            }
+            self.add_player(&id, None);
+        }
     }
 
     /// This player's own participant id (in `speaking_started`/`stopped`).
@@ -507,6 +645,26 @@ fn put(dictionary: &mut VarDictionary, key: &str, value: Variant) {
     dictionary.set(&key.to_variant(), &value);
 }
 
+fn pan_variant(pan: Option<f32>) -> Variant {
+    pan.map_or(Variant::nil(), |pan| pan.to_variant())
+}
+
+fn room_dictionary(config: Option<RoomConfig>) -> VarDictionary {
+    let mut out = VarDictionary::new();
+    put(&mut out, "managed", config.is_some().to_variant());
+    if let Some(config) = config {
+        put(&mut out, "mode", config.mode.to_variant());
+        put(&mut out, "spatial", config.spatial.to_variant());
+        put(&mut out, "secrecy_safe", config.secrecy_safe.to_variant());
+        put(
+            &mut out,
+            "max_participants",
+            i64::from(config.max_participants).to_variant(),
+        );
+    }
+    out
+}
+
 fn input_enabled() -> bool {
     ProjectSettings::singleton()
         .get_setting("audio/driver/enable_input")
@@ -584,8 +742,18 @@ impl GridspawnVoice {
             self.reference = Some(Tap::install(&StringName::from("Master")));
         }
         self.session = Some(session.clone());
-        self.base_mut()
-            .emit_signal("joined", &[GString::from(ROOM).to_variant()]);
+        let room = self.room.clone();
+        self.base_mut().emit_signal("joined", &[room.to_variant()]);
+        if let Some(config) = session.room_config() {
+            self.base_mut().emit_signal(
+                "room_config_changed",
+                &[room_dictionary(Some(config)).to_variant()],
+            );
+        }
+        if !session.authority_available() {
+            self.base_mut()
+                .emit_signal("authority_changed", &[false.to_variant()]);
+        }
         // Everyone already in the room, after `joined`.
         for participant in session.participants() {
             self.add_remote(&participant.id);
@@ -614,9 +782,62 @@ impl GridspawnVoice {
             VoiceEvent::ParticipantJoined { participant } => self.add_remote(&participant),
             VoiceEvent::ParticipantLeft { participant } => {
                 if let Some(mut remote) = self.remotes.remove(&participant) {
-                    remote.player.queue_free();
+                    remote.player.free();
                     self.emit_participant("participant_left", &participant);
                 }
+            }
+            VoiceEvent::Audibility {
+                participant,
+                audible,
+                gain,
+                pan,
+            } => {
+                self.base_mut().emit_signal(
+                    "audibility_changed",
+                    &[
+                        GString::from(&participant).to_variant(),
+                        audible.to_variant(),
+                        gain.to_variant(),
+                        pan_variant(pan),
+                    ],
+                );
+            }
+            VoiceEvent::RoomConfig { config } => {
+                self.base_mut().emit_signal(
+                    "room_config_changed",
+                    &[room_dictionary(Some(config)).to_variant()],
+                );
+            }
+            VoiceEvent::Authority { available } => {
+                self.base_mut()
+                    .emit_signal("authority_changed", &[available.to_variant()]);
+            }
+            VoiceEvent::ServerMuted { participant, muted } => {
+                self.base_mut().emit_signal(
+                    "server_mute_changed",
+                    &[GString::from(&participant).to_variant(), muted.to_variant()],
+                );
+            }
+            VoiceEvent::ReceiveFailed {
+                participant,
+                code,
+                message,
+            } => {
+                // Not fatal: the session goes on without this player's voice.
+                let name = self
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.participant(&participant))
+                    .and_then(|info| info.display_name)
+                    .unwrap_or_else(|| "a player".to_owned());
+                self.emit_error(&code, &format!("could not receive {name}: {message}"));
+            }
+            VoiceEvent::LocalServerMuted { muted } => {
+                let local = self.get_local_participant_id();
+                self.base_mut().emit_signal(
+                    "server_mute_changed",
+                    &[local.to_variant(), muted.to_variant()],
+                );
             }
             VoiceEvent::SpeakingStarted { participant } => {
                 self.emit_participant("speaking_started", &participant)
@@ -650,37 +871,68 @@ impl GridspawnVoice {
             .emit_signal("left", &[GString::from(reason).to_variant()]);
     }
 
-    /// A player and its generator for one participant.
+    /// A new participant: their player, then `participant_joined` with the
+    /// name to show.
     fn add_remote(&mut self, participant: &str) {
         if self.remotes.contains_key(participant) {
             return;
         }
-        let mut generator = AudioStreamGenerator::new_gd();
-        generator.set_mix_rate(RATE as f32);
-        generator.set_buffer_length(PLAYBACK_BUFFER_SECONDS);
-        let mut player = AudioStreamPlayer::new_alloc();
-        player.set_stream(&generator);
-        player.set_bus(&self.output_bus);
-        self.base_mut().add_child(&player);
-        player.play();
-        let Some(playback) = player
-            .get_stream_playback()
-            .and_then(|playback| playback.try_cast::<AudioStreamGeneratorPlayback>().ok())
-        else {
-            godot_warn!("GridspawnVoice: no generator playback");
-            player.queue_free();
-            return;
-        };
-        self.remotes
-            .insert(participant.to_owned(), Remote { player, playback });
+        self.add_player(participant, None);
+        let name = self
+            .session
+            .as_ref()
+            .and_then(|session| session.participant(participant))
+            .and_then(|info| info.display_name)
+            .unwrap_or_default();
         self.base_mut().emit_signal(
             "participant_joined",
             &[
                 GString::from(participant).to_variant(),
-                // Display names come with the voice roster (server work).
-                GString::new().to_variant(),
+                GString::from(&name).to_variant(),
             ],
         );
+    }
+
+    /// A generator for one participant, played flat (stereo, server pan) or
+    /// through a 3D player following `node`.
+    fn add_player(&mut self, participant: &str, node: Option<Gd<Node3D>>) {
+        let mut generator = AudioStreamGenerator::new_gd();
+        generator.set_mix_rate(RATE as f32);
+        generator.set_buffer_length(PLAYBACK_BUFFER_SECONDS);
+        let bus = self.output_bus.clone();
+        let (player, stream_playback) = match node {
+            None => {
+                let mut player = AudioStreamPlayer::new_alloc();
+                player.set_stream(&generator);
+                player.set_bus(&bus);
+                self.base_mut().add_child(&player);
+                player.play();
+                let playback = player.get_stream_playback();
+                (Player::Flat(player), playback)
+            }
+            Some(node) => {
+                let mut player = AudioStreamPlayer3D::new_alloc();
+                player.set_stream(&generator);
+                player.set_bus(&bus);
+                self.base_mut().add_child(&player);
+                if node.is_instance_valid() {
+                    player.set_global_position(node.get_global_position());
+                }
+                player.play();
+                let playback = player.get_stream_playback();
+                (Player::Spatial(player, node), playback)
+            }
+        };
+        let mut player = player;
+        let Some(playback) = stream_playback
+            .and_then(|playback| playback.try_cast::<AudioStreamGeneratorPlayback>().ok())
+        else {
+            godot_warn!("GridspawnVoice: no generator playback");
+            player.free();
+            return;
+        };
+        self.remotes
+            .insert(participant.to_owned(), Remote { player, playback });
     }
 
     /// The microphone on its (muted) input bus, with a capture.
@@ -721,11 +973,29 @@ impl GridspawnVoice {
             if frames <= 0 {
                 continue;
             }
-            samples.clear();
-            samples.resize(frames as usize, 0.0);
-            session.pull_participant(id, &mut samples);
-            let stereo: PackedVector2Array = samples.iter().map(|s| Vector2::new(*s, *s)).collect();
-            remote.playback.push_buffer(&stereo);
+            let frames = frames as usize;
+            let output: PackedVector2Array = match &mut remote.player {
+                Player::Flat(_) => {
+                    // Interleaved L, R with the server's pan.
+                    samples.clear();
+                    samples.resize(frames * 2, 0.0);
+                    session.pull_participant_stereo(id, &mut samples);
+                    samples
+                        .chunks_exact(2)
+                        .map(|pair| Vector2::new(pair[0], pair[1]))
+                        .collect()
+                }
+                Player::Spatial(player, node) => {
+                    if node.is_instance_valid() {
+                        player.set_global_position(node.get_global_position());
+                    }
+                    samples.clear();
+                    samples.resize(frames, 0.0);
+                    session.pull_participant(id, &mut samples);
+                    samples.iter().map(|s| Vector2::new(*s, *s)).collect()
+                }
+            };
+            remote.playback.push_buffer(&output);
         }
         self.samples = samples;
     }
@@ -737,7 +1007,7 @@ impl GridspawnVoice {
             task.abort();
         }
         for (_, mut remote) in self.remotes.drain() {
-            remote.player.queue_free();
+            remote.player.free();
         }
         if let Some((mut player, tap)) = self.microphone.take() {
             player.queue_free();

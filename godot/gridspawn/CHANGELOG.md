@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0 (2026-10-23)
+
+- Voice rules from the game server: `audibility_changed(participant_id, audible, gain, pan)`, `room_config_changed(config)`, `authority_changed(available)`, `server_mute_changed(participant_id, muted)`; `get_room_config()`, `is_secrecy_safe()`; voices play in stereo with the server's pan.
+- Players are listed with their display names (in `participant_joined` and `get_participants()`) as soon as they join, and `participant_id` is the id your game server got when it admitted the player (gridspawn-voice 0.2.0).
+- `get_participants()`: `volume` is this player's own setting (it was called `gain`); `gain` and `pan` are now the game server's; new `audible`, `server_muted`, `locally_muted`.
+- `room` property for `join()`; `set_player_muted(participant_id, muted)`; client-spatialized rooms: `bind_participant(participant_id, node)` / `unbind_participant(participant_id)` (an `AudioStreamPlayer3D` following the node), `voice/not_client_spatial` elsewhere.
+
 ## 0.2.1 (2026-10-22)
 
 - Fix (gridspawn-voice 0.1.1): after the last other player in a voice room left, the next one to join was not heard and the voice session ended with `voice/transport_failed`. Players can now leave and join again freely.

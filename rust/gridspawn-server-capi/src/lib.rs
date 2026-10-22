@@ -50,9 +50,10 @@ pub enum GsStatus {
     Internal = 9,
 }
 
-/// The documented error codes (protocol 02 and 05). GS_ERROR_CODE_NONE when
-/// the status is not GS_STATUS_API; GS_ERROR_CODE_OTHER for codes this
-/// version does not know (see gs_error_wire_code).
+/// The documented error codes (protocol 02 and 05, and the voice routes).
+/// GS_ERROR_CODE_NONE when the status is not GS_STATUS_API;
+/// GS_ERROR_CODE_OTHER for codes this version does not know (see
+/// gs_error_wire_code). New codes are added after OTHER.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GsErrorCode {
@@ -83,6 +84,14 @@ pub enum GsErrorCode {
     ChatUnavailable = 24,
     RateLimited = 25,
     Other = 26,
+    /// voice/invalid_request: see gs_error_field and gs_error_reason.
+    VoiceInvalidRequest = 27,
+    /// voice/stale_sequence: a newer update was already accepted.
+    VoiceStaleSequence = 28,
+    VoiceParticipantNotFound = 29,
+    VoiceModuleDisabled = 30,
+    /// voice/unavailable (503), retryable.
+    VoiceUnavailable = 31,
 }
 
 #[repr(C)]
@@ -165,6 +174,46 @@ pub struct GsAdmitParticipant {
     pub team: *const c_char,
 }
 
+/// A player's voice state. Fill with gs_voice_player_state_init first (alive,
+/// may speak, no channels, every room).
+#[repr(C)]
+pub struct GsVoicePlayerState {
+    /// NULL = every configured room; otherwise rooms_len room names (0-4).
+    pub rooms: *const *const c_char,
+    pub rooms_len: usize,
+    /// channels_len keys (0-8), for example "team:red"; NULL when 0.
+    pub channels: *const *const c_char,
+    pub channels_len: usize,
+    pub alive: bool,
+    pub spectator: bool,
+    pub can_speak: bool,
+    /// NULL = none. Players in different scenes never hear each other.
+    pub scene: *const c_char,
+}
+
+/// One player's position: right-handed, y up, metres. yaw (radians, used when
+/// has_yaw) is where they face: 0 faces -z, growing turns left. 2D games send
+/// (x, 0, y): the pan is computed in the x/z plane.
+#[repr(C)]
+pub struct GsVoicePosition {
+    pub participant_id: *const c_char,
+    pub position: [f64; 3],
+    pub yaw: f64,
+    pub has_yaw: bool,
+}
+
+/// The answer to a voice update.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GsVoiceAck {
+    /// The rules are enforced now (false until a player of the session joins
+    /// voice, or while the voice server's link is down). Not an error.
+    pub enforced: bool,
+    /// A retried update met "a newer update was already accepted": it landed
+    /// earlier or was replaced; enforced is false then.
+    pub overtaken: bool,
+}
+
 /// Called once on a runtime worker thread when gs_post_async finishes. On
 /// success id is set and error is NULL; otherwise id is NULL. id and error are
 /// borrowed for the duration of the call. Do not call blocking gs_* functions
@@ -210,6 +259,12 @@ pub struct GsRenewer {
     _rt: Arc<Rt>,
 }
 
+/// Sends the latest position of each player at a fixed rate. gs_voice_publisher_free stops it.
+pub struct GsVoicePublisher {
+    handle: Option<gs::PositionPublisher>,
+    _rt: Arc<Rt>,
+}
+
 /// An error. Free with gs_error_free.
 pub struct GsError {
     status: GsStatus,
@@ -220,6 +275,8 @@ pub struct GsError {
     request_id: Option<CString>,
     retry_after_ms: i64,
     retryable: bool,
+    field: Option<CString>,
+    reason: Option<CString>,
 }
 
 /// One multi-thread runtime per client, shut down without blocking when the
@@ -259,6 +316,8 @@ impl GsError {
             request_id: None,
             retry_after_ms: -1,
             retryable: false,
+            field: None,
+            reason: None,
         }
     }
 
@@ -293,6 +352,8 @@ impl GsError {
             out.retry_after_ms = api.retry_after.map_or(-1, |wait| {
                 i64::try_from(wait.as_millis()).unwrap_or(i64::MAX)
             });
+            out.field = api.field.clone().map(cstring);
+            out.reason = api.reason.clone().map(cstring);
         }
         out
     }
@@ -326,6 +387,11 @@ fn error_code(code: &gs::ErrorCode) -> GsErrorCode {
         C::BoardBusy => GsErrorCode::BoardBusy,
         C::ChatUnavailable => GsErrorCode::ChatUnavailable,
         C::RateLimited => GsErrorCode::RateLimited,
+        C::VoiceInvalidRequest => GsErrorCode::VoiceInvalidRequest,
+        C::VoiceStaleSequence => GsErrorCode::VoiceStaleSequence,
+        C::VoiceParticipantNotFound => GsErrorCode::VoiceParticipantNotFound,
+        C::VoiceModuleDisabled => GsErrorCode::VoiceModuleDisabled,
+        C::VoiceUnavailable => GsErrorCode::VoiceUnavailable,
         _ => GsErrorCode::Other,
     }
 }
@@ -1161,6 +1227,318 @@ pub unsafe extern "C" fn gs_participant_free(participant: *mut GsParticipant) {
     quietly(|| drop(unsafe { Box::from_raw(participant) }));
 }
 
+// ---- voice -----------------------------------------------------------------
+
+/// SAFETY: `out` is NULL or a valid, writable pointer.
+unsafe fn write_ack(out: *mut GsVoiceAck, ack: gs::VoiceAck) {
+    if !out.is_null() {
+        // SAFETY: non-NULL and writable per the contract.
+        unsafe {
+            put(
+                out,
+                GsVoiceAck {
+                    enforced: ack.enforced,
+                    overtaken: ack.overtaken,
+                },
+            )
+        };
+    }
+}
+
+/// SAFETY: `items` is NULL or points to `len` NUL-terminated strings.
+unsafe fn text_list(
+    items: *const *const c_char,
+    len: usize,
+    name: &str,
+) -> Result<Vec<String>, GsError> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    require(items, name)?;
+    (0..len)
+        // SAFETY: `len` valid entries per the contract.
+        .map(|index| unsafe { text(*items.add(index), name) }.map(str::to_owned))
+        .collect()
+}
+
+/// Defaults: every room, no channels, alive, not a spectator, may speak, no scene.
+#[no_mangle]
+pub unsafe extern "C" fn gs_voice_player_state_init(state: *mut GsVoicePlayerState) {
+    if state.is_null() {
+        return;
+    }
+    quietly(|| {
+        let defaults = GsVoicePlayerState {
+            rooms: ptr::null(),
+            rooms_len: 0,
+            channels: ptr::null(),
+            channels_len: 0,
+            alive: true,
+            spectator: false,
+            can_speak: true,
+            scene: ptr::null(),
+        };
+        // SAFETY: non-NULL and writable (header contract).
+        unsafe { put(state, defaults) };
+    });
+}
+
+/// Replaces the session's voice rooms. config_json is the wire shape, for
+/// example {"rooms": {"match": {"mode": "channels"}}}; it is checked before
+/// sending. ack_out may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn gs_voice_configure(
+    session: *mut GsSession,
+    config_json: *const c_char,
+    ack_out: *mut GsVoiceAck,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        // SAFETY: header contract.
+        let session = unsafe { handle(session, "session") }?;
+        // SAFETY: header contract.
+        let config = sdk(gs::VoiceConfig::from_json(unsafe {
+            text(config_json, "config_json")
+        }?))?;
+        let ack = sdk(block_on(
+            &session.rt,
+            session.session.voice().configure(&config),
+        )?)?;
+        // SAFETY: NULL or writable (header contract).
+        unsafe { write_ack(ack_out, ack) };
+        Ok(())
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// Sets one player's state. Call it before issuing the player's voice ticket:
+/// in a managed room a player without a state hears no one and is heard by
+/// no one. state->rooms NULL = every room; non-NULL with rooms_len 0 = no
+/// room. ack_out may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn gs_voice_set_player_state(
+    session: *mut GsSession,
+    participant_id: *const c_char,
+    state: *const GsVoicePlayerState,
+    ack_out: *mut GsVoiceAck,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        // SAFETY: header contract.
+        let session = unsafe { handle(session, "session") }?;
+        // SAFETY: header contract.
+        let participant =
+            gs::ParticipantId::new(unsafe { text(participant_id, "participant_id") }?);
+        // SAFETY: header contract.
+        let state = unsafe { handle(state, "state") }?;
+        // SAFETY: header contract for the arrays and strings inside.
+        let player = unsafe {
+            let mut player = gs::VoicePlayerState::new()
+                .channels(text_list(state.channels, state.channels_len, "channels")?)
+                .alive(state.alive)
+                .spectator(state.spectator)
+                .can_speak(state.can_speak);
+            if !state.rooms.is_null() {
+                player = player.rooms(text_list(state.rooms, state.rooms_len, "rooms")?);
+            }
+            if let Some(scene) = optional_text(state.scene, "scene")? {
+                player = player.scene(scene);
+            }
+            player
+        };
+        let ack = sdk(block_on(
+            &session.rt,
+            session
+                .session
+                .voice()
+                .set_player_state(&participant, &player),
+        )?)?;
+        // SAFETY: NULL or writable (header contract).
+        unsafe { write_ack(ack_out, ack) };
+        Ok(())
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// The authoritative mute (also after the player reconnects). ack_out may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn gs_voice_mute(
+    session: *mut GsSession,
+    participant_id: *const c_char,
+    muted: bool,
+    ack_out: *mut GsVoiceAck,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        // SAFETY: header contract.
+        let session = unsafe { handle(session, "session") }?;
+        // SAFETY: header contract.
+        let participant =
+            gs::ParticipantId::new(unsafe { text(participant_id, "participant_id") }?);
+        let ack = sdk(block_on(
+            &session.rt,
+            session.session.voice().mute(&participant, muted),
+        )?)?;
+        // SAFETY: NULL or writable (header contract).
+        unsafe { write_ack(ack_out, ack) };
+        Ok(())
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// SAFETY: `entry` points to a live GsVoicePosition with a valid id string.
+unsafe fn position(entry: &GsVoicePosition) -> Result<gs::VoicePosition, GsError> {
+    // SAFETY: per the contract.
+    let id = gs::ParticipantId::new(unsafe { text(entry.participant_id, "participant_id") }?);
+    let mut position = gs::VoicePosition::new(&id, entry.position);
+    if entry.has_yaw {
+        position = position.yaw(entry.yaw);
+    }
+    Ok(position)
+}
+
+/// One batch of 1-256 positions. A position counts fully for 1 s after it
+/// arrives: send several times a second, or use gs_voice_publisher_spawn.
+/// ack_out may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn gs_voice_publish_positions(
+    session: *mut GsSession,
+    positions: *const GsVoicePosition,
+    count: usize,
+    ack_out: *mut GsVoiceAck,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        // SAFETY: header contract.
+        let session = unsafe { handle(session, "session") }?;
+        require(positions, "positions")?;
+        let batch = (0..count)
+            // SAFETY: `count` live entries (header contract).
+            .map(|index| unsafe { position(&*positions.add(index)) })
+            .collect::<Result<Vec<_>, _>>()?;
+        let ack = sdk(block_on(
+            &session.rt,
+            session.session.voice().publish_positions(&batch),
+        )?)?;
+        // SAFETY: NULL or writable (header contract).
+        unsafe { write_ack(ack_out, ack) };
+        Ok(())
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// Starts a publisher on the client's runtime: hz times a second (1-10; 2 or
+/// more keeps every position inside the 1 s hold) it sends the latest
+/// position of every player given to gs_voice_publisher_update.
+#[no_mangle]
+pub unsafe extern "C" fn gs_voice_publisher_spawn(
+    session: *mut GsSession,
+    hz: u32,
+    out: *mut *mut GsVoicePublisher,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        require(out, "out")?;
+        // SAFETY: header contract.
+        let session = unsafe { handle(session, "session") }?;
+        let publisher = {
+            let _entered = session.rt.get().enter();
+            session.session.voice().spawn_position_publisher(hz)
+        };
+        let handle = GsVoicePublisher {
+            handle: Some(publisher),
+            _rt: session.rt.clone(),
+        };
+        // SAFETY: checked non-NULL above.
+        unsafe { put(out, Box::into_raw(Box::new(handle))) };
+        Ok(())
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// A player's latest position (cheap; call every tick). Checked here. Never
+/// blocks, so it may be called from anywhere.
+#[no_mangle]
+pub unsafe extern "C" fn gs_voice_publisher_update(
+    publisher: *mut GsVoicePublisher,
+    participant_id: *const c_char,
+    x: f64,
+    y: f64,
+    z: f64,
+    yaw: f64,
+    has_yaw: bool,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        // SAFETY: header contract.
+        let publisher = unsafe { handle(publisher, "publisher") }?;
+        // SAFETY: header contract.
+        let id = gs::ParticipantId::new(unsafe { text(participant_id, "participant_id") }?);
+        let handle = publisher
+            .handle
+            .as_ref()
+            .ok_or_else(|| GsError::invalid("publisher stopped"))?;
+        sdk(handle.update(&id, [x, y, z], has_yaw.then_some(yaw)))
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// Stops sending this player's position (range audibility fades out 1-3 s later).
+#[no_mangle]
+pub unsafe extern "C" fn gs_voice_publisher_remove(
+    publisher: *mut GsVoicePublisher,
+    participant_id: *const c_char,
+) {
+    quietly(|| {
+        // SAFETY: NULL or live handles and strings (header contract).
+        let (Some(publisher), Ok(id)) = (unsafe { publisher.as_ref() }, unsafe {
+            text(participant_id, "participant_id")
+        }) else {
+            return;
+        };
+        if let Some(handle) = &publisher.handle {
+            handle.remove(&gs::ParticipantId::new(id));
+        }
+    });
+}
+
+/// The failure of the last batch: a new GsError to free with gs_error_free,
+/// or NULL when the last batch was sent (or for a NULL publisher).
+#[no_mangle]
+pub unsafe extern "C" fn gs_voice_publisher_last_error(
+    publisher: *const GsVoicePublisher,
+) -> *mut GsError {
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: NULL or a live handle (header contract).
+        unsafe { publisher.as_ref() }
+            .and_then(|p| p.handle.as_ref())
+            .and_then(gs::PositionPublisher::last_error)
+            .map_or(ptr::null_mut(), |error| {
+                Box::into_raw(Box::new(GsError::from_sdk(&error)))
+            })
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gs_voice_publisher_free(publisher: *mut GsVoicePublisher) {
+    if publisher.is_null() {
+        return;
+    }
+    quietly(|| {
+        // SAFETY: allocated by the library, freed once (header contract).
+        let mut publisher = unsafe { Box::from_raw(publisher) };
+        // Stop the task before the runtime reference goes.
+        drop(publisher.handle.take());
+    });
+}
+
 // ---- errors ----------------------------------------------------------------
 
 /// SAFETY: NULL or a live GsError.
@@ -1218,6 +1596,25 @@ pub unsafe extern "C" fn gs_error_request_id(error: *const GsError) -> *const c_
 pub unsafe extern "C" fn gs_error_retry_after_ms(error: *const GsError) -> i64 {
     // SAFETY: header contract.
     unsafe { error_ref(error) }.map_or(-1, |e| e.retry_after_ms)
+}
+
+/// The request field the error is about (voice and presence payload
+/// errors); NULL when the service named none.
+#[no_mangle]
+pub unsafe extern "C" fn gs_error_field(error: *const GsError) -> *const c_char {
+    // SAFETY: header contract.
+    unsafe { error_ref(error) }
+        .and_then(|e| e.field.as_ref())
+        .map_or(ptr::null(), |field| field.as_ptr())
+}
+
+/// Why that field was refused (voice payload errors), e.g. "count"; NULL when absent.
+#[no_mangle]
+pub unsafe extern "C" fn gs_error_reason(error: *const GsError) -> *const c_char {
+    // SAFETY: header contract.
+    unsafe { error_ref(error) }
+        .and_then(|e| e.reason.as_ref())
+        .map_or(ptr::null(), |reason| reason.as_ptr())
 }
 
 /// Network errors, timeouts, 5xx and 429.

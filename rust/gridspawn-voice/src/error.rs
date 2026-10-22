@@ -48,12 +48,21 @@ impl VoiceError {
     pub fn code(&self) -> String {
         match self {
             Self::ModuleUnavailable => "voice/module_unavailable".into(),
-            Self::Admission { code, .. } => format!("voice/admission_{}", normalize(code)),
+            Self::Admission { code, .. } => match code.as_str() {
+                "sdk_voice_room_not_supported" => "voice/room_not_supported".into(),
+                "sdk_voice_room_not_configured" => "voice/room_not_configured".into(),
+                "sdk_voice_room_full" => "voice/room_full".into(),
+                other => format!("voice/admission_{}", normalize(other)),
+            },
             Self::ReconnectRequired => "voice/reconnect_required".into(),
             Self::SignalingFailed => "voice/signaling_failed".into(),
             Self::SignalingTimeout => "voice/signaling_timeout".into(),
             Self::SignalingDisconnected => "voice/signaling_disconnected".into(),
-            Self::Sfu { reason, .. } => format!("voice/sfu_{}", normalize(reason)),
+            Self::Sfu { reason, .. } => match reason.as_str() {
+                "room_full" => "voice/room_full".into(),
+                "server_muted" => "voice/server_muted".into(),
+                other => format!("voice/sfu_{}", normalize(other)),
+            },
             Self::TransportFailed(_) => "voice/transport_failed".into(),
             Self::Audio(_) => "voice/audio_failed".into(),
             Self::AuthRefreshFailed => "voice/auth_refresh_failed".into(),
@@ -99,13 +108,31 @@ mod tests {
             .code(),
             "voice/sfu_not_authorized_for_producer"
         );
-        assert_eq!(
-            VoiceError::Admission {
+        for (code, expected) in [
+            ("sdk_voice_room_not_supported", "voice/room_not_supported"),
+            ("sdk_voice_room_not_configured", "voice/room_not_configured"),
+            ("sdk_voice_room_full", "voice/room_full"),
+            (
+                "sdk_voice_rate_limited",
+                "voice/admission_sdk_voice_rate_limited",
+            ),
+        ] {
+            let error = VoiceError::Admission {
                 status: 400,
-                code: "sdk_voice_room_not_supported".into()
-            }
-            .code(),
-            "voice/admission_sdk_voice_room_not_supported"
-        );
+                code: code.into(),
+            };
+            assert_eq!(error.code(), expected);
+        }
+        for (reason, expected) in [
+            ("room_full", "voice/room_full"),
+            ("server_muted", "voice/server_muted"),
+            ("sdk_server_authority", "voice/sfu_sdk_server_authority"),
+        ] {
+            let error = VoiceError::Sfu {
+                operation: "joinRoom".into(),
+                reason: reason.into(),
+            };
+            assert_eq!(error.code(), expected);
+        }
     }
 }
