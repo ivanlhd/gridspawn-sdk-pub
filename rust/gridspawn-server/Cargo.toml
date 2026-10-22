@@ -1,0 +1,31 @@
+[package]
+name = "gridspawn-server"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+description = "Rust server SDK for Gridspawn: game sessions, player and guest admission, client tickets, and club posts."
+# Not published until a licence is chosen (see the repository README).
+publish = false
+
+[features]
+default = []
+# A small synchronous facade with its own current-thread runtime.
+blocking = []
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+tracing = "0.1"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+zeroize = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+wiremock = "0.6"
+
+[[example]]
+name = "club_post"
