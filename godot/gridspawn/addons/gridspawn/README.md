@@ -3,7 +3,7 @@
 Player sign-in with the system browser, player assertions for your game
 server, joining game sessions, and in-game voice, for Godot 4.3 and later.
 
-Status: 0.2.0. Builds for Windows x86_64 and Linux x86_64. Licence: MIT OR
+Status: 0.2.1. Builds for Windows x86_64 and Linux x86_64. Licence: MIT OR
 Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`). The bundled Rust bindings for
 Godot are MPL-2.0, and the voice code includes WebRTC audio processing,
 Abseil and libopus: see `THIRD-PARTY.md`.

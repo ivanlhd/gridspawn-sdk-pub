@@ -299,6 +299,101 @@ async fn three_speakers_mute_and_rejoin() {
     }
 }
 
+/// A listener whose only remote speaker leaves keeps its voice: the speaker
+/// rejoins and is heard, and a third player who joins later is heard too
+/// (regression: removing the last receive section broke renegotiation).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn listener_survives_its_only_speaker_leaving() {
+    let Some(f) = fixture().await else { return };
+    let (_a_session, a) = f.join("Voice A").await;
+    let mut a_events = a.events();
+    let watch = a.clone();
+    let log = tokio::spawn(async move {
+        let mut events = watch.events();
+        while let Ok(event) = events.recv().await {
+            eprintln!("A event: {event:?}");
+        }
+    });
+    let pa = pump(a.clone(), 440.0);
+
+    // B joins, is heard, and leaves: A's receive leg loses its only section.
+    let (_b_session, b) = f.join("Voice B").await;
+    let b_id = b.local_id().to_owned();
+    wait_for(
+        &mut a_events,
+        |e| matches!(e, VoiceEvent::ParticipantJoined { participant } if *participant == b_id),
+    )
+    .await;
+    let pb = pump(b.clone(), 600.0);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        hears(&tail(&pa, &b_id, 2), 600.0, &[440.0, 800.0]),
+        "A hears B"
+    );
+    pb.task.abort();
+    b.leave().await;
+    wait_for(
+        &mut a_events,
+        |e| matches!(e, VoiceEvent::ParticipantLeft { participant } if *participant == b_id),
+    )
+    .await;
+    eprintln!("A saw B leave");
+
+    // B joins again: A adds a section after the removal and hears B.
+    let (_b2_session, b2) = f.join("Voice B again").await;
+    let b2_id = b2.local_id().to_owned();
+    wait_for(
+        &mut a_events,
+        |e| matches!(e, VoiceEvent::ParticipantJoined { participant } if *participant == b2_id),
+    )
+    .await;
+    let pb2 = pump(b2.clone(), 600.0);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        hears(&tail(&pa, &b2_id, 2), 600.0, &[440.0, 800.0]),
+        "A hears B after B rejoined"
+    );
+    eprintln!("A hears B after the rejoin");
+
+    // B leaves again, then C joins: A hears C.
+    pb2.task.abort();
+    b2.leave().await;
+    wait_for(
+        &mut a_events,
+        |e| matches!(e, VoiceEvent::ParticipantLeft { participant } if *participant == b2_id),
+    )
+    .await;
+    let (_c_session, c) = f.join("Voice C").await;
+    let c_id = c.local_id().to_owned();
+    wait_for(
+        &mut a_events,
+        |e| matches!(e, VoiceEvent::ParticipantJoined { participant } if *participant == c_id),
+    )
+    .await;
+    let pc = pump(c.clone(), 800.0);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        hears(&tail(&pa, &c_id, 2), 800.0, &[440.0, 600.0]),
+        "A hears C, who joined after B left"
+    );
+    eprintln!("A hears C after B left");
+
+    // A never failed.
+    while let Ok(event) = a_events.try_recv() {
+        assert!(
+            !matches!(event, VoiceEvent::Error { .. } | VoiceEvent::Left { .. }),
+            "A's session failed: {event:?}"
+        );
+    }
+    log.abort();
+    for p in [pa, pc] {
+        p.task.abort();
+    }
+    for v in [a, c] {
+        v.leave().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn long_session_renews() {
     if env("GRIDSPAWN_TEST_VOICE_LONG").is_none() {

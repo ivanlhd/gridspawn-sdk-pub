@@ -779,12 +779,21 @@ impl VoiceSession {
             ids.iter().filter_map(|id| remotes.remove(id)).collect()
         };
         for remote in removed {
-            self.inner
+            let removal = self
+                .inner
                 .recv
                 .lock()
                 .await
                 .remove(&self.inner.signaling, &self.inner.room_id, remote.ssrc)
                 .await;
+            // The leg is back to stable either way; later speakers still join.
+            if let Err(error) = removal {
+                tracing::warn!(%error, "voice receive renegotiation after a removal failed");
+                let _ = self.inner.events.send(VoiceEvent::Warning {
+                    code: error.code(),
+                    message: error.to_string(),
+                });
+            }
             let _ = self.inner.events.send(VoiceEvent::ParticipantLeft {
                 participant: remote.id.clone(),
             });

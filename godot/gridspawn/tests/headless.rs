@@ -16,6 +16,7 @@
 //! - `headless_voice`: two instances join one voice room, each sending its own
 //!   tone through a custom input (Godot's headless audio driver has no
 //!   microphone), and each checks it receives and plays the other's tone.
+//!   Then B leaves and joins again while A stays, and both check again.
 
 use std::{
     fs,
@@ -213,7 +214,7 @@ async fn headless_voice() {
     let Some(setup) = setup().await else { return };
     let ticket_a = voice_ticket(&setup.session, "Voice A").await;
     let ticket_b = voice_ticket(&setup.session, "Voice B").await;
-    let run = |ticket: String, tone: &'static str, expect: &'static str| {
+    let run = |ticket: String, tone: &'static str, expect: &'static str, role: &'static str| {
         let setup = &setup;
         async move {
             godot(
@@ -225,13 +226,18 @@ async fn headless_voice() {
                     ("GRIDSPAWN_TEST_TICKET", ticket.as_str()),
                     ("GRIDSPAWN_TEST_TONE_HZ", tone),
                     ("GRIDSPAWN_TEST_EXPECT_HZ", expect),
+                    ("GRIDSPAWN_TEST_ROLE", role),
                 ],
             )
             .await
         }
     };
-    let ((code_a, output_a), (code_b, output_b)) =
-        tokio::join!(run(ticket_a, "440", "660"), run(ticket_b, "660", "440"));
+    // A stays; B leaves and joins again. A must keep its voice (regression:
+    // a listener whose only speaker left lost its voice on the next join).
+    let ((code_a, output_a), (code_b, output_b)) = tokio::join!(
+        run(ticket_a, "440", "660", "stay"),
+        run(ticket_b, "660", "440", "rejoin")
+    );
     let runs = [("A", code_a, &output_a), ("B", code_b, &output_b)];
     // Both outputs first, so a failure in A still shows B.
     for (name, _, output) in runs {
@@ -245,20 +251,24 @@ async fn headless_voice() {
         }
         eprintln!("{name} RESULT {}", lines(output, "RESULT ").join(" | "));
     }
-    for (name, code, output) in runs {
+    const HEARD: [&str; 4] = [
+        "joined match",
+        "participant_joined display_name_empty=true",
+        "network sent=true received=true",
+        "hears_other_tone=true",
+    ];
+    let checked_again = &HEARD[1..];
+    let mut stay: Vec<&str> = HEARD.to_vec();
+    stay.push("participant_left");
+    stay.extend_from_slice(checked_again);
+    stay.extend_from_slice(&["left left", "done"]);
+    let mut rejoin: Vec<&str> = HEARD.to_vec();
+    rejoin.push("left left");
+    rejoin.extend_from_slice(&HEARD);
+    rejoin.extend_from_slice(&["left left", "done"]);
+    for ((name, code, output), expected) in runs.into_iter().zip([stay, rejoin]) {
         let results = lines(output, "RESULT ");
         assert_eq!(code, 0, "Godot {name} failed:\n{output}");
-        assert_eq!(
-            results,
-            [
-                "joined match",
-                "participant_joined display_name_empty=true",
-                "network sent=true received=true",
-                "hears_other_tone=true",
-                "left left",
-                "done",
-            ],
-            "Godot {name}"
-        );
+        assert_eq!(results, expected, "Godot {name}");
     }
 }

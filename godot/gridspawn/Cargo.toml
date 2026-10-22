@@ -1,6 +1,6 @@
 [package]
 name = "gridspawn-godot"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 # gdext's own minimum; the Rust crates under sdk/rust stay at 1.83.
 rust-version = "1.94"

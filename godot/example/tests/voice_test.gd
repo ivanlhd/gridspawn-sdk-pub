@@ -2,14 +2,21 @@ extends Node
 ## Headless voice test, driven by sdk/godot/gridspawn/tests/headless.rs: two
 ## instances join one session's voice room, each sending its own tone through
 ## a custom input. Reads GRIDSPAWN_TEST_APP_ID, GRIDSPAWN_TEST_TICKET,
-## GRIDSPAWN_TEST_TONE_HZ (own tone) and GRIDSPAWN_TEST_EXPECT_HZ (the other
-## instance's tone); prints RESULT and INFO lines.
+## GRIDSPAWN_TEST_TONE_HZ (own tone), GRIDSPAWN_TEST_EXPECT_HZ (the other
+## instance's tone) and GRIDSPAWN_TEST_ROLE; prints RESULT and INFO lines.
+##
+## Roles, for the leave-and-rejoin regression (a listener whose only speaker
+## left lost its voice when someone joined again):
+## - "stay": checks the other, sees it leave and come back, checks it again;
+## - "rejoin": checks the other, leaves, joins again, checks it again.
 
 const RATE := 48000.0
 const LISTEN_SECONDS := 4.0
 const STAY_SECONDS := 3.0
 
 var _voice: GridspawnVoice
+var _role := "stay"
+var _round := 1
 var _tone_hz := 0.0
 var _expect_hz := 0.0
 var _phase := 0.0
@@ -33,12 +40,16 @@ var _step := "attach"
 var _window_start := 0.0
 var _window_sent := 0
 var _window_received := 0
+var _window_concealed := 0
 var _last_frame_usec := 0
 var _frames := 0
 var _longest_frame_usec := 0
 
 
 func _ready() -> void:
+	_role = OS.get_environment("GRIDSPAWN_TEST_ROLE")
+	if _role not in ["stay", "rejoin"]:
+		_role = "stay"
 	_tone_hz = float(OS.get_environment("GRIDSPAWN_TEST_TONE_HZ"))
 	_expect_hz = float(OS.get_environment("GRIDSPAWN_TEST_EXPECT_HZ"))
 	Gridspawn.app_id = OS.get_environment("GRIDSPAWN_TEST_APP_ID")
@@ -56,6 +67,7 @@ func _ready() -> void:
 	add_child(_voice)
 	_voice.joined.connect(_on_joined)
 	_voice.participant_joined.connect(_on_participant_joined)
+	_voice.participant_left.connect(_on_participant_left)
 	_voice.left.connect(_on_left)
 	_voice.error.connect(func(code, message): _fail("voice error %s %s" % [code, message]))
 
@@ -64,7 +76,7 @@ func _ready() -> void:
 	_capture.buffer_length = 1.0
 	AudioServer.add_bus_effect(0, _capture)
 
-	get_tree().create_timer(90.0).timeout.connect(func(): _fail("timeout in step " + _step))
+	get_tree().create_timer(120.0).timeout.connect(func(): _fail("timeout in step " + _step))
 	Gridspawn.attach(OS.get_environment("GRIDSPAWN_TEST_TICKET"))
 
 
@@ -88,12 +100,22 @@ func _on_joined(room: String) -> void:
 
 
 func _on_participant_joined(participant_id: String, display_name: String) -> void:
-	if _other != "":
+	if _other != "" or _step != "wait_other":
 		return
 	_other = participant_id
 	print("RESULT participant_joined display_name_empty=%s" % display_name.is_empty())
 	_step = "listen"
 	get_tree().create_timer(1.0).timeout.connect(_start_listening)
+
+
+func _on_participant_left(participant_id: String) -> void:
+	# The staying listener waits for the other to leave, then for it to return.
+	if _role != "stay" or _step != "wait_rejoin" or participant_id != _other:
+		return
+	print("RESULT participant_left")
+	_other = ""
+	_round = 2
+	_step = "wait_other"
 
 
 func _start_listening() -> void:
@@ -103,6 +125,7 @@ func _start_listening() -> void:
 	var stats: Dictionary = _voice.get_stats()
 	_window_sent = stats["packets_sent"]
 	_window_received = stats["participants"].get(_other, {}).get("packets_received", 0)
+	_window_concealed = stats["participants"].get(_other, {}).get("frames_concealed", 0)
 	get_tree().create_timer(LISTEN_SECONDS).timeout.connect(_report)
 
 
@@ -149,9 +172,10 @@ func _report() -> void:
 		mine.get("frames_concealed", 0), mine.get("target_delay_ms", 0), _heard.size(),
 		AudioServer.get_mix_rate()])
 	var window := _elapsed - _window_start
-	print("INFO packets/s over the listening window (%.2f s): sent %.1f, received %.1f" % [
+	print("INFO packets/s over the listening window (%.2f s): sent %.1f, received %.1f; concealed in the window %d" % [
 		window, (stats["packets_sent"] - _window_sent) / window,
-		(mine.get("packets_received", 0) - _window_received) / window])
+		(mine.get("packets_received", 0) - _window_received) / window,
+		mine.get("frames_concealed", 0) - _window_concealed])
 	print("INFO frames while listening: %d in %.0f s, longest %.1f ms" % [_frames, LISTEN_SECONDS, _longest_frame_usec / 1000.0])
 	print("RESULT network sent=%s received=%s" % [stats["packets_sent"] > 100, mine.get("packets_received", 0) > 100])
 	if _heard.size() > 0:
@@ -163,13 +187,25 @@ func _report() -> void:
 		print("RESULT hears_other_tone=%s" % (expected > 100.0 * max(own, off) and expected > 1e-6))
 	else:
 		print("RESULT hears_other_tone=no_audio_mixed")
+	if _round == 1 and _role == "stay":
+		_step = "wait_rejoin"
+		return
 	_step = "leave"
-	get_tree().create_timer(STAY_SECONDS).timeout.connect(func(): _voice.leave())
+	# The rejoining instance leaves soon; the second round ends together.
+	var wait := 2.0 if _round == 1 else STAY_SECONDS
+	get_tree().create_timer(wait).timeout.connect(func(): _voice.leave())
 
 
 func _on_left(reason: String) -> void:
 	_expect("leave")
 	print("RESULT left " + reason)
+	if _round == 1 and _role == "rejoin":
+		# Join the same room again; the other instance stayed.
+		_round = 2
+		_other = ""
+		_step = "join"
+		get_tree().create_timer(1.0).timeout.connect(func(): _voice.join())
+		return
 	print("RESULT done")
 	get_tree().quit(0)
 

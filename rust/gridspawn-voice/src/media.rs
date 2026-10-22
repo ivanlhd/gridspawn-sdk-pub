@@ -314,8 +314,15 @@ impl RecvLeg {
         self.renegotiate(signaling, room_id).await
     }
 
-    /// Turns a consumer's section inactive (its mid is not reused).
-    pub async fn remove(&mut self, signaling: &Signaling, room_id: &str, ssrc: u32) {
+    /// Turns a consumer's section inactive (its mid is not reused). A failed
+    /// renegotiation is returned; the leg is back in a stable state either way,
+    /// so later additions still work.
+    pub async fn remove(
+        &mut self,
+        signaling: &Signaling,
+        room_id: &str,
+        ssrc: u32,
+    ) -> Result<(), VoiceError> {
         let mut changed = false;
         for section in &mut self.sections {
             if section.ssrc == ssrc && section.active {
@@ -324,10 +331,9 @@ impl RecvLeg {
             }
         }
         if changed {
-            if let Err(error) = self.renegotiate(signaling, room_id).await {
-                tracing::debug!(%error, "voice receive renegotiation after a removal failed");
-            }
+            self.renegotiate(signaling, room_id).await?;
         }
+        Ok(())
     }
 
     async fn renegotiate(
@@ -336,15 +342,10 @@ impl RecvLeg {
         room_id: &str,
     ) -> Result<(), VoiceError> {
         let offer = sdp::recv_offer(&self.transport, &self.sections);
-        self.pc
-            .set_remote_description(RTCSessionDescription::offer(offer).map_err(media_error)?)
-            .await
-            .map_err(media_error)?;
-        let answer = self.pc.create_answer(None).await.map_err(media_error)?;
-        self.pc
-            .set_local_description(answer)
-            .await
-            .map_err(media_error)?;
+        if let Err(error) = self.apply_offer(offer).await {
+            self.rollback().await;
+            return Err(error);
+        }
         if !self.connected {
             let local = self
                 .pc
@@ -363,7 +364,89 @@ impl RecvLeg {
         Ok(())
     }
 
+    /// After a failed round. A failed step can leave the connection in
+    /// have-remote-offer (webrtc-rs changes the signaling state before it
+    /// validates the offer), and every later offer would then be refused. Roll
+    /// back to stable; from stable the rollback is refused, which is fine.
+    async fn rollback(&self) {
+        match RTCSessionDescription::rollback(None) {
+            Ok(rollback) => {
+                if let Err(error) = self.pc.set_remote_description(rollback).await {
+                    tracing::debug!(%error, "voice receive rollback not applied");
+                }
+            }
+            Err(error) => tracing::debug!(%error, "voice receive rollback not built"),
+        }
+    }
+
+    /// One offer/answer round: the SFU's offer, our answer.
+    async fn apply_offer(&self, offer: String) -> Result<(), VoiceError> {
+        self.pc
+            .set_remote_description(RTCSessionDescription::offer(offer).map_err(media_error)?)
+            .await
+            .map_err(media_error)?;
+        let answer = self.pc.create_answer(None).await.map_err(media_error)?;
+        self.pc
+            .set_local_description(answer)
+            .await
+            .map_err(media_error)
+    }
+
     pub async fn close(&self) {
         let _ = self.pc.close().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sdp::{test_opus, test_transport, RecvSection};
+
+    fn open_section(mid: &str) -> RecvSection {
+        RecvSection {
+            mid: mid.into(),
+            codec: test_opus(),
+            ssrc: 1234,
+            cname: "remote".into(),
+            active: true,
+        }
+    }
+
+    /// The shape of the old offer after the only consumer closed: a rejected
+    /// section and no transport.
+    fn transportless_offer() -> String {
+        "v=0\r\no=mediasoup 1 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\na=ice-lite\r\n\
+         a=group:BUNDLE \r\na=msid-semantic: WMS *\r\n\
+         m=audio 0 UDP/TLS/RTP/SAVPF 100\r\nc=IN IP4 127.0.0.1\r\na=mid:0\r\na=inactive\r\n\
+         a=rtpmap:100 opus/48000/2\r\n"
+            .to_owned()
+    }
+
+    /// Regression: a refused offer left the receive leg in have-remote-offer
+    /// and every later offer failed; the rollback brings it back to stable.
+    #[tokio::test]
+    async fn a_refused_offer_is_rolled_back() {
+        let good = sdp::recv_offer(&test_transport(), &[open_section("1")]);
+
+        let (events, _) = mpsc::unbounded_channel();
+        let stuck = RecvLeg::open(test_transport(), 100, events).await.unwrap();
+        assert!(stuck.apply_offer(transportless_offer()).await.is_err());
+        let refused = stuck.apply_offer(good.clone()).await.unwrap_err();
+        assert!(
+            refused.to_string().contains("have-remote-offer"),
+            "without a rollback the next offer is refused: {refused}"
+        );
+        stuck.close().await;
+
+        let (events, _) = mpsc::unbounded_channel();
+        let leg = RecvLeg::open(test_transport(), 100, events).await.unwrap();
+        assert!(leg.apply_offer(transportless_offer()).await.is_err());
+        leg.rollback().await;
+        leg.apply_offer(good)
+            .await
+            .expect("accepted after the rollback");
+        // A rollback from stable is harmless.
+        leg.rollback().await;
+        leg.close().await;
     }
 }

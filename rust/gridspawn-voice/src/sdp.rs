@@ -178,15 +178,31 @@ pub(crate) struct RecvSection {
 }
 
 /// The SFU's offer to our receive transport: one section per consumer.
+///
+/// The first section carries the BUNDLE's transport, as in mediasoup-client:
+/// when its consumer closes it is disabled (inactive, still bundled, with the
+/// ICE and DTLS parameters), never rejected. Otherwise an offer whose
+/// consumers have all closed would have no transport at all, and webrtc-rs
+/// refuses it ("no ice-ufrag"). Later closed sections are rejected (port 0).
 pub(crate) fn recv_offer(transport: &TransportInfo, sections: &[RecvSection]) -> String {
     let mids: Vec<&str> = sections
         .iter()
-        .filter(|s| s.active)
-        .map(|s| s.mid.as_str())
+        .enumerate()
+        .filter(|(index, s)| s.active || *index == 0)
+        .map(|(_, s)| s.mid.as_str())
         .collect();
     let mut sdp = session_header(&mids);
-    for section in sections {
-        if section.active {
+    for (index, section) in sections.iter().enumerate() {
+        if !section.active && index == 0 {
+            sdp.push_str(&media_section(
+                transport,
+                &section.mid,
+                "inactive",
+                "actpass",
+                &section.codec,
+                "",
+            ));
+        } else if section.active {
             let extra = format!(
                 "a=msid:gridspawn-{mid} audio-{mid}\r\na=ssrc:{ssrc} cname:{cname}\r\n",
                 mid = section.mid,
@@ -236,36 +252,49 @@ pub(crate) fn local_cname(sdp: &str) -> Option<String> {
     })
 }
 
+/// A mediasoup-like transport for tests.
+#[cfg(test)]
+pub(crate) fn test_transport() -> TransportInfo {
+    TransportInfo::parse(&json!({
+        "id": "t1",
+        "iceParameters": { "usernameFragment": "uf", "password": "pw", "iceLite": true },
+        "iceCandidates": [
+            { "foundation": "udpcandidate", "priority": 1076302079u64, "ip": "203.0.113.5", "protocol": "udp", "port": 40001, "type": "host" },
+            { "foundation": "tcpcandidate", "priority": 1076276479u64, "address": "203.0.113.5", "protocol": "tcp", "port": 40002, "type": "host", "tcpType": "passive" }
+        ],
+        "dtlsParameters": { "role": "auto", "fingerprints": [
+            { "algorithm": "sha-1", "value": "AA" },
+            { "algorithm": "sha-256", "value": "BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA" } ] }
+    }))
+    .unwrap()
+}
+
+/// The router's Opus as a consumer reports it, for tests.
+#[cfg(test)]
+pub(crate) fn test_opus() -> OpusCodec {
+    OpusCodec::from_rtp_codec(&json!({
+        "mimeType": "audio/opus", "payloadType": 100, "clockRate": 48000, "channels": 2,
+        "parameters": { "minptime": 10, "useinbandfec": 1 }
+    }))
+    .unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn transport() -> TransportInfo {
-        TransportInfo::parse(&json!({
-            "id": "t1",
-            "iceParameters": { "usernameFragment": "uf", "password": "pw", "iceLite": true },
-            "iceCandidates": [
-                { "foundation": "udpcandidate", "priority": 1076302079u64, "ip": "203.0.113.5", "protocol": "udp", "port": 40001, "type": "host" },
-                { "foundation": "tcpcandidate", "priority": 1076276479u64, "address": "203.0.113.5", "protocol": "tcp", "port": 40002, "type": "host", "tcpType": "passive" }
-            ],
-            "dtlsParameters": { "role": "auto", "fingerprints": [
-                { "algorithm": "sha-1", "value": "AA" }, { "algorithm": "sha-256", "value": "BB:CC" } ] }
-        }))
-        .unwrap()
+        test_transport()
     }
 
     fn opus() -> OpusCodec {
-        OpusCodec::from_rtp_codec(&json!({
-            "mimeType": "audio/opus", "payloadType": 100, "clockRate": 48000, "channels": 2,
-            "parameters": { "minptime": 10, "useinbandfec": 1 }
-        }))
-        .unwrap()
+        test_opus()
     }
 
     #[test]
     fn transport_and_codec() {
         let t = transport();
-        assert_eq!(t.fingerprint.1, "BB:CC");
+        assert!(t.fingerprint.1.starts_with("BB:CC:DD"));
         assert_eq!(t.candidates.len(), 2);
         assert!(t.candidates[1].ends_with("tcptype passive"));
         assert_eq!(opus().fmtp, "minptime=10;useinbandfec=1");
@@ -300,31 +329,63 @@ mod tests {
         assert!(sdp.contains("\r\n"));
     }
 
+    fn section(mid: &str, ssrc: u32, active: bool) -> RecvSection {
+        RecvSection {
+            mid: mid.into(),
+            codec: opus(),
+            ssrc,
+            cname: format!("c{ssrc}"),
+            active,
+        }
+    }
+
+    /// The text of one media section (from its m= line to the next).
+    fn media<'a>(sdp: &'a str, mid: &str) -> &'a str {
+        let at = sdp.find(&format!("a=mid:{mid}\r\n")).unwrap();
+        let start = sdp[..at].rfind("m=audio").unwrap();
+        let end = sdp[at..].find("m=audio").map_or(sdp.len(), |n| at + n);
+        &sdp[start..end]
+    }
+
     #[test]
     fn recv_offer_keeps_closed_sections() {
-        let sections = vec![
-            RecvSection {
-                mid: "0".into(),
-                codec: opus(),
-                ssrc: 11,
-                cname: "a".into(),
-                active: false,
-            },
-            RecvSection {
-                mid: "1".into(),
-                codec: opus(),
-                ssrc: 22,
-                cname: "b".into(),
-                active: true,
-            },
-        ];
-        let sdp = recv_offer(&transport(), &sections);
-        assert!(sdp.contains("a=group:BUNDLE 1\r\n"));
-        assert!(sdp.contains("m=audio 0 UDP/TLS/RTP/SAVPF 100"));
-        assert!(sdp.contains("a=mid:0\r\na=inactive"));
-        assert!(sdp.contains("a=ssrc:22 cname:b"));
-        assert!(sdp.contains("a=setup:actpass"));
-        assert!(!sdp.contains("a=ssrc:11"));
+        // mid 0 closed (disabled, still bundled), mid 1 closed (rejected), mid 2 open.
+        let sdp = recv_offer(
+            &transport(),
+            &[
+                section("0", 11, false),
+                section("1", 22, false),
+                section("2", 33, true),
+            ],
+        );
+        assert!(sdp.contains("a=group:BUNDLE 0 2\r\n"));
+        let first = media(&sdp, "0");
+        assert!(first.starts_with("m=audio 7 "), "{first}");
+        assert!(first.contains("a=inactive") && first.contains("a=ice-ufrag:uf"));
+        assert!(!first.contains("a=ssrc:"));
+        let rejected = media(&sdp, "1");
+        assert!(rejected.starts_with("m=audio 0 "), "{rejected}");
+        assert!(rejected.contains("a=inactive") && !rejected.contains("a=ice-ufrag"));
+        let open = media(&sdp, "2");
+        assert!(open.contains("a=sendonly") && open.contains("a=ssrc:33 cname:c33"));
+        assert!(open.contains("a=setup:actpass"));
+        assert!(!sdp.contains("a=ssrc:11") && !sdp.contains("a=ssrc:22"));
+    }
+
+    /// Regression: when the only consumer closes, the offer still carries the
+    /// transport (webrtc-rs refused the old one with "no ice-ufrag").
+    #[test]
+    fn recv_offer_with_every_consumer_closed_keeps_the_transport() {
+        let sdp = recv_offer(&transport(), &[section("0", 11, false)]);
+        assert!(sdp.contains("a=group:BUNDLE 0\r\n"));
+        assert!(sdp.contains("a=ice-ufrag:uf") && sdp.contains("a=fingerprint:sha-256 BB:CC"));
+        assert!(sdp.contains("a=inactive") && sdp.contains("a=end-of-candidates"));
+        // And a consumer added after it is bundled with it.
+        let next = recv_offer(
+            &transport(),
+            &[section("0", 11, false), section("1", 22, true)],
+        );
+        assert!(next.contains("a=group:BUNDLE 0 1\r\n"));
     }
 
     #[test]

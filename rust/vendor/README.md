@@ -44,10 +44,9 @@ Changes, all in `webrtc-audio-processing-sys/build.rs` unless noted:
 clang-cl is not an alternative on Windows: the AVX2 code of AEC3 uses
 MSVC-only vector member access under `_MSC_VER`.
 
-Changes 2 and 3 track upstream pull request #102 ("Support MSVC targets, and
-fix Apple cross-compilation, in bundled builds"), which makes the same
-changes; they can be dropped when it ships. Changes 1, 4 and 5 are not in it,
-and are prepared as a separate patch series against upstream's main.
+**Maintenance.** This copy is maintained by Gridspawn. Upstream changes are
+pulled in deliberately, when they are useful, not automatically. Each time,
+record here the upstream commit they came from and what changed.
 
 ## Building
 
@@ -56,9 +55,15 @@ The `bundled` feature builds WebRTC's audio processing module with meson:
 - Linux: meson and ninja, a C++17 compiler, libclang (for bindgen).
 - Windows: Visual Studio 2022 with the x64 developer environment (`vcvars64`),
   Python with meson, ninja, and LLVM (libclang, for bindgen).
-- Windows: keep the build directory's path short (or enable long paths).
-  The bundled sources and abseil sit deep under Cargo's `OUT_DIR`, and paths
-  over 260 characters fail with C1083.
+- Windows: keep the build directory's path short (for example
+  `--target-dir C:\t`), or enable long paths.
+  - The bundled sources, abseil and the installed headers sit deep under
+    Cargo's `OUT_DIR`, and paths over 260 characters fail with C1083.
+  - Release builds under a long `OUT_DIR` have also failed silently inside
+    meson: `meson setup` or `meson install`, with no output and no log. A
+    short target directory avoided that. The cause is not established: the
+    same long path also built once.
+  - The build script names this when a meson or ninja step fails on Windows.
 - Both: network access at build time, because meson fetches abseil
   (`abseil-cpp 20240722.0`) through its wrap. Vendoring the wrap's package
   cache is the follow-up for reproducible offline builds.

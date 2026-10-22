@@ -12,7 +12,7 @@ with Opus in-band FEC and loss concealment. Your engine talks to it through a
 plain PCM API (mono, 48 kHz). With the `cpal` feature, it can use the
 operating system's audio devices itself.
 
-Status: 0.1.0, source only, not on crates.io yet. Licence: MIT OR Apache-2.0.
+Status: 0.1.1, source only, not on crates.io yet. Licence: MIT OR Apache-2.0.
 WebRTC's audio processing is vendored with build fixes: `../vendor/README.md`.
 
 ## What this version does not do yet

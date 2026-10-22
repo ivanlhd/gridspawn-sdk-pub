@@ -229,14 +229,14 @@ mod webrtc {
             .arg(webrtc_source_dir.as_os_str())
             .status()
             .context("Failed to execute meson. Do you have it installed?")?;
-        assert!(status.success(), "Command failed: {:?}", &meson);
+        ensure_success(status, &meson)?;
 
         let mut ninja = Command::new("ninja");
         let status = ninja
             .current_dir(&webrtc_build_dir)
             .status()
             .context("Failed to execute ninja. Do you have it installed?")?;
-        assert!(status.success(), "Command failed: {:?}", &ninja);
+        ensure_success(status, &ninja)?;
 
         let mut install = Command::new("ninja");
         let status = install
@@ -244,9 +244,32 @@ mod webrtc {
             .arg("install")
             .status()
             .context("Failed to execute ninja install")?;
-        assert!(status.success(), "Command failed: {:?}", &install);
+        ensure_success(status, &install)?;
 
         Ok(())
+    }
+
+    /// Stops the build when a step failed. On Windows, says what helped when a
+    /// meson step failed without a message of its own.
+    fn ensure_success(status: std::process::ExitStatus, command: &Command) -> Result<()> {
+        if status.success() {
+            return Ok(());
+        }
+        if cfg!(windows) {
+            let out = out_dir();
+            bail!(
+                "Command failed: {command:?}\n\n\
+                 If meson printed nothing above: on Windows, meson setup and meson \
+                 install have failed without any message for builds under a long \
+                 OUT_DIR (this one has {} characters: {}). Building with a short \
+                 target directory, for example `cargo build --target-dir C:\\t` (or \
+                 CARGO_TARGET_DIR=C:\\t), avoided it. Paths over 260 characters also \
+                 fail with C1083 unless long paths are enabled in Windows.",
+                out.as_os_str().len(),
+                out.display()
+            );
+        }
+        bail!("Command failed: {command:?}");
     }
 
     // Patch with `patch`.
