@@ -1,0 +1,22 @@
+sudo: false
+language: rust
+os:
+  - linux
+  - osx
+rust:
+  - stable
+  - beta
+  - nightly
+matrix:
+  allow_failures:
+    - rust: nightly
+cache: cargo
+script:
+  - cargo build --verbose --features "bundled"
+  - cargo test --verbose --features "bundled"
+addons:
+  homebrew:
+    packages:
+    - portaudio
+    - pkg-config
+    update: true

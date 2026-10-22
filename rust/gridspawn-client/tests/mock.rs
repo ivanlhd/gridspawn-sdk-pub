@@ -244,6 +244,10 @@ async fn sign_in_completes_with_a_scripted_browser() {
     let client = client(&server, store.clone()).await;
     assert_eq!(client.application_name(), "Test Game");
     assert_eq!(client.modules(), [Module::Presence, Module::Voice]);
+    assert_eq!(
+        client.voice_url().map(|url| url.path()),
+        Some("/v1/sdk/voice")
+    );
     assert!(!client.persists_sessions());
     let mut events = client.subscribe();
 

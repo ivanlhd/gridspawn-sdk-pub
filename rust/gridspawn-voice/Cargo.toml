@@ -1,0 +1,45 @@
+[package]
+name = "gridspawn-voice"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Gridspawn voice for game clients: SFU signaling, WebRTC audio (Opus), echo cancellation and noise suppression, behind a PCM API."
+authors = ["Gridspawn"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ivanlhd/gridspawn-sdk-pub"
+# Not on crates.io yet.
+publish = false
+
+[features]
+default = []
+# Plays and captures through the operating system's audio devices (cpal).
+cpal = ["dep:cpal"]
+# Testing only: simulated receive loss and jitter before the jitter buffer.
+impairment = []
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+futures-util = { version = "0.3", features = ["sink"] }
+getrandom = "0.3"
+gridspawn-client = { path = "../gridspawn-client" }
+opus = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rtc = "=0.21.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+tracing = "0.1"
+url = "2"
+webrtc = "=0.21.1"
+# Vendored with MSVC and release-build fixes: ../vendor/README.md.
+webrtc-audio-processing = { path = "../vendor/webrtc-audio-processing", features = ["bundled"] }
+webrtc-audio-processing-config = "2.1"
+zeroize = "1"
+cpal = { version = "0.18", optional = true }
+
+[dev-dependencies]
+gridspawn-server = { path = "../gridspawn-server" }
+tokio = { version = "1", features = ["full"] }

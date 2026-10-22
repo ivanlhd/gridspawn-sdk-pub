@@ -1,7 +1,9 @@
-//! Godot 4 GDExtension for Gridspawn, built on `gridspawn-client`.
+//! Godot 4 GDExtension for Gridspawn, built on `gridspawn-client` and
+//! `gridspawn-voice`.
 //!
-//! One node class, `GridspawnClient`, which the addon's `gridspawn.tscn`
-//! puts in an autoload named `Gridspawn`. Every method returns at once; the
+//! Two node classes: `GridspawnClient`, which the addon's `gridspawn.tscn`
+//! puts in an autoload named `Gridspawn`, and `GridspawnVoice` (in-engine
+//! voice for an attached game session). Every method returns at once; the
 //! work runs on the node's own tokio runtime (background threads), and the
 //! results come back as signals, emitted from `_process` on the main thread.
 //! No Godot API is called off the main thread.
@@ -16,7 +18,13 @@ use gridspawn_client::{
     AttachedSession, AuthEvent, Client, Environment, Error, GrantEvent, MemoryTokenStore,
     RenewerHandle, Restore, SignIn,
 };
-use tokio::{runtime::Runtime, sync::OnceCell, task::JoinHandle};
+use tokio::{
+    runtime::{Handle, Runtime},
+    sync::OnceCell,
+    task::JoinHandle,
+};
+
+mod voice;
 
 struct GridspawnExtension;
 
@@ -444,16 +452,27 @@ impl GridspawnClient {
                 return None;
             }
         };
-        let runtime = self.runtime.get_or_insert_with(|| {
+        let future = task(config, self.client.clone(), self.outcomes_tx.clone());
+        Some(self.runtime().spawn(future))
+    }
+
+    /// The node's runtime, started on first use. `GridspawnVoice` shares it.
+    fn runtime(&mut self) -> &Runtime {
+        self.runtime.get_or_insert_with(|| {
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .thread_name("gridspawn")
                 .enable_all()
                 .build()
                 .expect("the Gridspawn runtime could not start")
-        });
-        let future = task(config, self.client.clone(), self.outcomes_tx.clone());
-        Some(runtime.spawn(future))
+        })
+    }
+
+    /// For `GridspawnVoice`: the client, the attached session and the runtime.
+    pub(crate) fn voice_context(&mut self) -> Option<(Client, AttachedSession, Handle)> {
+        let client = self.client.get()?.clone();
+        let session = self.attachment.as_ref()?.session.clone();
+        Some((client, session, self.runtime().handle().clone()))
     }
 
     /// Main thread: applies an outcome and emits its signal. Signals go

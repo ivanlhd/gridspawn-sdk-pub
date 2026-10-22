@@ -20,6 +20,11 @@ use crate::{
 };
 
 const DEFAULT_SDK_BASE: &str = "https://sdk.gridspawn.net";
+/// How long `connect` waits for the OS credential store to answer the probe.
+#[cfg(feature = "os-store")]
+const STORE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long one token store call may take before it counts as failed.
+const STORE_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const PROTOCOL_VERSION: u32 = 1;
 
 /// Which of the application's environments the game talks to.
@@ -173,6 +178,11 @@ impl ClientBuilder {
             &bootstrap.endpoints.api,
             "endpoints.api is not a secure URL",
         )?;
+        // 04 §1: voice admissions; optional, absent when bootstrap does not advertise it.
+        let voice = match bootstrap.endpoints.voice.as_deref() {
+            Some(value) => Some(parse(value, "endpoints.voice is not a secure URL")?),
+            None => None,
+        };
         // 01 §5: assertions live at {base}/v1/auth/…; base is the OAuth endpoint without /oauth.
         let auth_base = oauth
             .as_str()
@@ -200,6 +210,7 @@ impl ClientBuilder {
                 modules,
                 oauth,
                 api,
+                voice,
                 auth_base,
                 http,
                 store,
@@ -260,9 +271,15 @@ fn secure(url: &Url) -> bool {
 
 #[cfg(feature = "os-store")]
 async fn default_store(app_id: &str, environment: Environment) -> Arc<dyn TokenStore> {
-    let available = tokio::task::spawn_blocking(crate::storage::OsTokenStore::available)
-        .await
-        .unwrap_or(false);
+    // A locked keyring without a prompter can make the probe wait for minutes.
+    let probe = tokio::task::spawn_blocking(crate::storage::OsTokenStore::available);
+    let available = match tokio::time::timeout(STORE_PROBE_TIMEOUT, probe).await {
+        Ok(result) => result.unwrap_or(false),
+        Err(_) => {
+            tracing::warn!("the OS credential store did not answer in time");
+            false
+        }
+    };
     if available {
         Arc::new(crate::storage::OsTokenStore::new(app_id, environment))
     } else {
@@ -307,6 +324,8 @@ struct BootstrapProtocol {
 struct BootstrapEndpoints {
     api: String,
     oauth: String,
+    #[serde(default)]
+    voice: Option<String>,
 }
 
 /// The shared result of one in-flight refresh.
@@ -325,6 +344,7 @@ pub(crate) struct Inner {
     pub modules: Vec<Module>,
     pub oauth: Url,
     pub api: Url,
+    pub voice: Option<Url>,
     pub auth_base: Url,
     pub http: Http,
     pub store: Arc<dyn TokenStore>,
@@ -370,6 +390,11 @@ impl Client {
         &self.inner.modules
     }
 
+    /// Bootstrap's `endpoints.voice` (voice admissions, protocol 04), if advertised.
+    pub fn voice_url(&self) -> Option<&Url> {
+        self.inner.voice.as_ref()
+    }
+
     /// Whether a signed-in session survives a restart: `false` with the
     /// in-memory fallback, where the player signs in on each launch.
     pub fn persists_sessions(&self) -> bool {
@@ -386,8 +411,10 @@ impl Client {
         F: FnOnce(&dyn TokenStore) -> Result<T, StoreError> + Send + 'static,
     {
         let store = self.inner.store.clone();
-        tokio::task::spawn_blocking(move || call(store.as_ref()))
+        let task = tokio::task::spawn_blocking(move || call(store.as_ref()));
+        tokio::time::timeout(STORE_CALL_TIMEOUT, task)
             .await
+            .map_err(|_| StoreError::new("the token store did not answer in time"))?
             .map_err(|_| StoreError::new("the token store stopped unexpectedly"))?
             .map_err(Error::from)
     }
