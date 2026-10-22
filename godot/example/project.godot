@@ -1,0 +1,13 @@
+; Minimal project for the Gridspawn addon's headless test.
+
+config_version=5
+
+[application]
+
+config/name="Gridspawn SDK example"
+run/main_scene="res://tests/attach_test.tscn"
+config/features=PackedStringArray("4.3")
+
+[autoload]
+
+Gridspawn="*res://addons/gridspawn/gridspawn.tscn"

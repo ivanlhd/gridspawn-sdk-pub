@@ -1,0 +1,29 @@
+[package]
+name = "gridspawn-godot"
+version = "0.1.0"
+edition = "2021"
+# gdext's own minimum; the Rust crates under sdk/rust stay at 1.83.
+rust-version = "1.94"
+description = "Godot 4 GDExtension for Gridspawn: player sign-in, player assertions, and game-session attach."
+authors = ["Gridspawn"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ivanlhd/gridspawn-sdk-pub"
+# Not on crates.io; shipped as a Godot addon.
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+godot = { version = "=0.5.5", features = ["api-4-3"] }
+gridspawn-client = { path = "../../rust/gridspawn-client" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+url = "2"
+
+[dev-dependencies]
+gridspawn-server = { path = "../../rust/gridspawn-server" }
+tokio = { version = "1", features = ["full"] }
+
+[profile.release]
+strip = true
+lto = "thin"

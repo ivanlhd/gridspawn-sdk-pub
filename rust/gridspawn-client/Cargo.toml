@@ -1,0 +1,41 @@
+[package]
+name = "gridspawn-client"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+description = "Rust client SDK for Gridspawn: player sign-in (system browser, PKCE, loopback), player assertions, and game-session attach."
+authors = ["Gridspawn"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ivanlhd/gridspawn-sdk-pub"
+# Not on crates.io yet.
+publish = false
+
+[features]
+default = ["browser", "os-store"]
+# Opens the system browser for sign-in.
+browser = ["dep:webbrowser"]
+# OsTokenStore: Windows Credential Manager, macOS Keychain, Linux Secret Service.
+os-store = ["dep:keyring"]
+
+[dependencies]
+base64 = "0.22"
+getrandom = "0.3"
+keyring = { version = "3.6", optional = true, features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
+tracing = "0.1"
+url = "2"
+webbrowser = { version = "1", optional = true }
+zeroize = "1"
+
+[dev-dependencies]
+gridspawn-server = { path = "../gridspawn-server" }
+tokio = { version = "1", features = ["full"] }
+wiremock = "0.6"
+
+[[example]]
+name = "sign_in"

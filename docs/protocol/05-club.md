@@ -1,8 +1,15 @@
-# 05 Club posts from a game server — **Proposed**
+# 05 Club posts from a game server — **Current**
 
-Built, not deployed yet. This becomes **Current**, with live checks, once the
-SDK edge, chat-gateway and Core releases are out. Sources are cited so the
-document can be checked against the code before then.
+Deployed 2026-10-21/22 (UTC). Live checks, 2026-10-22:
+
+- A game connected from the Dev Hub posted to its club's chat from its own
+  Rust game server through `gridspawn-server` (development environment). A
+  repeat with the same `Idempotency-Key` answered as a duplicate and did not
+  post again.
+- An application without a linked game got club grants. Its posts answered
+  `404 feature_not_found`, as the table below says.
+
+Sources are cited so the document can be checked against the code.
 
 A game's own server posts news and chat messages into the game's **club**, shown
 as the game. The server trades its server credential for a short **club grant**

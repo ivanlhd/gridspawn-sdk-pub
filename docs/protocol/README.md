@@ -1,8 +1,9 @@
 # Gridspawn SDK wire protocol (v1)
 
 This is the contract every Gridspawn SDK implements: the TypeScript packages in
-`sdk/typescript`, and the native Rust core + Godot GDExtension planned under
-`sdk/native` and `sdk/godot`. It is **extracted from the deployed services**,
+`sdk/typescript`, and the Rust crates (`gridspawn-server`, its C ABI `gridspawn-server-capi`,
+and the game-client crate `gridspawn-client`), and the Godot GDExtension
+(`sdk/godot`). It is **extracted from the deployed services**,
 not designed separately. When this document and the code disagree, the code
 wins and this document is the bug.
 
@@ -17,7 +18,7 @@ Status legend used in every file:
 | [02 Game sessions and grants](02-sessions.md) | Current | `sdk-api-edge-rs` |
 | [03 Presence](03-presence.md) | **Proposed** | none yet |
 | [04 Voice](04-voice.md) | Current, plus **Proposed** additions | `voice-gateway-rs`, `sfu/` |
-| [05 Club posts from game servers](05-club.md) | **Proposed** (built, not deployed) | `sdk-api-edge-rs`, `gridspawn-core-rs`, `chat-gateway-rs` |
+| [05 Club posts from game servers](05-club.md) | Current | `sdk-api-edge-rs`, `gridspawn-core-rs`, `chat-gateway-rs` |
 
 ## Hosts
 
