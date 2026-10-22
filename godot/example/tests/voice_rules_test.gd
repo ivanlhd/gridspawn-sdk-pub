@@ -13,6 +13,10 @@ extends Node
 ## 2. other channel: audibility_changed(audible = false), silence →
 ##    "RESULT phase2_done";
 ## 3. same channel again: audibility_changed(audible = true), heard again.
+##
+## A third player (GRIDSPAWN_TEST_MUTED_NAME), muted by the game server before
+## both instances join, must be reported muted at join:
+## server_mute_changed(id, true) and server_muted in get_participants().
 
 const RATE := 48000.0
 const LISTEN_SECONDS := 3.0
@@ -35,6 +39,9 @@ var _listening := false
 var _step := "attach"
 var _room_reported := false
 var _anchor: Node3D
+var _muted_name := ""
+var _muted_id := ""
+var _muted_reported := false
 
 
 func _ready() -> void:
@@ -43,6 +50,7 @@ func _ready() -> void:
 		_spatial = "server"
 	_tone_hz = float(OS.get_environment("GRIDSPAWN_TEST_TONE_HZ"))
 	_expect_hz = float(OS.get_environment("GRIDSPAWN_TEST_EXPECT_HZ"))
+	_muted_name = OS.get_environment("GRIDSPAWN_TEST_MUTED_NAME")
 	Gridspawn.app_id = OS.get_environment("GRIDSPAWN_TEST_APP_ID")
 	Gridspawn.environment = 0  # Development
 	Gridspawn.token_storage = 1  # Memory
@@ -59,6 +67,7 @@ func _ready() -> void:
 	_voice.participant_joined.connect(_on_participant_joined)
 	_voice.room_config_changed.connect(_on_room_config)
 	_voice.audibility_changed.connect(_on_audibility)
+	_voice.server_mute_changed.connect(_on_server_mute)
 	_voice.left.connect(_on_left)
 	_voice.error.connect(_on_error)
 
@@ -102,6 +111,9 @@ func _on_room_config(config: Dictionary) -> void:
 
 
 func _on_participant_joined(participant_id: String, display_name: String) -> void:
+	if _muted_name != "" and display_name == _muted_name:
+		_muted_id = participant_id
+		return
 	if _other != "" or _step != "wait_other":
 		return
 	_other = participant_id
@@ -137,6 +149,20 @@ func _on_error(code: String, message: String) -> void:
 		print("RESULT bind_refused " + code)
 		return
 	_fail("voice error %s %s" % [code, message])
+
+
+## The muted player is reported muted right after joining (it was muted
+## before this instance joined, so no later change announces it).
+func _on_server_mute(participant_id: String, muted: bool) -> void:
+	if participant_id != _muted_id or _muted_reported:
+		return
+	_muted_reported = true
+	var listed := false
+	for participant in _voice.get_participants():
+		if participant["participant_id"] == _muted_id:
+			listed = participant["server_muted"]
+	print("INFO muted player reported in step %s" % _step)
+	print("RESULT server_muted_at_join muted=%s listed=%s" % [muted, listed])
 
 
 func _on_audibility(participant_id: String, audible: bool, gain: float, pan: Variant) -> void:

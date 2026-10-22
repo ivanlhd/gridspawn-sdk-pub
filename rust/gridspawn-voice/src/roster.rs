@@ -74,6 +74,36 @@ impl Audibility {
     }
 }
 
+/// A producer the SFU announced (`joinRoom`'s `producers`, `newProducer`):
+/// `{producerId, kind, peerId?, ownerPeerId?, type?, serverMuted?}`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Announced {
+    pub producer_id: String,
+    /// The SFU endpoint that produces it.
+    pub owner: String,
+    /// Its player is muted by the game server now (game-session rooms only;
+    /// later changes come as `producerPaused` / `producerResumed`).
+    pub server_muted: bool,
+}
+
+impl Announced {
+    /// Someone's voice (audio, `type` absent or `voice`, with an owner), or `None`.
+    pub(crate) fn parse(value: &Value) -> Option<Self> {
+        let is_voice =
+            value["kind"] == "audio" && value["type"].as_str().is_none_or(|t| t == "voice");
+        let producer_id = value["producerId"].as_str().filter(|id| !id.is_empty())?;
+        let owner = value["peerId"]
+            .as_str()
+            .or(value["ownerPeerId"].as_str())
+            .filter(|owner| !owner.is_empty())?;
+        is_voice.then(|| Self {
+            producer_id: producer_id.to_owned(),
+            owner: owner.to_owned(),
+            server_muted: value["serverMuted"].as_bool() == Some(true),
+        })
+    }
+}
+
 /// One roster entry: an SFU endpoint and the participant behind it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Peer {
@@ -166,6 +196,48 @@ mod tests {
                 .unwrap();
         assert_eq!((loud.gain, loud.pan), (1.0, Some(-1.0)));
         assert!(Audibility::parse(&json!({"producerId": "p"})).is_none());
+    }
+
+    #[test]
+    fn announced_producers() {
+        let muted = Announced::parse(&json!({
+            "producerId": "p1", "peerId": "gve1.a", "ownerPeerId": "gve1.a",
+            "kind": "audio", "type": "voice", "routeClass": "room", "serverMuted": true
+        }))
+        .unwrap();
+        assert_eq!(
+            muted,
+            Announced {
+                producer_id: "p1".into(),
+                owner: "gve1.a".into(),
+                server_muted: true
+            }
+        );
+        // Outside game-session rooms the field is absent: not muted.
+        let plain = Announced::parse(
+            &json!({"producerId": "p2", "ownerPeerId": "gve1.b", "kind": "audio"}),
+        )
+        .unwrap();
+        assert_eq!(
+            (plain.owner.as_str(), plain.server_muted),
+            ("gve1.b", false)
+        );
+        assert!(
+            !Announced::parse(
+                &json!({"producerId": "p3", "peerId": "gve1.c", "kind": "audio", "serverMuted": false})
+            )
+            .unwrap()
+            .server_muted
+        );
+        // Not someone's voice.
+        for value in [
+            json!({"producerId": "v", "peerId": "gve1.a", "kind": "video", "serverMuted": true}),
+            json!({"producerId": "s", "peerId": "gve1.a", "kind": "audio", "type": "screen"}),
+            json!({"producerId": "o", "kind": "audio"}),
+            json!({"peerId": "gve1.a", "kind": "audio"}),
+        ] {
+            assert!(Announced::parse(&value).is_none(), "{value}");
+        }
     }
 
     #[test]

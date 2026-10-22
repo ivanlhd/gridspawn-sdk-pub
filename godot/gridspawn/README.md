@@ -5,7 +5,7 @@ The Godot 4 GDExtension for Gridspawn. It is built on the Rust crates
 (`../../rust/gridspawn-voice`). The addon that game developers copy is
 `addons/gridspawn`: its README is the user documentation.
 
-Status: 0.3.0, source only. Licence: MIT OR Apache-2.0 (gdext, the Godot
+Status: 0.3.1, source only. Licence: MIT OR Apache-2.0 (gdext, the Godot
 bindings, is MPL-2.0: `addons/gridspawn/THIRD-PARTY.md`).
 - Godot 4.3 or later (gdext `api-4-3`).
 - Rust 1.94 or later for this crate.

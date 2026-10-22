@@ -708,6 +708,15 @@ async fn server_rules_channels_proximity_and_mutes() {
         0,
         "C server-muted"
     );
+    // A player who joins now sees C's mute at once (the producer descriptor's
+    // `serverMuted`), not only at the next change.
+    let ge = f.admit("Rules E").await;
+    let (_se, e) = f.join_guest("Rules E", &ge).await;
+    let c_for_e = e.participant(c_id).expect("C in E's roster");
+    assert!(c_for_e.server_muted, "E sees C muted at join: {c_for_e:?}");
+    assert!(!e.participant(b_id).unwrap().server_muted);
+    e.leave().await;
+    eprintln!("server mute: a late joiner sees it at join");
     voice.mute(&gc.id, false).await.expect("unmute");
     wait_for(&mut c_events, |e| {
         matches!(e, VoiceEvent::LocalServerMuted { muted: false })

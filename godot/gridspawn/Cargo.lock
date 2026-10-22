@@ -1059,7 +1059,7 @@ dependencies = [
 
 [[package]]
 name = "gridspawn-godot"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "godot",
  "gridspawn-client",
@@ -1086,7 +1086,7 @@ dependencies = [
 
 [[package]]
 name = "gridspawn-voice"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",

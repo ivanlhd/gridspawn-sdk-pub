@@ -21,7 +21,9 @@
 //!   channels, both players in one channel. Each instance checks the room's
 //!   rules and the other's display name, hears the other; the game server
 //!   moves B to another channel (both get `audibility_changed(false)` and
-//!   hear nothing), then back (heard again). Run twice: server-spatialized
+//!   hear nothing), then back (heard again). A third player, joined through
+//!   the Rust voice client and muted by the game server before the
+//!   instances start, must be reported muted at join. Run twice: server-spatialized
 //!   (binding a node is refused) and client-spatialized (not secrecy-safe,
 //!   the other is bound to a 3D node).
 
@@ -383,6 +385,14 @@ async fn rules_run(spatial: &'static str) {
             .await
             .expect("state");
     }
+    // A third player, muted by the game server before A and B join: no
+    // later change announces it, so both must see it at join.
+    let muted = guest(&setup.session, MUTED_NAME).await;
+    voice
+        .set_player_state(&muted.id, &red)
+        .await
+        .expect("state");
+    let muted_voice = join_muted(&setup, &muted).await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let env = |ticket: String, tone: &str, expect: &str| {
         vec![
@@ -391,6 +401,7 @@ async fn rules_run(spatial: &'static str) {
             ("GRIDSPAWN_TEST_TONE_HZ", tone.to_owned()),
             ("GRIDSPAWN_TEST_EXPECT_HZ", expect.to_owned()),
             ("GRIDSPAWN_TEST_SPATIAL", spatial.to_owned()),
+            ("GRIDSPAWN_TEST_MUTED_NAME", MUTED_NAME.to_owned()),
         ]
     };
     let mut godot_a = spawn_godot(
@@ -481,7 +492,8 @@ async fn rules_run(spatial: &'static str) {
         assert_eq!(code, Some(0), "Godot {who} failed:\n{text}");
         // Order-independent: the room, the name and the binding arrive as they come.
         let name_line = format!("participant_joined display_name={other}");
-        for wanted in [room_line, name_line.as_str(), bind_line] {
+        let muted_line = "server_muted_at_join muted=true listed=true";
+        for wanted in [room_line, name_line.as_str(), bind_line, muted_line] {
             assert!(
                 results.contains(&wanted),
                 "{who}: missing {wanted:?} in {results:?}"
@@ -517,9 +529,57 @@ async fn rules_run(spatial: &'static str) {
             "{who}"
         );
     }
+    muted_voice.leave().await;
 }
 
-#[tokio::test]
+const MUTED_NAME: &str = "Voice Muted";
+
+/// Joins `guest` with the Rust voice client and has the game server mute
+/// them; returns once the SFU has applied the mute (their own
+/// `LocalServerMuted`), so later joiners can only learn it at join.
+async fn join_muted(
+    setup: &Setup,
+    guest: &gridspawn_server::Participant,
+) -> gridspawn_voice::VoiceSession {
+    use gridspawn_voice::{VoiceEvent, VoiceOptions, VoiceSession};
+    let client = gridspawn_client::Client::builder(
+        setup.app_id.clone(),
+        gridspawn_client::Environment::Development,
+    )
+    .token_store(std::sync::Arc::new(
+        gridspawn_client::MemoryTokenStore::new(),
+    ))
+    .connect()
+    .await
+    .expect("client bootstrap");
+    let attached = client.attach(&ticket(guest).await).await.expect("attach");
+    let session = VoiceSession::join(&client, &attached, VoiceOptions::default())
+        .await
+        .expect("the muted player joins");
+    let mut events = session.events();
+    setup
+        .session
+        .voice()
+        .mute(&guest.id, true)
+        .await
+        .expect("mute");
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match events.recv().await {
+                Ok(VoiceEvent::LocalServerMuted { muted: true }) => break,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(error) => panic!("muted player's events: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("the SFU applies the mute within 20 s");
+    eprintln!("harness: {MUTED_NAME} joined and is muted by the game server");
+    session
+}
+
+// Multi-threaded: the muted player's voice session runs in this process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn headless_voice_rules() {
     rules_run("server").await;
     rules_run("client").await;

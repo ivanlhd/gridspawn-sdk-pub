@@ -3,7 +3,7 @@
 Player sign-in with the system browser, player assertions for your game
 server, joining game sessions, and in-game voice, for Godot 4.3 and later.
 
-Status: 0.3.0. Builds for Windows x86_64 and Linux x86_64. Licence: MIT OR
+Status: 0.3.1. Builds for Windows x86_64 and Linux x86_64. Licence: MIT OR
 Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`). The bundled Rust bindings for
 Godot are MPL-2.0, and the voice code includes WebRTC audio processing,
 Abseil and libopus: see `THIRD-PARTY.md`.
@@ -158,6 +158,9 @@ the room hears everyone.
   server configured them (and the voice service has named rooms on).
   Otherwise `join()` fails with `voice/room_not_supported` or
   `voice/room_not_configured`; a full room answers `voice/room_full`.
+- `server_mute_changed(id, muted)`: the game server muted or unmuted a
+  player. Players muted before this one joined are reported right after
+  `joined` (and `server_muted` is set in `get_participants()`).
 - `server_mute_changed(id, true)` with this player's own id: the game server
   muted this player. Unmuting is refused (`voice/server_muted`) until it
   unmutes.

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1 (2026-10-23)
+
+- Players the game server muted before this player joined are reported right after `joined`: `server_mute_changed(participant_id, true)`, and `server_muted` is true in `get_participants()` (gridspawn-voice 0.2.2). Before, they showed as unmuted until the next mute change.
+- An unmute refused with `voice/server_muted` leaves `is_muted()` true and sends `server_mute_changed` with this player's id.
+
 ## 0.3.0 (2026-10-23)
 
 - Voice rules from the game server: `audibility_changed(participant_id, audible, gain, pan)`, `room_config_changed(config)`, `authority_changed(available)`, `server_mute_changed(participant_id, muted)`; `get_room_config()`, `is_secrecy_safe()`; voices play in stereo with the server's pan.

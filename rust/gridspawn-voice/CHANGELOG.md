@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.2 (2026-10-23)
+
+- Players the game server muted before this client joined are known at join: the SFU's producer descriptor carries `serverMuted` (game-session rooms), so `ParticipantInfo::server_muted` is set and `VoiceEvent::ServerMuted` is sent as their voice is added. `producerPaused` / `producerResumed` remain the path for later changes.
+- This client's own mute is known at join when its participant also speaks from another device (a mute is per participant), and whenever `set_muted(false)` is refused with `voice/server_muted`: the client then stays muted (`is_muted()`) and sends `LocalServerMuted { muted: true }`.
+
 ## 0.2.1 (2026-10-23)
 
 - A speaker whose receive negotiation fails is never dropped silently: the round is retried once (`Warning` `voice/receive_retried`, naming the participant); if it fails again the section is closed, the SFU consumer is closed, and the new non-fatal `VoiceEvent::ReceiveFailed { participant, code, message }` is sent. The session goes on (before, the session ended).

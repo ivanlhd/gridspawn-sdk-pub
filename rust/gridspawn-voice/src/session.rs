@@ -25,7 +25,7 @@ use crate::{
     error::VoiceError,
     jitter::JitterBuffer,
     media::{Added, MediaEvent, RecvLeg, SendLeg},
-    roster::{pan_gains, Audibility, Peer, RoomConfig},
+    roster::{pan_gains, Announced, Audibility, Peer, RoomConfig},
     sdp::{OpusCodec, TransportInfo},
     signaling::Signaling,
 };
@@ -730,14 +730,26 @@ impl VoiceSession {
         } else {
             "resumeProducer"
         };
-        self.inner
+        let result = self
+            .inner
             .signaling
             .request(
                 event,
                 json!({ "roomId": self.inner.room_id, "producerId": self.inner.send.producer_id }),
             )
             .await
-            .map(|_| ())
+            .map(|_| ());
+        // Refused because the game server muted us (for example before a
+        // rejoin, which no event announces): stay muted, and say so.
+        if let Err(VoiceError::Sfu { reason, .. }) = &result {
+            if !muted && reason == "server_muted" {
+                lock(&self.inner.flags).muted = true;
+                if !self.inner.local_server_muted.swap(true, Ordering::SeqCst) {
+                    self.emit(VoiceEvent::LocalServerMuted { muted: true });
+                }
+            }
+        }
+        result
     }
 
     pub fn is_muted(&self) -> bool {
@@ -1011,22 +1023,26 @@ impl VoiceSession {
 
     /// Consumes one announced producer if it is someone else's voice.
     async fn consume(&self, producer: &Value) {
-        let is_voice =
-            producer["kind"] == "audio" && producer["type"].as_str().is_none_or(|t| t == "voice");
-        let Some(producer_id) = producer["producerId"].as_str() else {
+        let Some(Announced {
+            producer_id,
+            owner,
+            server_muted,
+        }) = Announced::parse(producer)
+        else {
             return;
         };
-        let owner = producer["peerId"]
-            .as_str()
-            .or(producer["ownerPeerId"].as_str())
-            .unwrap_or("")
-            .to_owned();
-        if !is_voice || owner == self.inner.endpoint_id || owner.is_empty() {
+        let producer_id = producer_id.as_str();
+        if owner == self.inner.endpoint_id {
             return;
         }
         let participant = self.participant_of(&owner);
-        // Our own participant on another device: never played back to us.
+        // Our own participant on another device: never played back to us,
+        // but its descriptor tells that the game server muted us (a mute is
+        // per participant).
         if participant == self.inner.local_participant {
+            if server_muted && !self.inner.local_server_muted.swap(true, Ordering::SeqCst) {
+                self.emit(VoiceEvent::LocalServerMuted { muted: true });
+            }
             return;
         }
         let mut recv = self.inner.recv.lock().await;
@@ -1086,7 +1102,9 @@ impl VoiceSession {
             speaking: AtomicBool::new(false),
             received: AtomicU64::new(0),
             audibility: Mutex::new(audibility),
-            server_muted: AtomicBool::new(false),
+            // Muted before we joined (or before this producer existed):
+            // `producerPaused` reports only later changes.
+            server_muted: AtomicBool::new(server_muted),
         });
         lock(&self.inner.remotes).insert(consumer_id.to_owned(), remote);
         let added = recv
@@ -1137,7 +1155,15 @@ impl VoiceSession {
             (joined, p.locally_muted)
         };
         if joined && !self.inner.roster_mode {
-            self.emit(VoiceEvent::ParticipantJoined { participant });
+            self.emit(VoiceEvent::ParticipantJoined {
+                participant: participant.clone(),
+            });
+        }
+        if server_muted {
+            self.emit(VoiceEvent::ServerMuted {
+                participant,
+                muted: true,
+            });
         }
         if locally_muted {
             if let Err(error) = self.pause_consumer(consumer_id, true).await {

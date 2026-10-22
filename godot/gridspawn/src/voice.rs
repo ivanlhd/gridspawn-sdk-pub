@@ -754,9 +754,27 @@ impl GridspawnVoice {
             self.base_mut()
                 .emit_signal("authority_changed", &[false.to_variant()]);
         }
-        // Everyone already in the room, after `joined`.
-        for participant in session.participants() {
+        // Everyone already in the room, after `joined`; then who the game
+        // server muted before we joined (later changes come as events).
+        let participants = session.participants();
+        for participant in &participants {
             self.add_remote(&participant.id);
+        }
+        for participant in participants.iter().filter(|p| p.server_muted) {
+            self.base_mut().emit_signal(
+                "server_mute_changed",
+                &[
+                    GString::from(&participant.id).to_variant(),
+                    true.to_variant(),
+                ],
+            );
+        }
+        if session.is_server_muted() {
+            let local = self.get_local_participant_id();
+            self.base_mut().emit_signal(
+                "server_mute_changed",
+                &[local.to_variant(), true.to_variant()],
+            );
         }
         let outcomes = self.outcomes_tx.clone();
         self.events_task = self.handle.as_ref().map(|handle| {

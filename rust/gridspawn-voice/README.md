@@ -12,7 +12,7 @@ with Opus in-band FEC and loss concealment. Your engine talks to it through a
 plain PCM API (mono, 48 kHz). With the `cpal` feature, it can use the
 operating system's audio devices itself.
 
-Status: 0.2.1, source only, not on crates.io yet. Licence: MIT OR Apache-2.0.
+Status: 0.2.2, source only, not on crates.io yet. Licence: MIT OR Apache-2.0.
 WebRTC's audio processing is vendored with build fixes: `../vendor/README.md`.
 
 ## Who hears whom
@@ -30,7 +30,11 @@ applies what the service sends:
   `VoiceEvent::RoomConfig`;
 - **server mute**: `VoiceEvent::ServerMuted` for others,
   `VoiceEvent::LocalServerMuted` and `is_server_muted()` for this client
-  (unmuting is refused with `voice/server_muted` meanwhile);
+  (unmuting is refused with `voice/server_muted` meanwhile). Players muted
+  before this client joined are known at join (`ParticipantInfo::server_muted`;
+  `ServerMuted` is sent as their voice is added); this client's own mute is
+  known at join only when its participant also speaks from another device;
+  otherwise on its first `set_muted(false)`;
 - **fail closed**: `VoiceEvent::Authority { available: false }` while the
   service's rules are unreachable (nothing is forwarded then).
 

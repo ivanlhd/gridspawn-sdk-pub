@@ -15,10 +15,8 @@ Sources:
   `voice-gateway-rs/src/sdk_audibility.rs`;
 - reference clients:
   - `sdk/rust/gridspawn-voice` covers §1–§5;
-  - `sdk/typescript/packages/voice/src/{session,signaling}.ts` covers
-    §1–§3. It does not handle the §5 events yet. In a configured room the
-    SFU still forwards only audible pairs, but that client applies no gain
-    or pan and shows no roster.
+  - `sdk/typescript/packages/voice/src/{session,signaling,room}.ts` covers
+    §1–§5.
 
 Implementation note for native clients: Godot's `WebRTCPeerConnection` is
 data-channel only. The native core must provide WebRTC media itself and build
@@ -74,6 +72,10 @@ Response, validated by the client (`core/src/sessions.ts`):
 - `nodeId` matches `^[A-Za-z0-9_-]{3,128}$`.
 - `sfu.url` must be HTTPS. The reference client also accepts plain HTTP on
   `localhost`/`127.0.0.1` for local testing.
+- The response's `Date` header is exposed to browsers
+  (`Access-Control-Expose-Headers: Date`). A client can therefore derive
+  the SFU token's lifetime as `sfu.expiresAt` minus `Date`, without relying
+  on its own clock.
 
 Refusals: `{"ok": false, "error": "<code>"}`.
 
@@ -114,7 +116,9 @@ Join sequence (`session.ts`):
 | 5 | `produce` | `{roomId, transportId, kind: "audio", rtpParameters, appData: {type: "voice", routeClass: "room"}}` | `{id}` |
 | 6 | `consume` (per remote producer) | `{roomId, producerId, transportId, rtpCapabilities}` | `{consumerId, producerId, peerId?, ownerPeerId?, kind, type?, rtpParameters}` |
 
-`ProducerDescriptor`: `{producerId, kind, peerId?, ownerPeerId?, type?}`.
+`ProducerDescriptor`: `{producerId, kind, peerId?, ownerPeerId?, type?, serverMuted?}`.
+`serverMuted` is present in game-session rooms only: `true` while the game
+server has muted that audio producer's player (§5.4).
 Consume only `kind == "audio"` with `type` absent or `"voice"`.
 
 Other requests:
@@ -360,7 +364,10 @@ voiceAuthority: { available: bool }
 - **Server-muted speaker:**
   - their audio producers are paused;
   - `resumeProducer` answers `{error: "server_muted"}`;
-  - after a reconnect, the new producer starts paused.
+  - after a reconnect, the new producer starts paused;
+  - a player who joins later sees the mute in the producer's descriptor
+    (`serverMuted: true` in `joinRoom`'s `producers` and in `newProducer`).
+    `producerPaused` / `producerResumed` report only later changes.
 
 ### 5.5 Fail closed
 
