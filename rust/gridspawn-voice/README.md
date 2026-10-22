@@ -70,6 +70,9 @@ voice.leave().await;
 **Players of the Godot addon get prebuilt binaries and never need any of
 this.** To build this crate yourself:
 
+- **Rust 1.91 or newer.** The WebRTC crates (rtc 0.21) need it: rcgen
+  0.14.8 and later require 1.88, and rtc-mdns uses the standard library's
+  `ip_from` feature, stable since 1.91.
 - **Linux:** meson and ninja, CMake (libopus), a C++17 compiler, and
   libclang (for bindgen).
 - **Windows:** Visual Studio 2022 with the x64 developer environment
