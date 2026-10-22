@@ -17,7 +17,7 @@ Status legend used in every file:
 | [01 Login](01-login.md) | Current | `sdk-auth-rs` |
 | [02 Game sessions and grants](02-sessions.md) | Current | `sdk-api-edge-rs` |
 | [03 Presence](03-presence.md) | Current | `sdk-api-edge-rs` |
-| [04 Voice](04-voice.md) | Current, plus **Proposed** additions | `voice-gateway-rs`, `sfu/` |
+| [04 Voice](04-voice.md) | Current | `voice-gateway-rs`, `sfu/`, `sdk-api-edge-rs` |
 | [05 Club posts from game servers](05-club.md) | Current | `sdk-api-edge-rs`, `gridspawn-core-rs`, `chat-gateway-rs` |
 
 ## Hosts
