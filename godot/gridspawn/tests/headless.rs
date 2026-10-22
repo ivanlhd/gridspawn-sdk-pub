@@ -11,7 +11,8 @@
 //! voice tickets. The example project (`../example`) then runs headless with
 //! the freshly built library:
 //! - `headless_attach`: restore, an assertion while signed out, attach, renew,
-//!   and a forged ticket, through the GDScript API and signals;
+//!   a forged ticket, and presence refused while signed out, through the
+//!   GDScript API and signals;
 //! - `headless_voice`: two instances join one voice room, each sending its own
 //!   tone through a custom input (Godot's headless audio driver has no
 //!   microphone), and each checks it receives and plays the other's tone.
@@ -201,6 +202,7 @@ async fn headless_attach() {
             "attached session=true name=Fixture Guest capabilities=voice",
             "grant_renewed voice",
             "attach_failed session/ticket_invalid",
+            "presence_failed sign_in/required",
             "done",
         ]
     );

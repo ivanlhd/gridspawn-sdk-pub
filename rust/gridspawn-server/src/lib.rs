@@ -5,6 +5,8 @@
 //!
 //! - game sessions, player and guest admission, and client tickets —
 //!   `docs/protocol/02-sessions.md`;
+//! - player presence set by the game server —
+//!   `docs/protocol/03-presence.md`;
 //! - posts to the game's club with a club grant —
 //!   `docs/protocol/05-club.md`.
 //!
@@ -39,6 +41,7 @@ mod club;
 mod credential;
 mod error;
 mod http;
+mod presence;
 mod session;
 mod types;
 
@@ -49,6 +52,7 @@ pub use client::{Client, ClientBuilder};
 pub use club::{Link, Post, PostReceipt};
 pub use credential::Credential;
 pub use error::{ApiError, Error, ErrorCode, Service};
+pub use presence::{ParticipantRef, Party, Presence, PresenceAck};
 pub use session::{
     AdmitGuest, AdmitParticipant, ClientTicket, CreateSession, IdentityKind, Lease, Participant,
     ParticipantId, RenewerHandle, Session, SessionId,

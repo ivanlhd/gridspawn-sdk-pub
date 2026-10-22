@@ -177,9 +177,12 @@ pub struct ApiError {
     pub request_id: Option<String>,
     /// From `Retry-After` when present.
     pub retry_after: Option<Duration>,
+    /// The request field the error is about (`error.field`), when the service
+    /// names one (presence payload errors).
+    pub field: Option<String>,
 }
 
-/// The documented error codes of protocol 01 (sdk-auth) and 02 (edge).
+/// The documented error codes of protocols 01 (sdk-auth), 02 and 03 (edge).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ErrorCode {
@@ -216,6 +219,21 @@ pub enum ErrorCode {
     AppNotFound,
     /// `config/protocol_incompatible`.
     ProtocolIncompatible,
+    /// `presence/invalid_request` ([`ApiError::field`] when known).
+    PresenceInvalidRequest,
+    /// `presence/text_not_allowed`: an email, web address or identifier in
+    /// the text ([`ApiError::field`]).
+    PresenceTextNotAllowed,
+    /// `presence/token_invalid`: missing, expired or revoked token, or one for
+    /// another app or environment.
+    PresenceTokenInvalid,
+    /// `presence/scope_denied`: no `presence.write` (or `presence.party`), or
+    /// the app's presence module is off.
+    PresenceScopeDenied,
+    /// `presence/guest_not_supported`.
+    PresenceGuestNotSupported,
+    /// `presence/account_unavailable`: the player's account is not active.
+    PresenceAccountUnavailable,
     /// Any other code, kept verbatim.
     Other(String),
 }
@@ -230,7 +248,7 @@ impl ErrorCode {
             "auth/access_denied" => Self::AccessDenied,
             "auth/login_required" => Self::LoginRequired,
             "auth/account_setup_required" => Self::AccountSetupRequired,
-            "auth/rate_limited" | "rate_limited" => Self::RateLimited,
+            "auth/rate_limited" | "rate_limited" | "presence/rate_limited" => Self::RateLimited,
             "service/not_ready" => Self::ServiceNotReady,
             "session/ticket_invalid" => Self::TicketInvalid,
             "session/grant_invalid" => Self::GrantInvalid,
@@ -239,6 +257,12 @@ impl ErrorCode {
             "session/invalid_request" => Self::SessionInvalidRequest,
             "config/app_not_found" => Self::AppNotFound,
             "config/protocol_incompatible" => Self::ProtocolIncompatible,
+            "presence/invalid_request" => Self::PresenceInvalidRequest,
+            "presence/text_not_allowed" => Self::PresenceTextNotAllowed,
+            "presence/token_invalid" => Self::PresenceTokenInvalid,
+            "presence/scope_denied" => Self::PresenceScopeDenied,
+            "presence/guest_not_supported" => Self::PresenceGuestNotSupported,
+            "presence/account_unavailable" => Self::PresenceAccountUnavailable,
             other => Self::Other(other.to_owned()),
         }
     }
@@ -261,6 +285,12 @@ impl ErrorCode {
             Self::SessionInvalidRequest => "session/invalid_request",
             Self::AppNotFound => "config/app_not_found",
             Self::ProtocolIncompatible => "config/protocol_incompatible",
+            Self::PresenceInvalidRequest => "presence/invalid_request",
+            Self::PresenceTextNotAllowed => "presence/text_not_allowed",
+            Self::PresenceTokenInvalid => "presence/token_invalid",
+            Self::PresenceScopeDenied => "presence/scope_denied",
+            Self::PresenceGuestNotSupported => "presence/guest_not_supported",
+            Self::PresenceAccountUnavailable => "presence/account_unavailable",
             Self::Other(code) => code,
         }
     }
@@ -295,12 +325,22 @@ mod tests {
             "session/invalid_request",
             "config/app_not_found",
             "config/protocol_incompatible",
+            "presence/invalid_request",
+            "presence/text_not_allowed",
+            "presence/token_invalid",
+            "presence/scope_denied",
+            "presence/guest_not_supported",
+            "presence/account_unavailable",
         ] {
             let mapped = ErrorCode::from_wire(code);
             assert!(!matches!(mapped, ErrorCode::Other(_)), "{code}");
             assert_eq!(mapped.as_str(), code);
         }
         assert_eq!(ErrorCode::from_wire("rate_limited"), ErrorCode::RateLimited);
+        assert_eq!(
+            ErrorCode::from_wire("presence/rate_limited"),
+            ErrorCode::RateLimited
+        );
         assert_eq!(
             ErrorCode::from_wire("config/origin_not_allowed"),
             ErrorCode::Other("config/origin_not_allowed".into())

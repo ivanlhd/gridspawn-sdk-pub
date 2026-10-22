@@ -110,6 +110,10 @@ impl fmt::Display for SessionId {
 pub struct ParticipantId(String);
 
 impl ParticipantId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -228,6 +232,10 @@ impl Session {
         &self.id
     }
 
+    pub(crate) fn client(&self) -> &Client {
+        &self.client
+    }
+
     /// The last lease seen; `None` for a [`Client::session`] handle until it renews.
     pub fn lease(&self) -> Option<Lease> {
         lock(&self.lease).clone()
@@ -306,7 +314,7 @@ impl Session {
                 true,
             )
             .await?;
-        self.participant(response)
+        self.admitted(response)
     }
 
     /// 02 §4: admit a guest (when the app allows guests).
@@ -331,10 +339,10 @@ impl Session {
                 true,
             )
             .await?;
-        self.participant(response)
+        self.admitted(response)
     }
 
-    fn participant(&self, response: ParticipantResponse) -> Result<Participant, Error> {
+    fn admitted(&self, response: ParticipantResponse) -> Result<Participant, Error> {
         let identity_kind = match response.identity_kind.as_str() {
             "gridspawn_user" => IdentityKind::GridspawnUser,
             "server_verified_guest" => IdentityKind::ServerVerifiedGuest,
@@ -559,6 +567,14 @@ pub struct Participant {
 }
 
 impl Participant {
+    pub(crate) fn client(&self) -> &Client {
+        &self.client
+    }
+
+    pub(crate) fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
     /// 02 §5: a single-use ticket for 1–3 modules. Never retried: each call
     /// issues a new ticket.
     pub async fn issue_ticket(&self, modules: &[Module]) -> Result<ClientTicket, Error> {

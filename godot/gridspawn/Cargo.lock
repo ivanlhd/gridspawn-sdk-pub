@@ -1040,7 +1040,7 @@ dependencies = [
 
 [[package]]
 name = "gridspawn-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
@@ -1059,7 +1059,7 @@ dependencies = [
 
 [[package]]
 name = "gridspawn-godot"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "godot",
  "gridspawn-client",
@@ -1071,7 +1071,7 @@ dependencies = [
 
 [[package]]
 name = "gridspawn-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "reqwest",
  "serde",

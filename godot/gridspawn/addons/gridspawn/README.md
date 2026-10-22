@@ -3,7 +3,7 @@
 Player sign-in with the system browser, player assertions for your game
 server, joining game sessions, and in-game voice, for Godot 4.3 and later.
 
-Status: 0.1.0. Builds for Windows x86_64 and Linux x86_64. Licence: MIT OR
+Status: 0.2.0. Builds for Windows x86_64 and Linux x86_64. Licence: MIT OR
 Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`). The bundled Rust bindings for
 Godot are MPL-2.0, and the voice code includes WebRTC audio processing,
 Abseil and libopus: see `THIRD-PARTY.md`.
@@ -54,6 +54,8 @@ Every method returns at once. Results arrive as signals on the main thread.
 | `attach(ticket)` | `attached(session_id, display_name, capabilities)` or `attach_failed(code, message)` |
 | `renew()` | `grant_renewed(module)` or `grant_expired(module, code)` |
 | `detach()` | Stops renewing the attached session's grants |
+| `set_presence(details, state, location)` | `presence_set(expires_at)` or `presence_failed(code, message)` |
+| `clear_presence()` | `presence_cleared` or `presence_failed(code, message)` |
 
 Also `session_expired(code)`: the stored sign-in was refused and cleared, so
 the player signs in again.
@@ -64,6 +66,28 @@ the player signs in again.
   can carry on offline and show the player's name.
 - **Grants:** an attached session's grants are renewed in the background
   until `detach()`.
+
+## Presence
+
+`set_presence("Ranked match", "In lobby", "Neon District")` shows what the
+player is doing on their Gridspawn profile, friends list and club member
+lists, as "<your game> · Ranked match · In lobby". Empty strings are left
+out; `set_presence("", "", "")` shows "Playing <your game>".
+- **Re-sending:** the presence is re-sent every 60 s until
+  `clear_presence()` (it expires 120 s after the last update). If a re-send
+  is refused later, `presence_failed` arrives.
+- **Whose token:** the attached session's presence grant when its ticket
+  included presence, otherwise the signed-in player. Then sign-in needs the
+  `presence.write` scope: add it to `scopes`.
+- **Guests** have no presence.
+- **Limit:** 5 updates per 20 s per player, so set it when the activity
+  changes, not every frame.
+- **Refused text:** emails, web addresses and identifiers in the text
+  (`presence/text_not_allowed`).
+- **When your game server also sets presence**, the server's is shown.
+- **Not yet in GDScript:** the start time (shown as time played) and the
+  party size. A dictionary-based `set_presence_ex(dict)` with them is planned
+  for the next version. Game servers can set both today (`gridspawn-server`).
 
 ## Voice
 
@@ -147,7 +171,8 @@ applies. Sign-in is never stored in files or save data.
 
 ## Error codes
 
-Codes are the service's (`auth/invalid_grant`, `session/ticket_invalid`, …) or
+Codes are the service's (`auth/invalid_grant`, `session/ticket_invalid`,
+`presence/scope_denied`, …) or
 local (`sign_in/cancelled`, `sign_in/timed_out`, `sign_in/browser_unavailable`,
 `sign_in/state_mismatch`, `sign_in/required`, `network`, `timeout`). Messages
 are for logs and never contain secrets.

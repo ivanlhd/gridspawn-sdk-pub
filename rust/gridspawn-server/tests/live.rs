@@ -9,7 +9,7 @@
 
 use gridspawn_server::{
     AdmitGuest, Client, CreateSession, Credential, Environment, Error, ErrorCode, IdempotencyKey,
-    IdentityKind, Module, Post,
+    IdentityKind, Module, Post, Presence,
 };
 
 fn env(names: &[&str]) -> Option<String> {
@@ -95,6 +95,21 @@ async fn live_test_application() {
     let ticket = guest.issue_ticket(&[Module::Voice]).await.expect("ticket");
     assert!(ticket.as_str().starts_with("gpt1."));
     eprintln!("guest and voice ticket ok ({ticket:?})");
+
+    // 03 server path: guests have no Gridspawn profile, so no presence; the
+    // same through a handle made from the id.
+    let refused = guest
+        .set_presence(&Presence::new().details("Live check"))
+        .await
+        .unwrap_err();
+    eprintln!("guest presence: {refused}");
+    assert_eq!(code(refused), ErrorCode::PresenceGuestNotSupported);
+    let by_id = session.participant(guest.id.clone());
+    assert_eq!(
+        code(by_id.clear_presence().await.unwrap_err()),
+        ErrorCode::PresenceGuestNotSupported
+    );
+    eprintln!("presence refused for the guest on both calls, as expected");
 
     // 05: the grant works and is reused; the test app has no game, so posts
     // answer feature_not_found.

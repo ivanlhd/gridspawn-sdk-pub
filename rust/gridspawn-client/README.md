@@ -13,7 +13,7 @@ It speaks the wire protocol one to one: `01-login.md` and `02-sessions.md` in
 the protocol docs (`docs/protocol/` in the public repository). Requests never
 carry an `Origin` header.
 
-Status: 0.1.0, source only, not on crates.io yet. Licence: MIT OR Apache-2.0
+Status: 0.2.0, source only, not on crates.io yet. Licence: MIT OR Apache-2.0
 (see the end of this file).
 MSRV: Rust 1.83 for the library (the tests' dev-dependencies need a newer
 toolchain). Presence (03) and voice (04) are not in this crate yet.
@@ -140,6 +140,37 @@ let voice = session.grant(gridspawn_client::Module::Voice).await?;
     you get `GrantEvent::Expired`.
 - Guests are attached the same way; their `display_name` is always set.
 
+## Show what the player is doing (presence)
+
+The player's presence in your game shows on their Gridspawn profile, friends
+list and club member lists as "<your game> · details · state" (protocol 03).
+
+```rust
+use gridspawn_client::{Party, Presence};
+
+// With the signed-in player's token (sign in with the `presence.write` scope)…
+let presence = client.presence();
+// …or with an attached session's presence grant (ticket with the presence module):
+// let presence = session.presence();
+presence.set(Presence::new().details("Ranked match").state("In lobby")).await?;
+// Re-sent every 60 s in the background until clear() or drop.
+presence.clear().await?;
+```
+
+- The presence expires 120 s after the last update. The updater re-sends it
+  every 60 s on the current tokio runtime. It retries 429, 5xx and network
+  errors (after `Retry-After`, or 10 s). On any other refusal it stops, with
+  `PresenceEvent::Stopped` (`subscribe()`).
+- A party (`Presence::party`) needs the `presence.party` scope. Guests have
+  no presence (`presence/guest_not_supported`).
+- When your game server also sets the player's presence, the server's is
+  shown and the client's is accepted but hidden.
+- Texts are trimmed and checked for length and control characters first.
+  The service refuses emails, web addresses and identifiers
+  (`presence/text_not_allowed`, with `ApiError::field`).
+- Limit: 5 writes per 20 s per player, so update when the activity changes,
+  not every frame.
+
 ## Errors
 
 `Error::code()` gives a stable string for UI and logs: the wire code
@@ -161,6 +192,10 @@ let voice = session.grant(gridspawn_client::Module::Voice).await?;
 | `session/ticket_invalid` | The ticket expired (120 s), was used, or is forged | Ask the game server for a new ticket |
 | `session/capability_denied` | A module the app or player may not use | Configuration |
 | `session/grant_invalid`, `session/not_found` | The game session ended | Rejoin |
+| `presence/invalid_request`, `presence/text_not_allowed` | A presence field is not accepted (`ApiError::field`) | Fix that text |
+| `presence/token_invalid`, `presence/scope_denied` | No `presence.write` (or `presence.party`) consent, or presence is off for the app | Sign in with the scope, or check the app's modules |
+| `presence/guest_not_supported` | A guest has no presence | Skip presence for guests |
+| `presence/rate_limited` | More than 5 updates in 20 s | Wait `retry_after`; update less often |
 | `service/not_ready`, `network`, `timeout` | Temporary | Retry later; the session is kept |
 
 ## Tests

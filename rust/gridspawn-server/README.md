@@ -9,7 +9,7 @@ admission, tickets) and `05-club.md` (club posts) in the protocol docs
 (`docs/protocol/` in the public repository). Requests never carry an `Origin`
 header.
 
-Status: 0.1.0, source only, not on crates.io yet. Licence: MIT OR Apache-2.0
+Status: 0.2.0, source only, not on crates.io yet. Licence: MIT OR Apache-2.0
 (see the end of this file).
 MSRV: Rust 1.83 for the library (the tests' dev-dependencies need a newer
 toolchain).
@@ -105,14 +105,47 @@ feature, `gridspawn_server::blocking::Client` offers the same calls
 synchronously (no background renewer there: call `renew` yourself). Do not
 call it from async code or a game's frame loop.
 
+## Show what a player is doing (presence)
+
+Your server sets a signed-in player's presence: it shows on their Gridspawn
+profile, friends list and club member lists as "<your game> · details ·
+state (size/max)" (protocol 03, server path).
+
+```rust
+use gridspawn_server::{Party, Presence};
+
+let presence = Presence::new()
+    .details("Ranked match")
+    .state("In lobby")
+    .party(Party::new("lobby-42", 2, 4));
+participant.set_presence(&presence).await?;   // or session.participant(id).set_presence(…)
+// …every 60 s while the player is in the session: it expires 120 s after
+// the last update.
+participant.clear_presence().await?;          // when the player leaves
+```
+
+- The crate does not re-send for you: call `set_presence` every 60 s while
+  the player is in the session. Presence expires 120 s after the last write,
+  and at once on `clear_presence`.
+- Needs the key's `session.manage` scope, a live lease, and the player's
+  `presence.write` consent (`presence.party` for a party). Guests have no
+  Gridspawn profile: `PresenceGuestNotSupported`.
+- While your server's presence is live, the player's own client updates for
+  your game are accepted but not shown.
+- Texts are trimmed and checked for length and control characters before
+  sending. The service refuses emails, web addresses and identifiers in them
+  (`PresenceTextNotAllowed`, with `ApiError::field`).
+- Limits: 5 writes per 20 s per player, and 3,000 per minute per app and
+  environment. Over them: `RateLimited` with `retry_after`.
+
 ## Retries
 
 - Network errors, timeouts and HTTP 5xx are retried (`RetryPolicy`: 3
   attempts, 200 ms doubling, ±20 % jitter), always with the same
   Idempotency-Key and body.
-- 429 is not retried: you get `ErrorCode::RateLimited` and decide. Neither
-  service sends `Retry-After` today (`ApiError::retry_after` reads it if it
-  appears); the posting limits are fixed one-minute windows.
+- 429 is not retried: you get `ErrorCode::RateLimited` and decide.
+  `ApiError::retry_after` carries `Retry-After` when sent (presence limits
+  send it; the posting limits are fixed one-minute windows without it).
 - Ticket issue is never retried (each call issues a new ticket).
 - A post that gets `grant_invalid` gets a new club grant once and is
   retried once.
@@ -120,14 +153,19 @@ call it from async code or a game's frame loop.
 ## Errors
 
 `Error::Api` carries an `ApiError` with `service`, `status`, `code`
-(`ErrorCode`), `wire_code`, `message`, `request_id` and `retry_after`.
+(`ErrorCode`), `wire_code`, `message`, `request_id`, `retry_after` and
+`field`.
 `Error::is_retryable()` tells whether a later retry with the same key makes
 sense.
 
 | `ErrorCode` | Wire code | What to do |
 |---|---|---|
 | `FeatureNotFound` | `feature_not_found` (404) | Add a destination for the feature in the Dev Hub, turn posting on, or allow test servers |
-| `RateLimited` | `rate_limited` (429) | Wait; limits are 120 posts/min per app and 30/min per feature |
+| `RateLimited` | `rate_limited`, `presence/rate_limited` (429) | Wait (`retry_after` when sent); posts: 120/min per app and 30/min per feature; presence: 5 writes per 20 s per player |
+| `PresenceInvalidRequest` / `PresenceTextNotAllowed` | `presence/invalid_request` / `presence/text_not_allowed` (400) | Fix the field in `ApiError::field` |
+| `PresenceScopeDenied` | `presence/scope_denied` (403) | No `presence.write` (or `presence.party`) consent, or the presence module is off |
+| `PresenceGuestNotSupported` | `presence/guest_not_supported` (403) | Guests have no presence |
+| `PresenceAccountUnavailable` | `presence/account_unavailable` (403) | The player's account is not active |
 | `GrantInvalid` | `grant_invalid` (401) | Key revoked or app turned off (one automatic refresh already happened) |
 | `AuthenticationRequired` | `server/authentication_required` (401) | Wrong, revoked or expired key, or the environment is off |
 | `ScopeDenied` | `server/scope_denied` (403) | The key lacks the scope (`club.post` / `session.manage`) |

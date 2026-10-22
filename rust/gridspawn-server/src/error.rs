@@ -97,12 +97,15 @@ pub struct ApiError {
     /// The edge's human-readable message; Core sends codes only.
     pub message: Option<String>,
     pub request_id: Option<String>,
-    /// From `Retry-After` when present. Neither service sends it today; Core's
-    /// posting limits are fixed one-minute windows.
+    /// From `Retry-After` when present (presence rate limits send it; Core's
+    /// posting limits are fixed one-minute windows without it).
     pub retry_after: Option<Duration>,
+    /// The request field the error is about (`error.field`), when the service
+    /// names one (presence payload errors).
+    pub field: Option<String>,
 }
 
-/// The documented error codes of protocol 02 (edge) and 05 (Core).
+/// The documented error codes of protocols 02 and 03 (edge) and 05 (Core).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ErrorCode {
@@ -156,7 +159,19 @@ pub enum ErrorCode {
     BoardBusy,
     /// `club_chat_unavailable`, `club_webhook_chat_unavailable` or `chat_unavailable`.
     ChatUnavailable,
-    /// `rate_limited`, or any 429 without a code (nginx).
+    /// `presence/invalid_request` ([`ApiError::field`] when known).
+    PresenceInvalidRequest,
+    /// `presence/text_not_allowed`: an email, web address or identifier in
+    /// the text ([`ApiError::field`]).
+    PresenceTextNotAllowed,
+    /// `presence/scope_denied`: no `presence.write` consent, a party without
+    /// `presence.party`, or the app's presence module is off.
+    PresenceScopeDenied,
+    /// `presence/guest_not_supported`.
+    PresenceGuestNotSupported,
+    /// `presence/account_unavailable`: the player's account is not active.
+    PresenceAccountUnavailable,
+    /// `rate_limited`, `presence/rate_limited`, or any 429 without a code (nginx).
     RateLimited,
     /// Any other code, kept verbatim.
     Other(String),
@@ -201,7 +216,12 @@ impl ErrorCode {
             "club_chat_unavailable" | "club_webhook_chat_unavailable" | "chat_unavailable" => {
                 Self::ChatUnavailable
             }
-            "rate_limited" => Self::RateLimited,
+            "presence/invalid_request" => Self::PresenceInvalidRequest,
+            "presence/text_not_allowed" => Self::PresenceTextNotAllowed,
+            "presence/scope_denied" => Self::PresenceScopeDenied,
+            "presence/guest_not_supported" => Self::PresenceGuestNotSupported,
+            "presence/account_unavailable" => Self::PresenceAccountUnavailable,
+            "rate_limited" | "presence/rate_limited" => Self::RateLimited,
             other if CONTENT_CODES.contains(&other) => Self::ContentRejected(other.to_owned()),
             other => Self::Other(other.to_owned()),
         }
@@ -234,6 +254,11 @@ impl ErrorCode {
             Self::BoardFull => "announcement_board_full",
             Self::BoardBusy => "announcement_board_busy",
             Self::ChatUnavailable => "chat_unavailable",
+            Self::PresenceInvalidRequest => "presence/invalid_request",
+            Self::PresenceTextNotAllowed => "presence/text_not_allowed",
+            Self::PresenceScopeDenied => "presence/scope_denied",
+            Self::PresenceGuestNotSupported => "presence/guest_not_supported",
+            Self::PresenceAccountUnavailable => "presence/account_unavailable",
             Self::RateLimited => "rate_limited",
         }
     }
@@ -275,6 +300,11 @@ mod tests {
             "announcement_board_full",
             "announcement_board_busy",
             "chat_unavailable",
+            "presence/invalid_request",
+            "presence/text_not_allowed",
+            "presence/scope_denied",
+            "presence/guest_not_supported",
+            "presence/account_unavailable",
             "rate_limited",
         ] {
             let mapped = ErrorCode::from_wire(code);
@@ -288,6 +318,10 @@ mod tests {
         assert_eq!(
             ErrorCode::from_wire("club_webhook_chat_unavailable"),
             ErrorCode::ChatUnavailable
+        );
+        assert_eq!(
+            ErrorCode::from_wire("presence/rate_limited"),
+            ErrorCode::RateLimited
         );
         for code in CONTENT_CODES {
             assert_eq!(

@@ -86,6 +86,19 @@ async fn live_attach_renew_and_renewer() {
             .await,
         Err(Error::SignInRequired)
     ));
+    // 03: bootstrap advertises the presence endpoint; without a signed-in
+    // player the client path refuses locally (a guest cannot get a presence
+    // grant, so the session path is not reachable from this test).
+    let presence_url = client.presence_url().expect("endpoints.presence");
+    assert_eq!(presence_url.scheme(), "https");
+    eprintln!("presence endpoint path: {}", presence_url.path());
+    assert!(matches!(
+        client
+            .presence()
+            .set(gridspawn_client::Presence::new())
+            .await,
+        Err(Error::SignInRequired)
+    ));
 
     let attached = client.attach(ticket.as_str()).await.expect("attach");
     let participant = attached.participant();

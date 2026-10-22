@@ -257,6 +257,10 @@ impl AttachedSession {
         &self.inner.id
     }
 
+    pub(crate) fn client(&self) -> &Client {
+        &self.inner.client
+    }
+
     pub fn participant(&self) -> &Participant {
         &self.inner.participant
     }

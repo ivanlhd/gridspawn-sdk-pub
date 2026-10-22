@@ -153,16 +153,20 @@ fn api_error(
     header_request_id: Option<String>,
 ) -> ApiError {
     let text = |value: Option<&Value>| value.and_then(Value::as_str).map(str::to_owned);
-    let (code, message, body_request_id) = match serde_json::from_slice::<Value>(body) {
+    let (code, message, field, body_request_id) = match serde_json::from_slice::<Value>(body) {
         Ok(Value::Object(map)) => {
-            let (code, message) = match map.get("error") {
-                Some(Value::Object(error)) => (text(error.get("code")), text(error.get("message"))),
-                Some(Value::String(code)) => (Some(code.clone()), None),
-                _ => (text(map.get("code")), None),
+            let (code, message, field) = match map.get("error") {
+                Some(Value::Object(error)) => (
+                    text(error.get("code")),
+                    text(error.get("message")),
+                    text(error.get("field")),
+                ),
+                Some(Value::String(code)) => (Some(code.clone()), None, None),
+                _ => (text(map.get("code")), None, None),
             };
-            (code, message, text(map.get("requestId")))
+            (code, message, field, text(map.get("requestId")))
         }
-        _ => (None, None, None),
+        _ => (None, None, None, None),
     };
     let wire_code = code.unwrap_or_else(|| {
         if status == StatusCode::TOO_MANY_REQUESTS {
@@ -183,5 +187,6 @@ fn api_error(
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.trim().parse::<u64>().ok())
             .map(Duration::from_secs),
+        field,
     }
 }

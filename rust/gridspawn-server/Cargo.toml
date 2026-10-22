@@ -1,6 +1,6 @@
 [package]
 name = "gridspawn-server"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.83"
 description = "Rust server SDK for Gridspawn: game sessions, player and guest admission, client tickets, and club posts."

@@ -13,8 +13,8 @@ use std::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use gridspawn_client::{
     AuthEvent, Client, Environment, Error, ErrorCode, GrantEvent, IdentityKind, MemoryTokenStore,
-    Module, PendingSignIn, Restore, Service, SignIn, SignInError, StoreError, StoredSession,
-    TokenStore, User,
+    Module, Party, PendingSignIn, Presence, PresenceEvent, Restore, Service, SignIn, SignInError,
+    StoreError, StoredSession, TokenStore, User,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -42,6 +42,7 @@ fn bootstrap_body(uri: &str, oauth: &str) -> Value {
             "api": format!("{uri}/v1"),
             "oauth": oauth,
             "voice": format!("{uri}/v1/sdk/voice"),
+            "presence": format!("{uri}/v1/presence"),
             "mediaResolver": format!("{uri}/v1/media/resolve")
         }
     })
@@ -1316,4 +1317,214 @@ async fn bootstrap_is_checked() {
             ..
         }
     ));
+}
+
+// ---- presence ---------------------------------------------------------------
+
+const PRESENCE: &str = "/v1/presence";
+
+fn presence_ok(expires_at: i64) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({ "ok": true, "expiresAt": expires_at }))
+}
+
+#[tokio::test]
+async fn presence_with_the_player_token_sets_and_clears() {
+    let server = server().await;
+    Mock::given(method("PUT"))
+        .and(path(PRESENCE))
+        .and(query_param("appId", APP))
+        .and(query_param("environment", "development"))
+        .and(header("authorization", "Bearer access-0"))
+        .respond_with(presence_ok(1792310520))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(PRESENCE))
+        .and(header("authorization", "Bearer access-0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+        .mount(&server)
+        .await;
+    let client = client(&server, store_with(stored(3600, "refresh-0"))).await;
+    client.restore().await.unwrap();
+    assert_eq!(client.presence_url().unwrap().path(), "/v1/presence");
+    let presence = client.presence();
+    let ack = presence
+        .set(Presence::new().details(" Ranked match ").state("In lobby"))
+        .await
+        .unwrap();
+    assert_eq!(ack.expires_at, 1792310520);
+    assert!(presence.is_active());
+    presence.clear().await.unwrap();
+    assert!(!presence.is_active());
+
+    let sent = requests(&server, PRESENCE).await;
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0].method.as_str(), "PUT");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&sent[0].body).unwrap(),
+        json!({ "details": "Ranked match", "state": "In lobby" })
+    );
+    assert_eq!(sent[1].method.as_str(), "DELETE");
+    assert_no_origin(&server).await;
+}
+
+#[tokio::test]
+async fn presence_needs_a_signed_in_player_or_a_presence_grant() {
+    let server = server().await;
+    let client = client(&server, Arc::new(MemoryTokenStore::new())).await;
+    let error = client.presence().set(Presence::new()).await.unwrap_err();
+    assert!(matches!(error, Error::SignInRequired), "{error:?}");
+    // The attached session has a voice grant only.
+    mount_attach(&server, 300).await;
+    let session = client.attach(TICKET).await.unwrap();
+    let error = session.presence().set(Presence::new()).await.unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+    assert!(requests(&server, PRESENCE).await.is_empty());
+}
+
+#[tokio::test]
+async fn presence_with_the_session_grant() {
+    let server = server().await;
+    let mut body = attach_body(300);
+    body["modules"] = json!(["presence"]);
+    body["grants"] = json!({
+        "presence": { "accessToken": "presence-grant", "tokenType": "Bearer", "expiresIn": 300, "scope": "presence.write" }
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/sessions/attach"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(PRESENCE))
+        .and(header("authorization", "Bearer presence-grant"))
+        .respond_with(presence_ok(1792310520))
+        .mount(&server)
+        .await;
+    let client = client(&server, Arc::new(MemoryTokenStore::new())).await;
+    let session = client.attach(TICKET).await.unwrap();
+    session
+        .presence()
+        .set(Presence::new().party(Party::new("lobby-42", 2, 4)))
+        .await
+        .unwrap();
+    let sent = requests(&server, PRESENCE).await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&sent[0].body).unwrap(),
+        json!({ "party": { "id": "lobby-42", "size": 2, "max": 4 } })
+    );
+}
+
+#[tokio::test]
+async fn presence_is_re_sent_until_cleared() {
+    let server = server().await;
+    Mock::given(method("PUT"))
+        .and(path(PRESENCE))
+        .respond_with(presence_ok(1792310520))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(PRESENCE))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+        .mount(&server)
+        .await;
+    let client = client(&server, store_with(stored(3600, "refresh-0"))).await;
+    client.restore().await.unwrap();
+    let presence = client.presence();
+    presence.set_resend_interval(Duration::from_millis(100));
+    presence
+        .set(Presence::new().details("Exploring"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    let puts = requests(&server, PRESENCE).await.len();
+    assert!(puts >= 4, "first send and re-sends: {puts}");
+    presence.clear().await.unwrap();
+    let after_clear = requests(&server, PRESENCE).await.len();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        requests(&server, PRESENCE).await.len(),
+        after_clear,
+        "no re-send after clear"
+    );
+}
+
+#[tokio::test]
+async fn presence_re_send_retries_429_and_stops_on_a_refusal() {
+    let server = server().await;
+    Mock::given(method("PUT"))
+        .and(path(PRESENCE))
+        .respond_with(presence_ok(1792310520))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(PRESENCE))
+        .respond_with(edge_error(429, "presence/rate_limited").insert_header("Retry-After", "1"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(PRESENCE))
+        .respond_with(edge_error(401, "presence/token_invalid"))
+        .mount(&server)
+        .await;
+    let client = client(&server, store_with(stored(3600, "refresh-0"))).await;
+    client.restore().await.unwrap();
+    let presence = client.presence();
+    presence.set_resend_interval(Duration::from_millis(100));
+    let mut events = presence.subscribe();
+    presence.set(Presence::new()).await.unwrap();
+    match next_event(&mut events).await {
+        PresenceEvent::RetryFailed { code, retry_in, .. } => {
+            assert_eq!(code, "presence/rate_limited");
+            assert_eq!(
+                retry_in,
+                Duration::from_millis(100),
+                "capped by the interval"
+            );
+        }
+        other => panic!("expected a retry, got {other:?}"),
+    }
+    match next_event(&mut events).await {
+        PresenceEvent::Stopped { code, .. } => assert_eq!(code, "presence/token_invalid"),
+        other => panic!("expected a stop, got {other:?}"),
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!presence.is_active());
+    assert_eq!(requests(&server, PRESENCE).await.len(), 3);
+}
+
+#[tokio::test]
+async fn presence_errors_are_typed_with_the_field() {
+    let server = server().await;
+    Mock::given(method("PUT"))
+        .and(path(PRESENCE))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "ok": false, "requestId": "req-p",
+            "error": { "code": "presence/text_not_allowed", "message": "no web addresses", "field": "details" }
+        })))
+        .mount(&server)
+        .await;
+    let client = client(&server, store_with(stored(3600, "refresh-0"))).await;
+    client.restore().await.unwrap();
+    let presence = client.presence();
+    let error = api(presence
+        .set(Presence::new().details("visit example.com"))
+        .await
+        .unwrap_err());
+    assert_eq!(error.code, ErrorCode::PresenceTextNotAllowed);
+    assert_eq!(error.field.as_deref(), Some("details"));
+    assert_eq!(error.service, Service::Edge);
+    assert!(
+        !presence.is_active(),
+        "a failed first send starts no re-send"
+    );
+    // Local bounds: nothing sent.
+    let local = presence
+        .set(Presence::new().location("x".repeat(65)))
+        .await
+        .unwrap_err();
+    assert!(matches!(local, Error::InvalidInput { .. }));
+    assert_eq!(requests(&server, PRESENCE).await.len(), 1);
 }

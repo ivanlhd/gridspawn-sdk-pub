@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use gridspawn_server::{
     AdmitGuest, Client, CreateSession, Credential, Environment, Error, ErrorCode, IdempotencyKey,
-    IdentityKind, Module, Post, RetryPolicy, Service,
+    IdentityKind, Module, ParticipantId, Party, Post, Presence, RetryPolicy, Service, SessionId,
 };
 use serde_json::{json, Value};
 use url::Url;
@@ -729,4 +729,146 @@ fn uuid_like() -> String {
             .unwrap()
             .as_nanos()
     )
+}
+
+#[tokio::test]
+async fn presence_set_and_clear_on_the_server_path() {
+    let server = server().await;
+    let route = "/v1/server/sessions/gssn1.s%2F1/participants/gsp1.p/presence";
+    Mock::given(method("PUT"))
+        .and(path(route))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "ok": true, "expiresAt": 1792310520 })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(route))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+        .mount(&server)
+        .await;
+    let client = client(&server).await;
+    let participant = client
+        .session(SessionId::new("gssn1.s/1"))
+        .participant(ParticipantId::new("gsp1.p"));
+    let ack = participant
+        .set_presence(
+            &Presence::new()
+                .details(" Ranked match ")
+                .state("In lobby")
+                .started_at(1792310400)
+                .party(Party::new("party-1", 2, 4)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ack.expires_at, 1792310520);
+    participant.clear_presence().await.unwrap();
+
+    let sent = requests(&server, route).await;
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0].method.as_str(), "PUT");
+    assert_eq!(
+        sent[0].headers["authorization"],
+        format!("GridspawnServer {CRED}").as_str()
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&sent[0].body).unwrap(),
+        json!({
+            "details": "Ranked match", "state": "In lobby", "startedAt": 1792310400,
+            "party": { "id": "party-1", "size": 2, "max": 4 }
+        })
+    );
+    assert_eq!(sent[1].method.as_str(), "DELETE");
+    assert!(sent[1].body.is_empty());
+    assert_no_origin(&server).await;
+}
+
+#[tokio::test]
+async fn presence_errors_are_typed_with_field_and_retry_after() {
+    let server = server().await;
+    let route = "/v1/server/sessions/gssn1.s/participants/gsp1.p/presence";
+    Mock::given(method("PUT"))
+        .and(path(route))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "ok": false, "requestId": "req-1",
+            "error": { "code": "presence/text_not_allowed", "message": "no web addresses", "field": "details" }
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(route))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "12")
+                .set_body_json(json!({
+                    "ok": false, "error": { "code": "presence/rate_limited", "message": "slow down" }
+                })),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let participant = client(&server)
+        .await
+        .session(SessionId::new("gssn1.s"))
+        .participant(ParticipantId::new("gsp1.p"));
+
+    let error = api(participant
+        .set_presence(&Presence::new().details("visit example.com"))
+        .await
+        .unwrap_err());
+    assert_eq!(error.code, ErrorCode::PresenceTextNotAllowed);
+    assert_eq!(error.field.as_deref(), Some("details"));
+    assert_eq!(error.request_id.as_deref(), Some("req-1"));
+
+    let error = participant
+        .set_presence(&Presence::new())
+        .await
+        .unwrap_err();
+    assert!(error.is_retryable());
+    let error = api(error);
+    assert_eq!(error.code, ErrorCode::RateLimited);
+    assert_eq!(error.wire_code, "presence/rate_limited");
+    assert_eq!(error.retry_after, Some(Duration::from_secs(12)));
+    assert_eq!(
+        requests(&server, route).await.len(),
+        2,
+        "429 is not retried"
+    );
+
+    // Local checks: nothing is sent.
+    let invalid = participant
+        .set_presence(&Presence::new().party(Party::new("p", 5, 4)))
+        .await
+        .unwrap_err();
+    assert!(matches!(invalid, Error::InvalidInput { .. }));
+    assert_eq!(requests(&server, route).await.len(), 2);
+}
+
+#[tokio::test]
+async fn presence_5xx_is_retried() {
+    let server = server().await;
+    let route = "/v1/server/sessions/gssn1.s/participants/gsp1.p/presence";
+    Mock::given(method("DELETE"))
+        .and(path(route))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+            "ok": false, "error": { "code": "service/not_ready", "message": "later" }
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(route))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+        .mount(&server)
+        .await;
+    client(&server)
+        .await
+        .session(SessionId::new("gssn1.s"))
+        .participant(ParticipantId::new("gsp1.p"))
+        .clear_presence()
+        .await
+        .unwrap();
+    assert_eq!(requests(&server, route).await.len(), 2);
 }

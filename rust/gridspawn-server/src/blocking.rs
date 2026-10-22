@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use crate::{
     AdmitGuest, AdmitParticipant, ClientBuilder, ClientTicket, CreateSession, Error,
-    IdempotencyKey, Lease, Module, Participant, Post, PostReceipt, Session,
+    IdempotencyKey, Lease, Module, Participant, ParticipantRef, Post, PostReceipt, Presence,
+    PresenceAck, Session,
 };
 
 pub struct Client {
@@ -68,6 +69,19 @@ impl Client {
         modules: &[Module],
     ) -> Result<ClientTicket, Error> {
         self.runtime.block_on(participant.issue_ticket(modules))
+    }
+
+    /// Re-send every 60 s while the player is in the session.
+    pub fn set_presence(
+        &self,
+        participant: &ParticipantRef,
+        presence: &Presence,
+    ) -> Result<PresenceAck, Error> {
+        self.runtime.block_on(participant.set_presence(presence))
+    }
+
+    pub fn clear_presence(&self, participant: &ParticipantRef) -> Result<(), Error> {
+        self.runtime.block_on(participant.clear_presence())
     }
 }
 

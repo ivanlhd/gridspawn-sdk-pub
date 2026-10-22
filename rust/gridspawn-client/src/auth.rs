@@ -547,7 +547,7 @@ impl Client {
     }
 
     /// A usable access token, refreshing first when needed.
-    async fn valid_access_token(&self) -> Result<Zeroizing<String>, Error> {
+    pub(crate) async fn valid_access_token(&self) -> Result<Zeroizing<String>, Error> {
         let held = lock(&self.inner.session)
             .clone()
             .ok_or(Error::SignInRequired)?;

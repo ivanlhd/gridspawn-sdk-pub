@@ -1,6 +1,6 @@
 [package]
 name = "gridspawn-client"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.83"
 description = "Rust client SDK for Gridspawn: player sign-in (system browser, PKCE, loopback), player assertions, and game-session attach."

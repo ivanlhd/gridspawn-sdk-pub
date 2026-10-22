@@ -145,21 +145,25 @@ pub(crate) fn api_error(
     header_request_id: Option<String>,
 ) -> ApiError {
     let text = |value: Option<&Value>| value.and_then(Value::as_str).map(str::to_owned);
-    let (code, message, body_request_id) = match serde_json::from_slice::<Value>(body) {
+    let (code, message, field, body_request_id) = match serde_json::from_slice::<Value>(body) {
         Ok(Value::Object(map)) => {
-            let (code, message) = match (map.get("error"), text(map.get("code"))) {
-                (Some(Value::Object(error)), _) => {
-                    (text(error.get("code")), text(error.get("message")))
-                }
-                (_, Some(code)) => (Some(code), text(map.get("error_description"))),
-                (Some(Value::String(error)), None) => {
-                    (Some(error.clone()), text(map.get("error_description")))
-                }
-                _ => (None, None),
+            let (code, message, field) = match (map.get("error"), text(map.get("code"))) {
+                (Some(Value::Object(error)), _) => (
+                    text(error.get("code")),
+                    text(error.get("message")),
+                    text(error.get("field")),
+                ),
+                (_, Some(code)) => (Some(code), text(map.get("error_description")), None),
+                (Some(Value::String(error)), None) => (
+                    Some(error.clone()),
+                    text(map.get("error_description")),
+                    None,
+                ),
+                _ => (None, None, None),
             };
-            (code, message, text(map.get("requestId")))
+            (code, message, field, text(map.get("requestId")))
         }
-        _ => (None, None, None),
+        _ => (None, None, None, None),
     };
     let wire_code = code.unwrap_or_else(|| {
         if status == StatusCode::TOO_MANY_REQUESTS {
@@ -180,6 +184,7 @@ pub(crate) fn api_error(
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.trim().parse::<u64>().ok())
             .map(Duration::from_secs),
+        field,
     }
 }
 

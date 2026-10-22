@@ -15,8 +15,8 @@ use std::{
 
 use godot::{classes::INode, prelude::*};
 use gridspawn_client::{
-    AttachedSession, AuthEvent, Client, Environment, Error, GrantEvent, MemoryTokenStore,
-    RenewerHandle, Restore, SignIn,
+    AttachedSession, AuthEvent, Client, Environment, Error, GrantEvent, MemoryTokenStore, Module,
+    Presence, PresenceEvent, PresenceUpdater, RenewerHandle, Restore, SignIn,
 };
 use tokio::{
     runtime::{Handle, Runtime},
@@ -65,7 +65,18 @@ enum Outcome {
     AttachFailed(String, String),
     GrantRenewed(String),
     GrantExpired(String, String),
+    PresenceSet(i64),
+    PresenceCleared,
+    PresenceFailed(String, String),
     Warning(String),
+}
+
+/// The presence updater and where its token comes from.
+struct PresenceState {
+    updater: PresenceUpdater,
+    /// With the attached session's grant (else the signed-in player's token).
+    from_session: bool,
+    events: JoinHandle<()>,
 }
 
 struct Attachment {
@@ -149,6 +160,7 @@ pub struct GridspawnClient {
     outcomes_rx: mpsc::Receiver<Outcome>,
     sign_in_task: Option<JoinHandle<()>>,
     attachment: Option<Attachment>,
+    presence: Option<PresenceState>,
     base: Base<Node>,
 }
 
@@ -171,6 +183,7 @@ impl INode for GridspawnClient {
             outcomes_rx,
             sign_in_task: None,
             attachment: None,
+            presence: None,
             base,
         }
     }
@@ -205,6 +218,12 @@ impl GridspawnClient {
     fn grant_renewed(module: GString);
     #[signal]
     fn grant_expired(module: GString, code: GString);
+    #[signal]
+    fn presence_set(expires_at: i64);
+    #[signal]
+    fn presence_cleared();
+    #[signal]
+    fn presence_failed(code: GString, message: GString);
 
     /// Loads the stored session → `signed_in` | `signed_out` | `sign_in_failed`.
     /// Offline with a stored session, `sign_in_failed("network", …)` comes
@@ -263,9 +282,13 @@ impl GridspawnClient {
         }
     }
 
-    /// Clears the stored session, then revokes it → `signed_out`.
+    /// Clears the stored session, then revokes it → `signed_out`. Stops
+    /// re-sending a presence set with the player's token.
     #[func]
     fn sign_out(&mut self) {
+        if self.presence.as_ref().is_some_and(|p| !p.from_session) {
+            self.stop_presence();
+        }
         self.run(|config, cell, outcomes| async move {
             match connect(&cell, config, &outcomes).await {
                 Err(error) => {
@@ -404,13 +427,79 @@ impl GridspawnClient {
         });
     }
 
-    /// Leaves the attached session: stops renewing its grants.
+    /// Leaves the attached session: stops renewing its grants (and re-sending
+    /// a presence that used its grant).
     #[func]
     fn detach(&mut self) {
         if let Some(attachment) = self.attachment.take() {
             attachment.events.abort();
             attachment.renewer.stop();
         }
+        if self.presence.as_ref().is_some_and(|p| p.from_session) {
+            self.stop_presence();
+        }
+    }
+
+    /// Shows what the player is doing in your game on their Gridspawn profile
+    /// → `presence_set(expires_at)` | `presence_failed(code, message)`.
+    /// Empty strings are left out (all empty shows "Playing <your game>").
+    /// Re-sent every 60 s until `clear_presence()`; a later failure of the
+    /// re-send also arrives as `presence_failed`. Uses the attached session's
+    /// presence grant when it has one, otherwise the signed-in player (who
+    /// must have signed in with the `presence.write` scope).
+    #[func]
+    fn set_presence(&mut self, details: GString, state: GString, location: GString) {
+        let mut presence = Presence::new();
+        for (value, apply) in [
+            (
+                details,
+                Presence::details as fn(Presence, String) -> Presence,
+            ),
+            (state, Presence::state),
+            (location, Presence::location),
+        ] {
+            let value = value.to_string();
+            if !value.trim().is_empty() {
+                presence = apply(presence, value);
+            }
+        }
+        let Some(updater) = self.presence_updater() else {
+            let _ = self.outcomes_tx.send(Outcome::PresenceFailed(
+                "sign_in/required".into(),
+                "Sign in (with presence.write) or attach a session with presence first.".into(),
+            ));
+            return;
+        };
+        self.run(|_config, _cell, outcomes| async move {
+            let _ = outcomes.send(match updater.set(presence).await {
+                Ok(ack) => Outcome::PresenceSet(ack.expires_at),
+                Err(error) => {
+                    let (code, message) = failure(&error);
+                    Outcome::PresenceFailed(code, message)
+                }
+            });
+        });
+    }
+
+    /// Removes the player's presence now and stops re-sending it
+    /// → `presence_cleared` | `presence_failed(code, message)`.
+    #[func]
+    fn clear_presence(&mut self) {
+        let Some(state) = self.presence.take() else {
+            let _ = self.outcomes_tx.send(Outcome::PresenceCleared);
+            return;
+        };
+        state.events.abort();
+        let updater = state.updater;
+        self.run(|_config, _cell, outcomes| async move {
+            let _ = outcomes.send(match updater.clear().await {
+                Ok(()) => Outcome::PresenceCleared,
+                Err(error) => {
+                    let (code, message) = failure(&error);
+                    Outcome::PresenceFailed(code, message)
+                }
+            });
+        });
     }
 }
 
@@ -466,6 +555,61 @@ impl GridspawnClient {
                 .build()
                 .expect("the Gridspawn runtime could not start")
         })
+    }
+
+    /// The presence updater for the current token source: the attached
+    /// session's grant when it has presence, else the signed-in player. A new
+    /// source replaces the updater (the old one stops re-sending). `None`
+    /// before the client is connected.
+    fn presence_updater(&mut self) -> Option<PresenceUpdater> {
+        let session = self
+            .attachment
+            .as_ref()
+            .filter(|a| a.session.capabilities().contains(&Module::Presence))
+            .map(|a| a.session.clone());
+        let from_session = session.is_some();
+        if let Some(state) = &self.presence {
+            if state.from_session == from_session {
+                return Some(state.updater.clone());
+            }
+        }
+        let updater = match session {
+            Some(session) => session.presence(),
+            None => self.client.get()?.presence(),
+        };
+        self.stop_presence();
+        let mut events = updater.subscribe();
+        let outcomes = self.outcomes_tx.clone();
+        let task = self.runtime().spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(PresenceEvent::Stopped { code, message }) => {
+                        let _ = outcomes.send(Outcome::PresenceFailed(code, message));
+                    }
+                    Ok(PresenceEvent::RetryFailed { code, message, .. }) => {
+                        let _ = outcomes.send(Outcome::Warning(format!(
+                            "presence re-send failed ({code}): {message}; retrying"
+                        )));
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        self.presence = Some(PresenceState {
+            updater: updater.clone(),
+            from_session,
+            events: task,
+        });
+        Some(updater)
+    }
+
+    /// Drops the updater: re-sending stops and the presence expires (120 s).
+    fn stop_presence(&mut self) {
+        if let Some(state) = self.presence.take() {
+            state.events.abort();
+        }
     }
 
     /// For `GridspawnVoice`: the client, the attached session and the runtime.
@@ -530,6 +674,17 @@ impl GridspawnClient {
             Outcome::GrantExpired(module, code) => {
                 self.base_mut()
                     .emit_signal("grant_expired", &[s(&module), s(&code)]);
+            }
+            Outcome::PresenceSet(expires_at) => {
+                self.base_mut()
+                    .emit_signal("presence_set", &[expires_at.to_variant()]);
+            }
+            Outcome::PresenceCleared => {
+                self.base_mut().emit_signal("presence_cleared", &[]);
+            }
+            Outcome::PresenceFailed(code, message) => {
+                self.base_mut()
+                    .emit_signal("presence_failed", &[s(&code), s(&message)]);
             }
             Outcome::Warning(message) => godot_warn!("Gridspawn: {message}"),
         }

@@ -183,6 +183,11 @@ impl ClientBuilder {
             Some(value) => Some(parse(value, "endpoints.voice is not a secure URL")?),
             None => None,
         };
+        // 03: presence updates; optional in the same way.
+        let presence = match bootstrap.endpoints.presence.as_deref() {
+            Some(value) => Some(parse(value, "endpoints.presence is not a secure URL")?),
+            None => None,
+        };
         // 01 §5: assertions live at {base}/v1/auth/…; base is the OAuth endpoint without /oauth.
         let auth_base = oauth
             .as_str()
@@ -211,6 +216,7 @@ impl ClientBuilder {
                 oauth,
                 api,
                 voice,
+                presence,
                 auth_base,
                 http,
                 store,
@@ -326,6 +332,8 @@ struct BootstrapEndpoints {
     oauth: String,
     #[serde(default)]
     voice: Option<String>,
+    #[serde(default)]
+    presence: Option<String>,
 }
 
 /// The shared result of one in-flight refresh.
@@ -345,6 +353,7 @@ pub(crate) struct Inner {
     pub oauth: Url,
     pub api: Url,
     pub voice: Option<Url>,
+    pub presence: Option<Url>,
     pub auth_base: Url,
     pub http: Http,
     pub store: Arc<dyn TokenStore>,
@@ -401,8 +410,10 @@ impl Client {
         self.inner.store.persistent()
     }
 
-    // Extension point for protocol 03 (Presence): a `presence()` accessor will
-    // be added here once its route exists. Not in phase 1.
+    /// Bootstrap's `endpoints.presence` (presence updates, protocol 03), if advertised.
+    pub fn presence_url(&self) -> Option<&Url> {
+        self.inner.presence.as_ref()
+    }
 
     /// Runs a token store call on the blocking pool.
     pub(crate) async fn store_call<T, F>(&self, call: F) -> Result<T, Error>

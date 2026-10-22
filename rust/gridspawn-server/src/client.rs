@@ -183,9 +183,6 @@ impl Client {
         &self.inner.modules
     }
 
-    // Extension point for protocol 03 (Presence): a `presence()` accessor
-    // will be added here once the server route exists. Not in phase 1.
-
     /// POST to the SDK edge with the server credential.
     pub(crate) async fn edge_post<T: DeserializeOwned>(
         &self,
@@ -195,15 +192,36 @@ impl Client {
         idempotency_key: Option<&IdempotencyKey>,
         retry: bool,
     ) -> Result<T, Error> {
+        self.edge_send(
+            Method::POST,
+            route,
+            path,
+            Some(body),
+            idempotency_key,
+            retry,
+        )
+        .await
+    }
+
+    /// Any method to the SDK edge with the server credential.
+    pub(crate) async fn edge_send<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        route: &'static str,
+        path: &str,
+        body: Option<&Value>,
+        idempotency_key: Option<&IdempotencyKey>,
+        retry: bool,
+    ) -> Result<T, Error> {
         self.inner
             .http
             .send(Call {
                 service: Service::Edge,
-                method: Method::POST,
+                method,
                 url: endpoint(&self.inner.sdk_base, path),
                 route,
                 auth: Auth::Server(&self.inner.credential),
-                body: Some(body),
+                body,
                 idempotency_key: idempotency_key.map(IdempotencyKey::as_str),
                 retry,
             })

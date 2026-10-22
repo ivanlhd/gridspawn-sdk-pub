@@ -18,6 +18,8 @@ func _ready() -> void:
 	Gridspawn.assertion_failed.connect(_on_assertion_failed)
 	Gridspawn.attached.connect(_on_attached)
 	Gridspawn.attach_failed.connect(_on_attach_failed)
+	Gridspawn.presence_set.connect(func(_expires_at): _fail("presence_set"))
+	Gridspawn.presence_failed.connect(_on_presence_failed)
 	Gridspawn.grant_renewed.connect(_on_grant_renewed)
 	Gridspawn.grant_expired.connect(func(module, code): _fail("grant_expired %s %s" % [module, code]))
 	get_tree().create_timer(90.0).timeout.connect(func(): _fail("timeout in step " + _step))
@@ -56,6 +58,15 @@ func _on_grant_renewed(module: String) -> void:
 func _on_attach_failed(code: String, _message: String) -> void:
 	_expect("forged")
 	print("RESULT attach_failed " + code)
+	# Presence: no session grant for it (guests get none) and no signed-in
+	# player, so it is refused before anything is sent.
+	_step = "presence"
+	Gridspawn.set_presence("Live check", "", "")
+
+
+func _on_presence_failed(code: String, _message: String) -> void:
+	_expect("presence")
+	print("RESULT presence_failed " + code)
 	print("RESULT done")
 	get_tree().quit(0)
 

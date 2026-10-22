@@ -5,7 +5,7 @@ The Godot 4 GDExtension for Gridspawn. It is built on the Rust crates
 (`../../rust/gridspawn-voice`). The addon that game developers copy is
 `addons/gridspawn`: its README is the user documentation.
 
-Status: 0.1.0, source only. Licence: MIT OR Apache-2.0 (gdext, the Godot
+Status: 0.2.0, source only. Licence: MIT OR Apache-2.0 (gdext, the Godot
 bindings, is MPL-2.0: `addons/gridspawn/THIRD-PARTY.md`).
 - Godot 4.3 or later (gdext `api-4-3`).
 - Rust 1.94 or later for this crate.
@@ -39,7 +39,8 @@ The tests:
 - import the project headless, then run it.
 
 `headless_attach` checks restore, an assertion while signed out, attach,
-renew, and a forged ticket, through the GDScript API and signals.
+renew, a forged ticket, and presence refused while signed out (guests get no
+presence grant), through the GDScript API and signals.
 `headless_voice` runs two Godot instances in one voice room. Each sends its
 own tone through `input_source = Custom` (headless Godot has no microphone)
 and checks that it receives and plays the other's tone; it also prints each
