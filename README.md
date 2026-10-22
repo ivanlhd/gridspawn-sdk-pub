@@ -21,7 +21,7 @@ here; each commit names the upstream commit it came from.
 | `rust/gridspawn-client` | Rust client SDK for game clients: sign-in (PKCE, loopback), player assertions, session attach and module grants, and player presence (re-sent every 60 s). |
 | `rust/gridspawn-voice` | Rust voice for game clients: joins an attached session's voice room (WebRTC audio, Opus, echo cancellation, noise suppression, jitter buffer) behind a PCM API. Building it compiles C and C++: see its README. |
 | `rust/vendor` | Third-party crates the voice crate builds with small build changes (see Third-party code). |
-| `godot/gridspawn` | Godot 4.3+ addon (GDExtension) over the client SDKs: the `Gridspawn` autoload with sign-in, assertions, attach and presence as signals, and the `GridspawnVoice` node for in-game voice. Windows x86_64 and Linux x86_64. Prebuilt addon zips (Windows, Linux) with SHA-256 sums: [release godot-v0.2.1](https://github.com/ivanlhd/gridspawn-sdk-pub/releases/tag/godot-v0.2.1) (with voice and presence; [godot-v0.1.0](https://github.com/ivanlhd/gridspawn-sdk-pub/releases/tag/godot-v0.1.0) has sign-in and attach only); or build it from source (`godot/gridspawn/README.md`). |
+| `godot/gridspawn` | Godot 4.3+ addon (GDExtension) over the client SDKs: the `Gridspawn` autoload with sign-in, assertions, attach and presence as signals, and the `GridspawnVoice` node for in-game voice. Windows x86_64 and Linux x86_64. Prebuilt addon zips (Windows, Linux) with SHA-256 sums: [release godot-v0.3.0](https://github.com/ivanlhd/gridspawn-sdk-pub/releases/tag/godot-v0.3.0) (with voice, the game server's voice rules, and presence; [godot-v0.1.0](https://github.com/ivanlhd/gridspawn-sdk-pub/releases/tag/godot-v0.1.0) has sign-in and attach only); or build it from source (`godot/gridspawn/README.md`). |
 | `godot/example` | Minimal Godot project used by the addon's headless tests. |
 | `docs/protocol` | The wire protocol: login (01), sessions and module grants (02), presence (03), voice (04), club posts from game servers (05). |
 
@@ -76,4 +76,4 @@ dual licensed as above, without any additional terms or conditions.
 
 ---
 
-Synced from upstream commit `496e3b435`.
+Synced from upstream commit `6b99a79c9`.
