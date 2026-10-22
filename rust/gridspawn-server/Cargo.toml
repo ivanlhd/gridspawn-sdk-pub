@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.83"
 description = "Rust server SDK for Gridspawn: game sessions, player and guest admission, client tickets, and club posts."
-# Not published until a licence is chosen (see the repository README).
+authors = ["Gridspawn"]
+license = "MIT OR Apache-2.0"
+# Not on crates.io yet.
 publish = false
 
 [features]

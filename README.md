@@ -36,9 +36,18 @@ key). It is a secret for your game server only: never ship it in a game client.
 
 ## Licence
 
-No licence has been chosen yet. Until one is, **all rights are reserved**;
-publication on crates.io follows the licence decision.
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
 
 ---
 
-Synced from upstream commit `d38c7cbbb`.
+Synced from upstream commit `bf4d817de`.

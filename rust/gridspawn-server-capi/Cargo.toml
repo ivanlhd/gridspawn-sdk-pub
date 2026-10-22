@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.83"
 description = "C ABI for gridspawn-server: Gridspawn's server SDK for C, C++ and Unreal."
-# Not published until a licence is chosen (see the repository README).
+authors = ["Gridspawn"]
+license = "MIT OR Apache-2.0"
+# Not on crates.io yet.
 publish = false
 
 [lib]

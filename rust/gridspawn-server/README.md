@@ -9,8 +9,8 @@ admission, tickets) and `05-club.md` (club posts) in the protocol docs
 (`docs/protocol/` in the public repository). Requests never carry an `Origin`
 header.
 
-Status: 0.1.0, source only. **No licence yet: all rights reserved until one is
-chosen.** crates.io follows the licence decision.
+Status: 0.1.0, source only, not on crates.io yet. Licence: MIT OR Apache-2.0
+(see the end of this file).
 MSRV: Rust 1.83 for the library (the tests' dev-dependencies need a newer
 toolchain).
 
@@ -152,3 +152,17 @@ GRIDSPAWN_TEST_FEATURE=smoke cargo test --test live   # posts a real test messag
 ```
 
 Run Cargo from this directory; its `target/` stays local.
+
+## Licence
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.

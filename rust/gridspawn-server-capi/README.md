@@ -4,8 +4,8 @@ C ABI for [`gridspawn-server`](../gridspawn-server): Gridspawn's server SDK
 for C, C++ and Unreal. Server-side only. Linux is built and tested; other
 platforms are not yet.
 
-Status: 0.1.0, source only. **No licence yet: all rights reserved until one is
-chosen.** ABI version 1 (`GS_ABI_VERSION`). The rules are the preamble of
+Status: 0.1.0, source only. Licence: MIT OR Apache-2.0 (see the end of this
+file). ABI version 1 (`GS_ABI_VERSION`). The rules are the preamble of
 `include/gridspawn_server.h`.
 
 ## Build
@@ -59,3 +59,17 @@ GRIDSPAWN_CREDENTIAL_FILE=/path/to/0600-key-file ./club_post patch-notes
 cargo test                                            # needs a C compiler (cc)
 GRIDSPAWN_TEST_APP_ID=… GRIDSPAWN_TEST_CREDENTIAL_FILE=/path/to/key cargo test --test c_example
 ```
+
+## Licence
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.

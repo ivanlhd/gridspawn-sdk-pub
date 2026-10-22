@@ -254,8 +254,8 @@ impl ClubPoster {
 
 The Rust crate `gridspawn-server` does the grant, its reuse, the one refresh
 on `grant_invalid` and the retries. Add it from the public SDK repository
-(`gridspawn-server = { git = "https://github.com/ivanlhd/gridspawn-sdk-pub", rev = "<commit>" }`; no licence
-yet, so all rights reserved; the C ABI for C, C++ and Unreal is
+(`gridspawn-server = { git = "https://github.com/ivanlhd/gridspawn-sdk-pub", rev = "<commit>" }`; MIT OR
+Apache-2.0; the C ABI for C, C++ and Unreal is
 `gridspawn-server-capi` next to it):
 
 ```rust
