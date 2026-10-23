@@ -1,4 +1,4 @@
-# 01 Login — Current
+# 01 Login — Current (§6 Proposed)
 
 OAuth 2.0 authorization code with PKCE (RFC 7636, S256 only) for public
 clients, with RFC 8252 loopback redirects for native apps. It is **not**
@@ -153,3 +153,132 @@ Response:
 The assertion lives 60 seconds (`PLAYER_ASSERTION_TTL`), is single-use, and is
 bound to the app, environment and challenge. The client sends it to its game
 server over the game's own connection; the server redeems it (02 §3).
+
+## 6. Sign in through the Gridspawn app — Proposed
+
+Not implemented; the shape is under review. Source: the platform's one-login
+design note (`docs/game-sdk/one-login.md`, §2 and §6).
+
+When the player has the Gridspawn desktop app open and signed in, a native
+game can ask the app instead of opening the browser. The player confirms in
+the app, and the game gets an authorization code, which it exchanges as in
+§2 with its own PKCE verifier. If the app is not there, or cannot help, the
+game uses the browser flow of §1 without telling the player.
+
+Browser games cannot use this: there is no local pipe in a browser.
+
+### 6.1 Transport
+
+The app listens on the local RPC pipe that Discord-compatible games already
+use:
+- **Windows:** `\\.\pipe\discord-ipc-0` … `-9`.
+- **Linux and macOS:** a Unix socket `discord-ipc-0` … `-9` in the first
+  existing directory among `$XDG_RUNTIME_DIR`, `$TMPDIR`, `$TMP`, `$TEMP`
+  and `/tmp`. The app does not host one there yet.
+
+**Frames:** an opcode (u32, little-endian), a length (u32, little-endian),
+then a UTF-8 JSON object of at most 64 KiB. The opcodes are 0 handshake,
+1 frame, 2 close, 3 ping, 4 pong.
+
+Discord may own one of these pipes, usually `-0`. A client tries the slots
+in order, and uses a pipe only after the Gridspawn handshake answer (§6.2).
+
+### 6.2 Handshake
+
+Client → app, opcode 0:
+
+```json
+{ "v": 1, "client_id": "<appId>", "gridspawn": { "protocol": 1 } }
+```
+
+App → client, opcode 1:
+
+```json
+{ "cmd": "DISPATCH", "evt": "READY", "nonce": null,
+  "data": { "v": 1, "gridspawn": { "protocol": 1 } } }
+```
+
+- **Accept only the Gridspawn READY.** A client uses the pipe only if
+  `data.gridspawn.protocol` is `1`. Anything else ends that pipe and moves
+  on to the next slot: another READY, a close (opcode 2), an error, or no
+  answer within 500 ms.
+- **No user data:** the Gridspawn READY carries none. Nothing about the
+  player is shared before they confirm.
+- **Time budget:** the search over all slots takes at most 1.5 s.
+
+### 6.3 Authorize
+
+Client → app, opcode 1, once per connection:
+
+```json
+{
+  "cmd": "AUTHORIZE",
+  "nonce": "<request id, echoed back>",
+  "args": {
+    "client_id": "<appId>",
+    "environment": "production",
+    "scopes": ["identity.basic"],
+    "code_challenge": "<BASE64URL(SHA256(verifier))>",
+    "code_challenge_method": "S256",
+    "state": "<random>"
+  }
+}
+```
+
+- `environment`: `development`, `staging` or `production`.
+- `scopes`, `code_challenge` and `state` follow §1's rules.
+- There is no OAuth `nonce` on the pipe: `nonce` is the frame's request id.
+- **The player's answer:** the app shows a confirmation naming the game and
+  the requested scopes. If the player has already agreed to these scopes for
+  this game, the app answers without asking and shows a short notice. The
+  client waits for the answer as long as it would wait for the browser (5
+  minutes by default).
+- **Cancelling:** if the client closes the connection, the app dismisses the
+  confirmation.
+- **One request per connection:** one `AUTHORIZE` per connection, and the
+  client closes the connection after the answer. The app shows one
+  confirmation at a time and queues the others.
+
+**Approved:**
+
+```json
+{ "cmd": "AUTHORIZE", "evt": null, "nonce": "<same>",
+  "data": { "code": "<code>", "state": "<same state>" } }
+```
+
+**Refused:**
+
+```json
+{ "cmd": "AUTHORIZE", "evt": "ERROR", "nonce": "<same>",
+  "data": { "code": 4000, "message": "…", "error": "access_denied" } }
+```
+
+The OAuth `error` decides what happens (§6.4). The numeric `code` is 4000 on
+every refusal. 4009 is the answer of an app or connection that does not
+support this.
+
+### 6.4 Using the answer
+
+- **Approved:**
+  - check that `state` matches; if it does not, stop (do not fall back to
+    the browser);
+  - exchange the code as in §2, with
+    `redirect_uri=urn:gridspawn:app-broker` and the client's own
+    `code_verifier`;
+  - the code's lifetime and single use are as in §1.
+  - The URN is reserved for codes issued through the app: it is accepted
+    for every application with no registration, and `/authorize` refuses
+    it.
+- **`error: "access_denied"`:** the player declined, or the request did not
+  come from the player's own Windows session and user. Stop, exactly as
+  when they press Deny in the browser. Do not open the browser.
+- **Fall back to the browser (§1), without telling the player:**
+  - `data.code` 4009: an app that does not support this;
+  - `error: "login_required"`: the app is signed out, or the account still
+    needs setup, which the browser pages can do;
+  - `error: "temporarily_unavailable"`;
+  - a broken connection, or an answer that does not match the request.
+- **`error: "invalid_request"`:** a malformed `AUTHORIZE`, or a second one
+  on the same connection. Stop, and report it.
+- **Any other `error`** (for example `invalid_client`, `invalid_scope`):
+  stop, and report it, as the browser flow would.
