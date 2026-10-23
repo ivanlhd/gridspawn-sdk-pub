@@ -1,8 +1,9 @@
 # gridspawn-client
 
 Rust client SDK for Gridspawn, for game clients:
-- player sign-in with the system browser (OAuth 2.0 authorization code + PKCE
-  S256, RFC 8252 loopback redirect), with token refresh and sign-out;
+- player sign-in through the Gridspawn app when it is open (the player just
+  confirms), otherwise with the system browser (OAuth 2.0 authorization code
+  + PKCE S256, RFC 8252 loopback redirect), with token refresh and sign-out;
 - player assertions for your game server;
 - attaching to a game session with the ticket your game server issued.
 
@@ -13,10 +14,10 @@ It speaks the wire protocol one to one: `01-login.md` and `02-sessions.md` in
 the protocol docs (`docs/protocol/` in the public repository). Requests never
 carry an `Origin` header.
 
-Status: 0.2.0, source only, not on crates.io yet. Licence: MIT OR Apache-2.0
+Status: 0.3.0, source only, not on crates.io yet. Licence: MIT OR Apache-2.0
 (see the end of this file).
 MSRV: Rust 1.83 for the library (the tests' dev-dependencies need a newer
-toolchain). Presence (03) and voice (04) are not in this crate yet.
+toolchain). Voice (04) is the separate `gridspawn-voice` crate.
 
 ## Install
 
@@ -64,12 +65,32 @@ async fn main() -> Result<(), gridspawn_client::Error> {
 }
 ```
 
-- `sign_in` listens on `127.0.0.1` on a port the OS picks, opens the browser,
-  waits (default 5 minutes, at most 10), and exchanges the code. The browser
-  tab then says whether it worked. Other requests to the listener (favicon,
+- **Needs a Gridspawn desktop app release that is not out yet.** Until it
+  ships, `sign_in` finds no app that can answer and uses the browser exactly
+  as before. Nothing changes for players, and nothing needs changing in your
+  game when the app release comes.
+- **One login.** If the player has the Gridspawn desktop app open and signed
+  in, `sign_in` asks the app (protocol 01 §6, Proposed). The player confirms there,
+  and no browser opens. Otherwise, or if the app is not installed or cannot
+  help, the browser flow below runs, and the player sees nothing of the
+  attempt. You do not need to do anything for this.
+  - Looking for the app takes at most 1.5 s (no app: about nothing).
+  - The player has **2 minutes** to answer in the app. Then the sign-in
+    ends with `sign_in/timed_out` and the app's confirmation closes. The
+    request's `timeout` applies when it is shorter.
+  - Declining in the app is `auth/access_denied`, the same as Deny in the
+    browser. Cancelling (dropping the future) closes the app's confirmation.
+  - `SignIn::browser_only(true)` always uses the browser.
+    `Client::sign_in_method()` says which one was used (`None` after
+    `restore()`).
+  - To show players: "If the Gridspawn app is open, you just confirm in the
+    app. Otherwise your browser opens to sign in."
+- The browser flow listens on `127.0.0.1` on a port the OS picks, opens the
+  browser, waits (default 5 minutes, at most 10), and exchanges the code. The
+  browser tab then says whether it worked. Other requests to the listener (favicon,
   probes) get a 404; a callback with the wrong `state`, or for another host
   name, ends the sign-in.
-- `begin_sign_in` does the same in two steps:
+- `begin_sign_in` runs the browser flow in two steps (it never asks the app):
   - with `SignIn::open_browser(false)`, show
     `PendingSignIn::authorization_url()` to the player yourself;
   - `finish()` waits for the callback;

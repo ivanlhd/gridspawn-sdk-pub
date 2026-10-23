@@ -1,9 +1,10 @@
 # Gridspawn for Godot
 
-Player sign-in with the system browser, player assertions for your game
-server, joining game sessions, and in-game voice, for Godot 4.3 and later.
+Player sign-in (through the Gridspawn app when it is open, otherwise the
+system browser), player assertions for your game server, joining game
+sessions, and in-game voice, for Godot 4.3 and later.
 
-Status: 0.3.1. Builds for Windows x86_64 and Linux x86_64. Licence: MIT OR
+Status: 0.4.0. Builds for Windows x86_64 and Linux x86_64. Licence: MIT OR
 Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`). The bundled Rust bindings for
 Godot are MPL-2.0, and the voice code includes WebRTC audio processing,
 Abseil and libopus: see `THIRD-PARTY.md`.
@@ -44,8 +45,9 @@ Every method returns at once. Results arrive as signals on the main thread.
 | Method | Result |
 |---|---|
 | `restore()` | `signed_in(display_name)`, `signed_out`, or `sign_in_failed(code, message)` |
-| `sign_in()` | Opens the browser → `signed_in` or `sign_in_failed` |
+| `sign_in()` | Asks the Gridspawn app when it is open, otherwise opens the browser → `signed_in` or `sign_in_failed` |
 | `cancel_sign_in()` | `sign_in_failed("sign_in/cancelled", …)` |
+| `sign_in_method() -> String` | Immediate: `"app"`, `"browser"`, or `""` (after `restore()`, or signed out) |
 | `sign_out()` | `signed_out` |
 | `is_signed_in() -> bool` | Immediate |
 | `player_display_name() -> String` | Immediate; `""` when signed out |
@@ -60,6 +62,18 @@ Every method returns at once. Results arrive as signals on the main thread.
 Also `session_expired(code)`: the stored sign-in was refused and cleared, so
 the player signs in again.
 
+- **One login:** if the player has the Gridspawn desktop app open and signed
+  in, `sign_in()` asks the app: the player confirms there and no browser
+  opens. Otherwise, or if the app is not installed, the browser opens as
+  before. You do not need to do anything for this.
+  - **This needs a Gridspawn desktop app release that is not out yet.**
+    Until it ships, `sign_in()` uses the browser exactly as before.
+  - The player has 2 minutes to answer in the app; then `sign_in_failed`
+    comes with `sign_in/timed_out`.
+  - Declining in the app is `auth/access_denied`, as in the browser.
+  - Set the `browser_only` property to always use the browser.
+  - To show players: "If the Gridspawn app is open, you just confirm in the
+    app. Otherwise your browser opens to sign in."
 - **Identity:** show `display_name` only.
 - **Offline:** with a stored sign-in, `restore()` may answer
   `sign_in_failed("network", …)` while `is_signed_in()` stays true. The game

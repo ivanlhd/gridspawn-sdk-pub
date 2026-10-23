@@ -15,6 +15,7 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use crate::{
+    broker,
     config::{lock, Client},
     error::{Error, ErrorCode, Service, SignInError},
     http::{endpoint, Body, Call},
@@ -58,6 +59,18 @@ pub struct SignIn {
     /// Open the system browser (default `true`). With `false`, show
     /// [`PendingSignIn::authorization_url`] to the player yourself.
     pub open_browser: bool,
+    /// Skip the Gridspawn app and always use the browser (default `false`).
+    pub browser_only: bool,
+}
+
+/// How the current session's sign-in happened ([`Client::sign_in_method`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SignInMethod {
+    /// The player confirmed in the Gridspawn app (protocol 01 §6).
+    App,
+    /// The player signed in in the system browser (protocol 01 §1).
+    Browser,
 }
 
 impl SignIn {
@@ -67,7 +80,14 @@ impl SignIn {
             redirect_path: "/callback".into(),
             timeout: Duration::from_secs(300),
             open_browser: true,
+            browser_only: false,
         }
+    }
+
+    /// Always use the browser, even when the Gridspawn app is open.
+    pub fn browser_only(mut self, browser_only: bool) -> Self {
+        self.browser_only = browser_only;
+        self
     }
 
     pub fn redirect_path(mut self, path: impl Into<String>) -> Self {
@@ -187,6 +207,9 @@ impl PendingSignIn {
             Page::Failed
         };
         callback.responder.send(page).await;
+        if result.is_ok() {
+            *lock(&client.inner.sign_in_method) = Some(SignInMethod::Browser);
+        }
         result
     }
 
@@ -266,6 +289,31 @@ struct AssertionResponse {
     expires_in: f64,
 }
 
+/// The request's own rules, for both paths: the scopes (validated and
+/// sorted), the redirect path and the timeout.
+fn check_request(request: &SignIn) -> Result<Vec<String>, Error> {
+    let scopes = normalize_scopes(&request.scopes)?;
+    let path = &request.redirect_path;
+    let path_ok = path.starts_with('/')
+        && path.len() <= 256
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'~' | b'-'));
+    if !path_ok {
+        return Err(Error::InvalidInput {
+            field: "redirect path",
+            reason: "a path starting with / of A-Z a-z 0-9 / . _ ~ -, at most 256 characters",
+        });
+    }
+    if request.timeout.is_zero() || request.timeout > MAX_SIGN_IN_WAIT {
+        return Err(Error::InvalidInput {
+            field: "sign-in timeout",
+            reason: "more than 0 and at most 10 minutes",
+        });
+    }
+    Ok(scopes)
+}
+
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -319,6 +367,8 @@ impl Client {
     /// than 30 s left. Offline, a held session is kept: the error is returned
     /// and [`Client::is_signed_in`] stays true.
     pub async fn restore(&self) -> Result<Restore, Error> {
+        // A stored session does not say how it began.
+        *lock(&self.inner.sign_in_method) = None;
         let Some(stored) = self.store_call(|store| store.load()).await? else {
             *lock(&self.inner.session) = None;
             return Ok(Restore::SignedOut);
@@ -351,33 +401,72 @@ impl Client {
         }
     }
 
-    /// Full interactive sign-in: loopback listener, system browser, code exchange.
+    /// Full interactive sign-in. When the Gridspawn app is open and signed
+    /// in, the player confirms there (protocol 01 §6): no browser opens.
+    /// Otherwise, or if the app cannot help, the system browser flow runs as
+    /// before, without telling the player. [`SignIn::browser_only`] skips the
+    /// app. [`Client::sign_in_method`] tells which one was used.
+    ///
+    /// The player has 2 minutes to answer in the app (the app dismisses its
+    /// sheet after 5); then the sign-in ends with `sign_in/timed_out` and the
+    /// app's sheet closes. Declining in the app is `auth/access_denied`, as
+    /// in the browser.
     pub async fn sign_in(&self, request: SignIn) -> Result<User, Error> {
+        self.sign_in_via(request, &broker::default_candidates())
+            .await
+    }
+
+    /// `sign_in` with the app's pipes given (tests use a stand-in).
+    pub(crate) async fn sign_in_via(
+        &self,
+        request: SignIn,
+        candidates: &[std::ffi::OsString],
+    ) -> Result<User, Error> {
+        let scopes = check_request(&request)?;
+        if !request.browser_only {
+            let pkce = Pkce::new()?;
+            let state = random_base64url(32)?;
+            let app = broker::AppRequest {
+                app_id: &self.inner.app_id,
+                environment: self.inner.environment.as_str(),
+                scopes: &scopes,
+                challenge: &pkce.challenge,
+                state: &state,
+                wait: request.timeout.min(broker::APP_CONSENT_WAIT),
+            };
+            match broker::sign_in_via_app(candidates, &app).await? {
+                broker::AppOutcome::Approved(code) => {
+                    let user = self
+                        .exchange(&code, broker::APP_BROKER_URI, &pkce.verifier)
+                        .await?;
+                    *lock(&self.inner.sign_in_method) = Some(SignInMethod::App);
+                    return Ok(user);
+                }
+                broker::AppOutcome::Refused(error) => {
+                    return Err(SignInError::Denied(error).into());
+                }
+                broker::AppOutcome::Unavailable => {
+                    tracing::debug!("the Gridspawn app is not available; using the browser");
+                }
+            }
+        }
         self.begin_sign_in(request).await?.finish().await
     }
 
-    /// The same in two steps. Opens the browser when `request.open_browser` is
-    /// true; otherwise show [`PendingSignIn::authorization_url`] yourself.
+    /// How the current session's sign-in happened: `None` after
+    /// [`Client::restore`] (a stored session does not say) and when signed
+    /// out. Information only; the session is the same either way.
+    pub fn sign_in_method(&self) -> Option<SignInMethod> {
+        *lock(&self.inner.sign_in_method)
+    }
+
+    /// The browser flow in two steps: it never asks the Gridspawn app (a
+    /// caller who wants a URL to show wants the browser). Opens the browser
+    /// when `request.open_browser` is true; otherwise show
+    /// [`PendingSignIn::authorization_url`] yourself.
     pub async fn begin_sign_in(&self, request: SignIn) -> Result<PendingSignIn, Error> {
-        let scopes = normalize_scopes(&request.scopes)?;
+        let scopes = check_request(&request)?;
         let path = &request.redirect_path;
-        let path_ok = path.starts_with('/')
-            && path.len() <= 256
-            && path.bytes().all(|b| {
-                b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'~' | b'-')
-            });
-        if !path_ok {
-            return Err(Error::InvalidInput {
-                field: "redirect path",
-                reason: "a path starting with / of A-Z a-z 0-9 / . _ ~ -, at most 256 characters",
-            });
-        }
-        if request.timeout.is_zero() || request.timeout > MAX_SIGN_IN_WAIT {
-            return Err(Error::InvalidInput {
-                field: "sign-in timeout",
-                reason: "more than 0 and at most 10 minutes",
-            });
-        }
         let pkce = Pkce::new()?;
         let state = random_base64url(32)?;
         let nonce = random_base64url(32)?;
@@ -470,6 +559,7 @@ impl Client {
     pub async fn sign_out(&self) -> Result<(), Error> {
         let held = lock(&self.inner.session).take();
         *lock(&self.inner.fresh_until) = None;
+        *lock(&self.inner.sign_in_method) = None;
         let session = match held {
             Some(session) => Some(session),
             None => self.store_call(|store| store.load()).await.ok().flatten(),
@@ -750,5 +840,185 @@ impl Client {
                 Err(error)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod app_sign_in_tests {
+    //! `sign_in` through a stand-in Gridspawn app, and the exchange with the
+    //! reserved redirect URI against a stand-in token endpoint.
+
+    use std::sync::Arc;
+
+    use serde_json::{json, Value};
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, Request, ResponseTemplate,
+    };
+
+    use super::*;
+    use crate::{
+        broker::tests::{approve, missing, stand_in, Script},
+        config::Environment,
+        pkce::challenge,
+        storage::MemoryTokenStore,
+    };
+
+    async fn edge() -> MockServer {
+        let server = MockServer::start().await;
+        let uri = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/v1/bootstrap"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "requestId": "r",
+                "application": { "appId": "game-test", "displayName": "Test Game" },
+                "environment": "development",
+                "protocol": { "selected": 1, "minimum": 1, "maximum": 1 },
+                "modules": [],
+                "endpoints": {
+                    "api": format!("{uri}/v1"), "oauth": format!("{uri}/oauth"),
+                    "mediaResolver": format!("{uri}/v1/media/resolve")
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-1", "token_type": "Bearer", "expires_in": 600,
+                "refresh_token": "refresh-1", "scope": "identity.basic",
+                "user": { "subject": "sub-1", "displayName": "Player One" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/revoke"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn client(server: &MockServer) -> Client {
+        Client::builder("game-test", Environment::Development)
+            .sdk_base_url(server.uri().parse().unwrap())
+            .token_store(Arc::new(MemoryTokenStore::new()))
+            .connect()
+            .await
+            .unwrap()
+    }
+
+    fn form(request: &Request) -> std::collections::HashMap<String, String> {
+        url::form_urlencoded::parse(&request.body)
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_approved_app_sign_in_exchanges_with_the_broker_uri() {
+        let server = edge().await;
+        let client = client(&server).await;
+        let app = stand_in(Script::App(Some(approve))).await;
+        let user = client
+            .sign_in_via(
+                SignIn::new(["identity.basic"]),
+                &[missing(), app.candidate.clone()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(user.display_name, "Player One");
+        assert_eq!(client.sign_in_method(), Some(SignInMethod::App));
+        assert!(client.is_signed_in());
+
+        let ask: Value = app.authorize.lock().unwrap().clone().unwrap();
+        let sent_challenge = ask["args"]["code_challenge"].as_str().unwrap().to_owned();
+        assert_eq!(sent_challenge.len(), 43);
+        let token = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.url.path() == "/oauth/token")
+            .unwrap();
+        let fields = form(&token);
+        assert_eq!(fields["grant_type"], "authorization_code");
+        assert_eq!(fields["code"], "brokered-code");
+        assert_eq!(fields["redirect_uri"], "urn:gridspawn:app-broker");
+        assert_eq!(
+            challenge(&fields["code_verifier"]),
+            sent_challenge,
+            "our verifier"
+        );
+
+        client.sign_out().await.unwrap();
+        assert_eq!(client.sign_in_method(), None);
+    }
+
+    #[tokio::test]
+    async fn a_decline_in_the_app_is_access_denied_without_a_browser() {
+        let server = edge().await;
+        let client = client(&server).await;
+        let app = stand_in(Script::App(Some(|ask| {
+            json!({
+                "cmd": "AUTHORIZE", "evt": "ERROR", "nonce": ask["nonce"],
+                "data": { "code": 4000, "message": "m", "error": "access_denied" }
+            })
+        })))
+        .await;
+        let error = client
+            .sign_in_via(
+                SignIn::new(["identity.basic"]).open_browser(false),
+                std::slice::from_ref(&app.candidate),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "auth/access_denied");
+        assert_eq!(client.sign_in_method(), None);
+    }
+
+    #[tokio::test]
+    async fn without_the_app_or_with_browser_only_the_browser_flow_runs() {
+        let server = edge().await;
+        let client = client(&server).await;
+        let app = stand_in(Script::App(Some(approve))).await;
+        // browser_only: the stand-in is never asked. With no browser to open
+        // and a short timeout, the browser flow ends as timed out.
+        let request = SignIn::new(["identity.basic"])
+            .browser_only(true)
+            .open_browser(false)
+            .timeout(Duration::from_millis(200));
+        let error = client
+            .sign_in_via(request, std::slice::from_ref(&app.candidate))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "sign_in/timed_out");
+        assert!(app.authorize.lock().unwrap().is_none());
+        // No app at all: the same browser flow.
+        let request = SignIn::new(["identity.basic"])
+            .open_browser(false)
+            .timeout(Duration::from_millis(200));
+        let error = client.sign_in_via(request, &[missing()]).await.unwrap_err();
+        assert_eq!(error.code(), "sign_in/timed_out");
+    }
+
+    #[tokio::test]
+    async fn the_app_wait_is_capped_and_ends_as_timed_out() {
+        let server = edge().await;
+        let client = client(&server).await;
+        let app = stand_in(Script::App(None)).await;
+        // The request's timeout is shorter than the 2-minute app wait.
+        let started = Instant::now();
+        let error = client
+            .sign_in_via(
+                SignIn::new(["identity.basic"]).timeout(Duration::from_millis(300)),
+                std::slice::from_ref(&app.candidate),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "sign_in/timed_out");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(app.closed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(broker::APP_CONSENT_WAIT, Duration::from_secs(120));
     }
 }

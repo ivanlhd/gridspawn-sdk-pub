@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0 (2026-10-23)
+
+- **The in-app sign-in needs a Gridspawn desktop app release that is not out yet.** Until then, `sign_in()` uses the browser exactly as before.
+- One login (gridspawn-client 0.3.0): `sign_in()` asks the Gridspawn app when it is open, and the player just confirms there; otherwise the browser opens as before. The player has 2 minutes to answer in the app (`sign_in/timed_out` after that); declining is `auth/access_denied`.
+- `browser_only` property (always use the browser); `sign_in_method()` returns `"app"`, `"browser"` or `""`. `cancel_sign_in()` also closes the app's confirmation.
+
 ## 0.3.1 (2026-10-23)
 
 - Players the game server muted before this player joined are reported right after `joined`: `server_mute_changed(participant_id, true)`, and `server_muted` is true in `get_participants()` (gridspawn-voice 0.2.2). Before, they showed as unmuted until the next mute change.

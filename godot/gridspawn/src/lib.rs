@@ -16,7 +16,7 @@ use std::{
 use godot::{classes::INode, prelude::*};
 use gridspawn_client::{
     AttachedSession, AuthEvent, Client, Environment, Error, GrantEvent, MemoryTokenStore, Module,
-    Presence, PresenceEvent, PresenceUpdater, RenewerHandle, Restore, SignIn,
+    Presence, PresenceEvent, PresenceUpdater, RenewerHandle, Restore, SignIn, SignInMethod,
 };
 use tokio::{
     runtime::{Handle, Runtime},
@@ -148,6 +148,9 @@ pub struct GridspawnClient {
     /// Path of the registered loopback redirect (`http://127.0.0.1/callback`).
     #[export]
     redirect_path: GString,
+    /// Always sign in with the browser, even when the Gridspawn app is open.
+    #[export]
+    browser_only: bool,
     #[export]
     token_storage: TokenStorage,
     /// Advanced: leave empty for production (`https://sdk.gridspawn.net`).
@@ -175,6 +178,7 @@ impl INode for GridspawnClient {
             environment: GridspawnEnvironment::Production,
             scopes,
             redirect_path: "/callback".into(),
+            browser_only: false,
             token_storage: TokenStorage::OsSecure,
             sdk_base_url: GString::new(),
             runtime: None,
@@ -243,7 +247,10 @@ impl GridspawnClient {
         });
     }
 
-    /// Opens the system browser → `signed_in` | `sign_in_failed`.
+    /// Asks the Gridspawn app when it is open (the player confirms there),
+    /// otherwise opens the system browser → `signed_in` | `sign_in_failed`.
+    /// The player has 2 minutes to answer in the app. Declining there is
+    /// `sign_in_failed("auth/access_denied", …)`, as in the browser.
     #[func]
     fn sign_in(&mut self) {
         if let Some(task) = self.sign_in_task.take() {
@@ -255,7 +262,9 @@ impl GridspawnClient {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let request = SignIn::new(scopes).redirect_path(self.redirect_path.to_string());
+        let request = SignIn::new(scopes)
+            .redirect_path(self.redirect_path.to_string())
+            .browser_only(self.browser_only);
         self.sign_in_task = self.run(|config, cell, outcomes| async move {
             let outcome = match connect(&cell, config, &outcomes).await {
                 Err(error) => sign_in_failure(&error),
@@ -268,7 +277,20 @@ impl GridspawnClient {
         });
     }
 
-    /// Stops a sign-in in progress (closes the listener) → `sign_in_failed("sign_in/cancelled", …)`.
+    /// How the current sign-in happened: `"app"` (confirmed in the Gridspawn
+    /// app), `"browser"`, or `""` when unknown (after `restore()`) or signed out.
+    #[func]
+    fn sign_in_method(&self) -> GString {
+        match self.client.get().and_then(Client::sign_in_method) {
+            Some(SignInMethod::App) => "app".into(),
+            Some(SignInMethod::Browser) => "browser".into(),
+            _ => GString::new(),
+        }
+    }
+
+    /// Stops a sign-in in progress (closes the listener, or the connection to
+    /// the Gridspawn app, whose confirmation then closes too) →
+    /// `sign_in_failed("sign_in/cancelled", …)`.
     #[func]
     fn cancel_sign_in(&mut self) {
         if let Some(task) = self.sign_in_task.take() {

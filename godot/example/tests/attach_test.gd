@@ -29,6 +29,7 @@ func _ready() -> void:
 func _on_signed_out() -> void:
 	_expect("restore")
 	print("RESULT signed_out signed_in=%s persist=%s" % [Gridspawn.is_signed_in(), Gridspawn.sessions_persist()])
+	print("RESULT sign_in_method='%s' browser_only=%s" % [Gridspawn.sign_in_method(), Gridspawn.browser_only])
 	_step = "assertion"
 	Gridspawn.player_assertion("headless-check-challenge-0123456789-abcdef")
 

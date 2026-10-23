@@ -224,6 +224,7 @@ impl ClientBuilder {
                 fresh_until: Mutex::new(None),
                 refresh: Mutex::new(None),
                 events,
+                sign_in_method: Mutex::new(None),
             }),
         })
     }
@@ -367,6 +368,8 @@ pub(crate) struct Inner {
     /// The refresh in flight, if any; concurrent callers wait for the same one.
     pub refresh: Mutex<Option<watch::Receiver<RefreshResult>>>,
     pub events: broadcast::Sender<AuthEvent>,
+    /// How the held session's sign-in happened (`None` after a restore).
+    pub sign_in_method: Mutex<Option<crate::auth::SignInMethod>>,
 }
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

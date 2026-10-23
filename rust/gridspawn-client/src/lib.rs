@@ -2,9 +2,11 @@
 //!
 //! It speaks the wire protocol one to one:
 //!
-//! - player sign-in with the system browser (OAuth 2.0 authorization code +
-//!   PKCE S256, RFC 8252 loopback redirect), token refresh, player assertions
-//!   for the game server, and sign-out — `docs/protocol/01-login.md`;
+//! - player sign-in through the Gridspawn app when it is open (the player
+//!   confirms there), otherwise with the system browser (OAuth 2.0
+//!   authorization code + PKCE S256, RFC 8252 loopback redirect), token
+//!   refresh, player assertions for the game server, and sign-out —
+//!   `docs/protocol/01-login.md`;
 //! - attaching to a game session with the participant ticket the game server
 //!   issued, and module grants — `docs/protocol/02-sessions.md`;
 //! - the player's presence in your game, re-sent every 60 s —
@@ -40,6 +42,7 @@
 //! assertions, tickets and grants are never logged and are redacted in `Debug`.
 
 mod auth;
+mod broker;
 mod config;
 mod error;
 mod http;
@@ -49,7 +52,7 @@ mod presence;
 mod session;
 mod storage;
 
-pub use auth::{AuthEvent, PendingSignIn, PlayerAssertion, Restore, SignIn, User};
+pub use auth::{AuthEvent, PendingSignIn, PlayerAssertion, Restore, SignIn, SignInMethod, User};
 pub use config::{Client, ClientBuilder, Environment, Module};
 pub use error::{ApiError, Error, ErrorCode, Service, SignInError};
 pub use presence::{Party, Presence, PresenceAck, PresenceEvent, PresenceUpdater};

@@ -233,6 +233,7 @@ async fn headless_attach() {
         results,
         [
             "signed_out signed_in=false persist=false",
+            "sign_in_method='' browser_only=false",
             "assertion_failed sign_in/required",
             "attached session=true name=Fixture Guest capabilities=voice",
             "grant_renewed voice",
