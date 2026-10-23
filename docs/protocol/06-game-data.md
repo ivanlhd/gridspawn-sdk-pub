@@ -1,8 +1,19 @@
-# 06 Game data from game servers — **Proposed**
+# 06 Game data from game servers — **Current**
 
-Not implemented. This is the shape under review before it is built. Source:
-the platform's game-data design note (`docs/game-data.md`, §2 model and
-quotas, §3 write path).
+Deployed on the SDK edge on 2026-10-23. Live checks the same day, with the
+reference crate `gridspawn-server` 0.4.0 on a test application's
+development data:
+- the writer's listing, including removed keys;
+- writes with and without a TTL, numbered above every listed `seq` after
+  each restart;
+- a personal-data refusal, with the JSON path in `field`;
+- an event, its repeat with the same `Idempotency-Key` (`duplicate: true`),
+  and an event with a generated key;
+- removal, leaving tombstones in the listing.
+
+Sources: the platform's game-data design note (`docs/game-data.md`, §2 model
+and quotas, §3 write path); reference client
+`sdk/rust/gridspawn-server/src/game_data.rs`.
 
 A game's own server publishes **live data** that the game's club can show on
 its pages: player counts, the current round, a scoreboard, map markers. It
@@ -16,7 +27,7 @@ no page by itself.
   readable by anyone. Publish display names only, never emails, account or
   participant ids, or anything private (§6).
 
-## 1. Authentication — Proposed
+## 1. Authentication — Current
 
 ```
 Authorization: GridspawnServer <credential>
@@ -29,7 +40,7 @@ Authorization: GridspawnServer <credential>
 
 Base: the SDK base URL (`https://sdk.gridspawn.net`).
 
-## 2. Documents — Proposed
+## 2. Documents — Current
 
 A document is a named JSON value, kept per app and environment.
 
@@ -90,7 +101,7 @@ GET /v1/server/game-data
 - **`updatedAt`:** server time, for information only.
 - A writer calls it once at start-up (§3).
 
-## 3. Ordering — Proposed
+## 3. Ordering — Current
 
 - **`seq`:** each `set` and `remove` entry carries its own integer, chosen
   by the writer, up to 2⁵³ − 1. Per key, it must strictly increase.
@@ -114,7 +125,7 @@ GET /v1/server/game-data
 - **No clock is involved.** Server times in answers are for information
   only.
 
-## 4. Events — Proposed
+## 4. Events — Current
 
 ```
 POST /v1/server/game-events
@@ -134,7 +145,7 @@ Idempotency-Key: <[A-Za-z0-9_-]{8,64}>
 - **`id`:** the server's sequence per app and environment, as a string.
 - **Retention:** the last 100 events, none older than 7 days.
 
-## 5. Limits — Proposed
+## 5. Limits — Current
 
 Per app and environment. Every limit fails closed (503 when it cannot be
 checked).
@@ -150,7 +161,7 @@ checked).
 - Tombstones do not count toward the key or byte quota.
 - A batch holds at most 40 entries, matching the burst.
 
-## 6. Public by nature — Proposed
+## 6. Public by nature — Current
 
 - **What to publish:** production game data is shown on public club pages.
   Publish display names only. Never publish emails, account ids,
@@ -164,7 +175,7 @@ checked).
     `field` set to the JSON path, for example
     `set.scoreboard.value.players[3].name`.
 
-## 7. Errors — Proposed
+## 7. Errors — Current
 
 Body: `{"ok": false, "error": {"code", "message", "field"?, "reason"?}, "requestId"}`.
 
@@ -181,16 +192,26 @@ Body: `{"ok": false, "error": {"code", "message", "field"?, "reason"?}, "request
 
 There is no `stale_sequence` error: stale entries are skipped (§3).
 
-## 8. SDKs — Proposed
+## 8. SDKs — Current
 
-`gridspawn-server` 0.4.0 (Rust) and its C ABI are planned to cover this
-document:
+`gridspawn-server` 0.4.0 (Rust) and its C ABI `gridspawn-server-capi` 0.3.0
+cover this document:
 - `client.game().data()`: `set`, `set_with_ttl`, `remove`, `set_many` and
   `list`.
-- `spawn_data_publisher(hz)`: the latest value per key, one batch per tick.
+- `spawn_data_publisher(hz)` (1–5 Hz):
+  - It sends the latest value per key, one batch per tick, oldest change
+    first, within §5. `set` and `set_with_ttl` are cheap, so call them every
+    frame.
+  - It retries what can succeed later (network errors, 5xx, 429 after
+    `Retry-After`) with the newest values.
+  - A refusal that retrying cannot fix drops those entries and is reported
+    as the last error: an invalid or personal-data value, or
+    `data/quota_exceeded`.
 - `client.game().events().emit` and `emit_with_id`: an `Idempotency-Key` on
   every request, either generated or the caller's.
-- The ordering of §3, including the start-up read and the resend.
+- The ordering of §3: one in-process counter, seeded once from the listing,
+  and one resend. No clock is involved.
+- The C ABI mirrors all of this (`gs_game_data_*`, `gs_game_event_emit`).
 
 Game clients and the Godot addon have nothing to do here: this is a
 server-side feature.

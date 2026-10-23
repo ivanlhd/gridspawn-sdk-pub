@@ -2,12 +2,15 @@
 //! tokio runtime. Do not call it from async code or from a game's frame loop;
 //! there is no background renewer here, so call [`Client::renew`] yourself.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
+
+use serde_json::Value;
 
 use crate::{
-    AdmitGuest, AdmitParticipant, ClientBuilder, ClientTicket, CreateSession, Error,
-    IdempotencyKey, Lease, Module, Participant, ParticipantId, ParticipantRef, Post, PostReceipt,
-    Presence, PresenceAck, Session, VoiceAck, VoiceConfig, VoicePlayerState, VoicePosition,
+    AdmitGuest, AdmitParticipant, ClientBuilder, ClientTicket, CreateSession, DataAck, DataBatch,
+    DataListing, Error, EventReceipt, IdempotencyKey, Lease, Module, Participant, ParticipantId,
+    ParticipantRef, Post, PostReceipt, Presence, PresenceAck, Session, VoiceAck, VoiceConfig,
+    VoicePlayerState, VoicePosition,
 };
 
 pub struct Client {
@@ -124,6 +127,53 @@ impl Client {
     ) -> Result<VoiceAck, Error> {
         self.runtime
             .block_on(session.voice().publish_positions(positions))
+    }
+
+    /// As [`crate::GameData::set`], or [`crate::GameData::set_with_ttl`] with a TTL.
+    pub fn game_data_set(
+        &self,
+        key: &str,
+        value: Value,
+        ttl: Option<Duration>,
+    ) -> Result<DataAck, Error> {
+        let data = self.client.game().data();
+        match ttl {
+            Some(ttl) => self.runtime.block_on(data.set_with_ttl(key, value, ttl)),
+            None => self.runtime.block_on(data.set(key, value)),
+        }
+    }
+
+    /// As [`crate::GameData::remove`].
+    pub fn game_data_remove(&self, key: &str) -> Result<DataAck, Error> {
+        self.runtime.block_on(self.client.game().data().remove(key))
+    }
+
+    /// As [`crate::GameData::set_many`].
+    pub fn game_data_set_many(&self, batch: &DataBatch) -> Result<DataAck, Error> {
+        self.runtime
+            .block_on(self.client.game().data().set_many(batch))
+    }
+
+    /// As [`crate::GameData::list`]: for start-up and checks, not for polling.
+    pub fn game_data_list(&self) -> Result<DataListing, Error> {
+        self.runtime.block_on(self.client.game().data().list())
+    }
+
+    /// As [`crate::GameEvents::emit`], or [`crate::GameEvents::emit_with_id`]
+    /// with your own id. There is no background publisher here.
+    pub fn game_event_emit(
+        &self,
+        name: &str,
+        payload: Value,
+        id: Option<&str>,
+    ) -> Result<EventReceipt, Error> {
+        let events = self.client.game().events();
+        match id {
+            Some(id) => self
+                .runtime
+                .block_on(events.emit_with_id(name, payload, id)),
+            None => self.runtime.block_on(events.emit(name, payload)),
+        }
     }
 }
 

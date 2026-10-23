@@ -1,6 +1,6 @@
 [package]
 name = "gridspawn-server-capi"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.83"
 description = "C ABI for gridspawn-server: Gridspawn's server SDK for C, C++ and Unreal."
@@ -16,6 +16,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 gridspawn-server = { path = "../gridspawn-server" }
+serde_json = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 url = "2"
 zeroize = "1"

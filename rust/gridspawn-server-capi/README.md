@@ -4,7 +4,7 @@ C ABI for [`gridspawn-server`](../gridspawn-server): Gridspawn's server SDK
 for C, C++ and Unreal. Server-side only. Linux is built and tested; other
 platforms are not yet.
 
-Status: 0.2.0, source only. Licence: MIT OR Apache-2.0 (see the end of this
+Status: 0.3.0, source only. Licence: MIT OR Apache-2.0 (see the end of this
 file). ABI version 1 (`GS_ABI_VERSION`). The rules are the preamble of
 `include/gridspawn_server.h`.
 
@@ -70,6 +70,49 @@ gs_voice_publisher_free(positions);
   `gs_error_reason` for invalid bodies.
 - `gs_voice_publisher_last_error` returns the last batch's failure (free it
   with `gs_error_free`).
+
+## Live game data for your club
+
+The same as `gridspawn-server`'s `client.game()` (its README has the
+details: one writer per key, TTLs, limits). No game session is needed.
+**Club pages are public: publish display names only, never emails or ids.**
+
+```c
+GsDataAck *ack;
+gs_game_data_set(client, "match.score", "{\"red\": 3, \"blue\": 1}", 0, &ack, &error);
+gs_data_ack_free(ack);
+gs_game_data_set(client, "lobby.open", "true", 300, NULL, &error);   /* TTL 300 s */
+gs_game_data_remove(client, "lobby.open", NULL, &error);
+
+GsDataEntry set[] = {{"match.round", "4", 0}};
+const char *removes[] = {"lobby.banner"};
+gs_game_data_set_many(client, set, 1, removes, 1, NULL, &error);    /* 1-40 entries */
+
+GsDataPublisher *live;
+gs_game_data_publisher_spawn(client, 4, &live, &error);              /* 1-5 Hz */
+gs_game_data_publisher_set(live, "match.clock", "812", 0, &error);   /* every frame */
+gs_game_data_publisher_free(live);
+
+char *event_id;
+gs_game_event_emit(client, "match.ended", "{\"winner\": \"Red team\"}", NULL, &event_id, NULL, &error);
+gs_string_free(event_id);
+```
+
+- Values are JSON text, parsed and checked before sending. `ttl_seconds` 0
+  means no TTL; otherwise 10–86400.
+- `GsDataAck`: `gs_data_ack_accepted_len` / `_key`, `gs_data_ack_skipped_len`
+  / `_key` / `_seq` (keys another writer owns) and `gs_data_ack_quota`.
+- `gs_game_event_emit` with `id` NULL generates the Idempotency-Key; pass
+  your own (`[A-Za-z0-9_-]{8,64}`) for an event that may be sent again after
+  a restart.
+- `gs_game_data_list` returns the writer's listing as JSON (free it with
+  `gs_string_free`). It is for start-up and checks, not for polling.
+- Errors: `GS_ERROR_CODE_GAME_DATA_*`. `gs_error_reason` is
+  `"personal_data"` when an email or a Gridspawn id was found, and
+  `gs_error_field` holds the JSON path.
+- `gs_game_data_publisher_skipped_json` and
+  `gs_game_data_publisher_last_error` report what the publisher could not
+  send.
 
 ## Rules in short
 

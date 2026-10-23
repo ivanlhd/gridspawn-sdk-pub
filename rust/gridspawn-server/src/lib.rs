@@ -9,7 +9,9 @@
 //!   `docs/protocol/03-presence.md`;
 //! - voice rules: who hears whom in a session's voice rooms ([`Session::voice`]);
 //! - posts to the game's club with a club grant —
-//!   `docs/protocol/05-club.md`.
+//!   `docs/protocol/05-club.md`;
+//! - live game data and events for the club's pages ([`Client::game`]) —
+//!   `docs/protocol/06-game-data.md`.
 //!
 //! ```no_run
 //! use gridspawn_server::{Client, Credential, Environment, IdempotencyKey, Post};
@@ -41,6 +43,7 @@ mod client;
 mod club;
 mod credential;
 mod error;
+mod game_data;
 mod http;
 mod presence;
 mod session;
@@ -54,6 +57,10 @@ pub use client::{Client, ClientBuilder};
 pub use club::{Link, Post, PostReceipt};
 pub use credential::Credential;
 pub use error::{ApiError, Error, ErrorCode, Service};
+pub use game_data::{
+    DataAck, DataBatch, DataKey, DataListing, DataPublisher, DataQuota, EventReceipt, Game,
+    GameData, GameEvents, SkippedKey,
+};
 pub use presence::{ParticipantRef, Party, Presence, PresenceAck};
 pub use session::{
     AdmitGuest, AdmitParticipant, ClientTicket, CreateSession, IdentityKind, Lease, Participant,

@@ -310,6 +310,8 @@ async fn the_publisher_sends_the_latest_position_of_each_player() {
     publisher.remove(&b);
     tokio::time::sleep(Duration::from_millis(250)).await;
     drop(publisher);
+    // A batch already on the wire when the task stops may still land.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let sent = bodies(&server, &positions).await;
     assert!(sent.len() >= 4, "about 10 per second, got {}", sent.len());
     assert_eq!(

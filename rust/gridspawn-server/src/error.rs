@@ -186,8 +186,20 @@ pub enum ErrorCode {
     VoiceModuleDisabled,
     /// `voice/unavailable` (503): voice control is temporarily unreachable.
     VoiceUnavailable,
-    /// `rate_limited`, `presence/rate_limited`, `voice/rate_limited`, or any
-    /// 429 without a code (nginx).
+    /// `data/invalid_value`: game data out of bounds, or personal data
+    /// ([`ApiError::field`] and [`ApiError::reason`], for example
+    /// `personal_data`; see [`ApiError::is_personal_data`]).
+    GameDataInvalidValue,
+    /// `data/module_disabled`: game data is off for the application and
+    /// environment.
+    GameDataModuleDisabled,
+    /// `data/quota_exceeded` (409): the write would pass the key or byte
+    /// quota ([`ApiError::field`]: `keys` or `bytes`).
+    GameDataQuotaExceeded,
+    /// `data/unavailable` (503): the store is unreachable; nothing was stored.
+    GameDataUnavailable,
+    /// `rate_limited`, `presence/rate_limited`, `voice/rate_limited`,
+    /// `data/rate_limited`, or any 429 without a code (nginx).
     RateLimited,
     /// Any other code, kept verbatim.
     Other(String),
@@ -211,7 +223,8 @@ impl ErrorCode {
             "server/scope_denied" => Self::ScopeDenied,
             "server/browser_forbidden"
             | "game_server_browser_forbidden"
-            | "voice/browser_forbidden" => Self::BrowserForbidden,
+            | "voice/browser_forbidden"
+            | "data/browser_forbidden" => Self::BrowserForbidden,
             "service/not_ready" => Self::ServiceNotReady,
             "session/invalid_request" => Self::SessionInvalidRequest,
             "session/not_found" | "voice/session_not_found" => Self::SessionNotFound,
@@ -244,7 +257,14 @@ impl ErrorCode {
             "voice/participant_not_found" => Self::VoiceParticipantNotFound,
             "voice/module_disabled" => Self::VoiceModuleDisabled,
             "voice/unavailable" => Self::VoiceUnavailable,
-            "rate_limited" | "presence/rate_limited" | "voice/rate_limited" => Self::RateLimited,
+            "data/invalid_value" => Self::GameDataInvalidValue,
+            "data/module_disabled" => Self::GameDataModuleDisabled,
+            "data/quota_exceeded" => Self::GameDataQuotaExceeded,
+            "data/unavailable" => Self::GameDataUnavailable,
+            "rate_limited"
+            | "presence/rate_limited"
+            | "voice/rate_limited"
+            | "data/rate_limited" => Self::RateLimited,
             other if CONTENT_CODES.contains(&other) => Self::ContentRejected(other.to_owned()),
             other => Self::Other(other.to_owned()),
         }
@@ -287,6 +307,10 @@ impl ErrorCode {
             Self::VoiceParticipantNotFound => "voice/participant_not_found",
             Self::VoiceModuleDisabled => "voice/module_disabled",
             Self::VoiceUnavailable => "voice/unavailable",
+            Self::GameDataInvalidValue => "data/invalid_value",
+            Self::GameDataModuleDisabled => "data/module_disabled",
+            Self::GameDataQuotaExceeded => "data/quota_exceeded",
+            Self::GameDataUnavailable => "data/unavailable",
             Self::RateLimited => "rate_limited",
         }
     }
@@ -338,6 +362,10 @@ mod tests {
             "voice/participant_not_found",
             "voice/module_disabled",
             "voice/unavailable",
+            "data/invalid_value",
+            "data/module_disabled",
+            "data/quota_exceeded",
+            "data/unavailable",
             "rate_limited",
         ] {
             let mapped = ErrorCode::from_wire(code);
@@ -360,6 +388,8 @@ mod tests {
             ("voice/browser_forbidden", ErrorCode::BrowserForbidden),
             ("voice/session_not_found", ErrorCode::SessionNotFound),
             ("voice/rate_limited", ErrorCode::RateLimited),
+            ("data/browser_forbidden", ErrorCode::BrowserForbidden),
+            ("data/rate_limited", ErrorCode::RateLimited),
         ] {
             assert_eq!(ErrorCode::from_wire(alias), code, "{alias}");
         }

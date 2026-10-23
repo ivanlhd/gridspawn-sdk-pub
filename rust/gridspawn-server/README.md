@@ -1,16 +1,16 @@
 # gridspawn-server
 
 Rust server SDK for Gridspawn: game sessions, player and guest admission,
-client tickets, player presence, voice rules (who hears whom), and posting to
-your game's club. Server-side only — the credential must never ship in a game
-client.
+client tickets, player presence, voice rules (who hears whom), posting to
+your game's club, and live game data for your club's pages. Server-side only
+— the credential must never ship in a game client.
 
 It speaks the wire protocol one to one: `02-sessions.md` (sessions,
-admission, tickets) and `05-club.md` (club posts) in the protocol docs
-(`docs/protocol/` in the public repository). Requests never carry an `Origin`
-header.
+admission, tickets), `05-club.md` (club posts) and `06-game-data.md` (game
+data) in the protocol docs (`docs/protocol/` in the public repository).
+Requests never carry an `Origin` header.
 
-Status: 0.3.0, source only, not on crates.io yet. Licence: MIT OR Apache-2.0
+Status: 0.4.0, source only, not on crates.io yet. Licence: MIT OR Apache-2.0
 (see the end of this file).
 MSRV: Rust 1.83 for the library (the tests' dev-dependencies need a newer
 toolchain).
@@ -211,32 +211,60 @@ voice.mute(&guest.id, true).await?;                        // authoritative mute
   `voice_set_player_state`, `voice_mute` and `voice_publish_positions` (no
   background publisher there).
 
-## Show live game data on your club (planned, 0.4.0)
-
-**Not in this version.** The service and this API are under review
-(protocol `06-game-data.md`, Proposed). It is described here so the shape can
-be checked before it is built.
+## Show live game data on your club
 
 Your server keeps named values current (player count, round, scoreboard,
 map markers) and sends events ("round won"). Your club shows them on its
-pages through the club layout editor. **No game session is needed:** the
-data belongs to your app and environment.
+pages through the club layout editor (protocol `06-game-data.md`). **No game
+session is needed:** the data belongs to your app and environment. Values
+are `serde_json::Value` (add `serde_json = "1"`).
 
 ```rust
+use gridspawn_server::DataBatch;
 use serde_json::json;
 use std::time::Duration;
 
 let game = client.game();
-game.data().set("match.score", json!({"red": 3, "blue": 1})).await?;
+let ack = game.data().set("match.score", json!({"red": 3, "blue": 1})).await?;
 game.data().set_with_ttl("lobby.open", json!(true), Duration::from_secs(300)).await?;
 game.data().remove("lobby.open").await?;
+game.data().set_many(&DataBatch::new()                 // 1–40 entries, all or nothing
+    .set("match.round", json!(4))
+    .remove("lobby.banner")).await?;
+let listing = game.data().list().await?;               // keys, seq, sizes, removals, quota
 
 // Values that change every frame: the latest per key, one batch per tick.
 let live = game.spawn_data_publisher(4);     // 1–5 Hz
 live.set("match.clock", json!(812))?;        // cheap: every frame
+// live.skipped(): keys another writer owns; live.last_error(); drop(live) stops it
 
 game.events().emit("match.ended", json!({"winner": "Red team"})).await?;
+game.events().emit_with_id("round.won", json!({"round": 4}), "round-4-of-match-81").await?;
 ```
+
+- **`DataAck`:** `accepted` (the keys stored), `skipped` (keys another
+  writer owns, with their stored sequence number) and `quota` (`keys`,
+  `max_keys`, `bytes`, `max_bytes`).
+- **Events:** every event carries an `Idempotency-Key`, so a retry is never
+  counted twice. `emit` generates one; `emit_with_id` takes yours
+  (`[A-Za-z0-9_-]{8,64}`). Use your own when the same event may be sent again
+  after a restart: a repeat within 24 h answers `duplicate: true`.
+- **TTL:** whole seconds, 10 s to 24 h. Without one, a document lives until
+  it is removed. A removal is kept 24 h, so an older delayed write cannot
+  bring the key back.
+- **Checks before sending** (`Error::InvalidInput`): key `^[a-z][a-z0-9_.-]{0,63}$`,
+  values up to 4 KiB of JSON and 8 levels deep, 1–40 entries and 32 KiB per
+  batch, event names `^[a-z0-9][a-z0-9_.-]{0,47}$`, event payloads a JSON
+  object up to 4 KiB.
+- **The publisher** retries what can succeed later (network errors, 5xx,
+  429 after `Retry-After`) with the newest values. A refusal that cannot
+  succeed by retrying — an invalid or personal-data value, or
+  `GameDataQuotaExceeded` — drops those entries and is kept in
+  `last_error()`; set the key again once the cause is fixed.
+- **`list()` is for start-up and checks, not for polling** (10 per 10 s).
+- The `blocking` client has `game_data_set`, `game_data_remove`,
+  `game_data_set_many`, `game_data_list` and `game_event_emit` (no background
+  publisher there).
 
 - **Public by nature.** Production game data appears on public club pages,
   readable by anyone. **Publish display names only, never emails, account
@@ -244,17 +272,21 @@ game.events().emit("match.ended", json!({"winner": "Red team"})).await?;
   shapes and Gridspawn id prefixes (`GameDataInvalidValue` with reason
   `personal_data`, and the JSON path in `field`), but that check is a safety
   net, not a filter to rely on.
-- **One writer per key.** Servers that run side by side (shards, regions)
-  write disjoint keys, for example `shard-eu.players`. On start-up the crate
-  reads your stored keys once, so a restarted server carries on where it
-  stopped. A key that another writer owns comes back in `DataAck::skipped`.
+- **One writer per key.** Every write carries a sequence number from one
+  in-process counter per `Client`; the service skips a write that is not
+  newer than the key's stored one. Servers that run side by side (shards,
+  regions) write disjoint keys, for example `shard-eu.players`. The first
+  write reads your stored keys once and starts above them, so a restarted
+  server carries on where it stopped; no clock is involved. A key that is
+  still skipped after one resend belongs to another writer and comes back in
+  `DataAck::skipped`.
 - **Setup:** give the server key the `game_data.write` scope and switch game
   data on for the app and environment, in the Dev Hub. What your club shows
   is the club's choice; writing data changes no page by itself.
 - **Limits** (per app and environment): 20 entries a second (bursts of 40)
   and 5 a second per key; up to 40 entries and 32 KiB per batch; 256 keys
-  and 256 KiB in total; values up to 4 KiB; 10 events a second. The
-  publisher stays within them by itself.
+  and 256 KiB in total; values up to 4 KiB; 10 events a second; the listing
+  10 per 10 s. The publisher stays within them by itself.
 
 ## Retries
 
@@ -263,7 +295,10 @@ game.events().emit("match.ended", json!({"winner": "Red team"})).await?;
   Idempotency-Key and body.
 - 429 is not retried: you get `ErrorCode::RateLimited` and decide.
   `ApiError::retry_after` carries `Retry-After` when sent (presence limits
-  send it; the posting limits are fixed one-minute windows without it).
+  send it, as do voice and game data; the posting limits are fixed one-minute
+  windows without it). The game-data publisher waits it out by itself.
+- Game-data writes need no Idempotency-Key: their sequence numbers make a
+  repeat harmless. Events always carry one.
 - Ticket issue is never retried (each call issues a new ticket).
 - A post that gets `grant_invalid` gets a new club grant once and is
   retried once.
@@ -279,7 +314,11 @@ sense.
 | `ErrorCode` | Wire code | What to do |
 |---|---|---|
 | `FeatureNotFound` | `feature_not_found` (404) | Add a destination for the feature in the Dev Hub, turn posting on, or allow test servers |
-| `RateLimited` | `rate_limited`, `presence/rate_limited`, `voice/rate_limited` (429) | Wait (`retry_after` when sent); posts: 120/min per app and 30/min per feature; presence: 5 writes per 20 s per player; voice: see its limits |
+| `RateLimited` | `rate_limited`, `presence/rate_limited`, `voice/rate_limited`, `data/rate_limited` (429) | Wait (`retry_after` when sent); posts: 120/min per app and 30/min per feature; presence: 5 writes per 20 s per player; voice and game data: see their limits |
+| `GameDataInvalidValue` | `data/invalid_value` (400) | Fix the field in `ApiError::field` (`reason` says why). `ApiError::is_personal_data()`: an email or a Gridspawn id was found; publish display names only |
+| `GameDataModuleDisabled` | `data/module_disabled` (403) | Turn game data on for the app and environment in the Dev Hub |
+| `GameDataQuotaExceeded` | `data/quota_exceeded` (409) | Remove keys (`field`: `keys` or `bytes`) |
+| `GameDataUnavailable` | `data/unavailable` (503) | Retried automatically; nothing was stored; try again later |
 | `PresenceInvalidRequest` / `PresenceTextNotAllowed` | `presence/invalid_request` / `presence/text_not_allowed` (400) | Fix the field in `ApiError::field` |
 | `PresenceScopeDenied` | `presence/scope_denied` (403) | No `presence.write` (or `presence.party`) consent, or the presence module is off |
 | `PresenceGuestNotSupported` | `presence/guest_not_supported` (403) | Guests have no presence |
@@ -291,7 +330,7 @@ sense.
 | `VoiceUnavailable` | `voice/unavailable` (503) | Retried automatically; try again later |
 | `GrantInvalid` | `grant_invalid` (401) | Key revoked or app turned off (one automatic refresh already happened) |
 | `AuthenticationRequired` | `server/authentication_required` (401) | Wrong, revoked or expired key, or the environment is off |
-| `ScopeDenied` | `server/scope_denied` (403) | The key lacks the scope (`club.post` / `session.manage`) |
+| `ScopeDenied` | `server/scope_denied` (403) | The key lacks the scope (`club.post` / `session.manage` / `game_data.write`) |
 | `CapabilityDenied` | `session/capability_denied` (403) | A module the app or the player may not use |
 | `BoardFull` / `BoardBusy` | `announcement_board_full` / `_busy` (409) | Full: remove old posts. Busy: retry |
 | `ContentRejected(code)` | `title_too_long`, … (400) | Fix the post |
@@ -301,7 +340,8 @@ sense.
 | `ServiceNotReady` | `service/not_ready` (503) | Retried automatically; try again later |
 | `Other(code)` | anything else | Kept verbatim |
 
-The full list is in the `ErrorCode` docs and the protocol docs (02, 05).
+`data/browser_forbidden` maps to `BrowserForbidden`. The full list is in the
+`ErrorCode` docs and the protocol docs (02, 05, 06).
 
 ## Tests
 

@@ -10,6 +10,7 @@ use crate::{
     club::CachedGrant,
     credential::Credential,
     error::{Error, Service},
+    game_data::GameShared,
     http::{Auth, Call, Http},
     types::{token_char, Environment, IdempotencyKey, Module, RetryPolicy},
 };
@@ -109,6 +110,7 @@ impl ClientBuilder {
                 http,
                 modules,
                 grant: Mutex::new(None),
+                game: GameShared::default(),
             }),
         })
     }
@@ -151,6 +153,8 @@ pub(crate) struct Inner {
     pub(crate) http: Http,
     modules: Vec<Module>,
     pub(crate) grant: Mutex<Option<CachedGrant>>,
+    /// The game-data writer: one per client (see `Client::game`).
+    pub(crate) game: GameShared,
 }
 
 impl Client {

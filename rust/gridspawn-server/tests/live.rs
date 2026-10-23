@@ -283,6 +283,137 @@ async fn raw_state(
     )
 }
 
+/// Game data (protocol 06) on the test application's development data: the
+/// listing, set with and without a TTL, the start-up seeding, an event and
+/// its duplicate, the personal-data refusal, and removal. Skipped (with the
+/// reason) when the key lacks `game_data.write` or game data is off.
+#[tokio::test]
+async fn live_game_data() {
+    use serde_json::json;
+    use std::time::Duration;
+    let (Some(path), Some(app_id)) = (
+        env(&[
+            "GRIDSPAWN_TEST_CREDENTIAL_FILE",
+            "GRIDSPAWN_TEST_SERVER_CREDENTIAL_FILE",
+        ]),
+        env(&["GRIDSPAWN_TEST_APP_ID"]),
+    ) else {
+        eprintln!("skipped: GRIDSPAWN_TEST_CREDENTIAL_FILE / GRIDSPAWN_TEST_APP_ID not set");
+        return;
+    };
+    let client = Client::builder(
+        app_id,
+        Environment::Development,
+        Credential::from_file(&path).expect("credential"),
+    )
+    .connect()
+    .await
+    .expect("bootstrap");
+    let data = client.game().data();
+    let before = match data.list().await {
+        Ok(listing) => listing,
+        Err(Error::Api(api))
+            if matches!(
+                api.code,
+                ErrorCode::ScopeDenied | ErrorCode::GameDataModuleDisabled
+            ) =>
+        {
+            eprintln!("skipped: {} ({})", api.code, api.status);
+            return;
+        }
+        Err(error) => panic!("listing: {error:?}"),
+    };
+    eprintln!(
+        "listing: {} keys, quota {:?}",
+        before.keys.len(),
+        before.quota
+    );
+    let ack = data
+        .set("sdk-live.rust", json!({"round": 4, "leader": "Red team"}))
+        .await
+        .expect("set");
+    assert_eq!(ack.accepted, ["sdk-live.rust"], "{ack:?}");
+    assert!(ack.skipped.is_empty(), "{ack:?}");
+    data.set_with_ttl(
+        "sdk-live.banner",
+        json!("Overtime"),
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("set with ttl");
+    let after = data.list().await.expect("listing again");
+    let mine = after
+        .keys
+        .iter()
+        .find(|k| k.key == "sdk-live.rust")
+        .expect("listed");
+    let banner = after
+        .keys
+        .iter()
+        .find(|k| k.key == "sdk-live.banner")
+        .expect("listed");
+    assert!(!mine.removed && mine.ttl_remaining.is_none());
+    assert!(banner.ttl_remaining.is_some(), "{banner:?}");
+    let seeded_above = before.keys.iter().map(|k| k.seq).max().unwrap_or(0);
+    assert!(mine.seq > seeded_above, "{} > {seeded_above}", mine.seq);
+    eprintln!(
+        "set: sdk-live.rust seq {} > listed max {seeded_above}; banner seq {}, ttl_remaining {:?}",
+        mine.seq, banner.seq, banner.ttl_remaining
+    );
+
+    let refused = data
+        .set(
+            "sdk-live.private",
+            json!({"contact": "someone@example.com"}),
+        )
+        .await
+        .expect_err("personal data");
+    let api = refused.api().expect("an API error");
+    assert!(api.is_personal_data(), "{api:?}");
+    eprintln!("personal data refused, field {:?}", api.field);
+
+    let id = format!("sdk-live-{}", &IdempotencyKey::random().as_str()[..8]);
+    let events = client.game().events();
+    let first = events
+        .emit_with_id("sdk-live.round-won", json!({"round": 4}), &id)
+        .await
+        .expect("event");
+    let again = events
+        .emit_with_id("sdk-live.round-won", json!({"round": 4}), &id)
+        .await
+        .expect("event again");
+    assert!(!first.duplicate && again.duplicate, "{first:?} {again:?}");
+    assert_eq!(first.id, again.id);
+    let generated = events
+        .emit("sdk-live.generated", json!({}))
+        .await
+        .expect("event with a generated key");
+    eprintln!(
+        "events: id {} (duplicate {}), repeat id {} (duplicate {}), generated-key id {} (duplicate {})",
+        first.id, first.duplicate, again.id, again.duplicate, generated.id, generated.duplicate
+    );
+
+    for key in ["sdk-live.rust", "sdk-live.banner"] {
+        let ack = data.remove(key).await.expect("remove");
+        assert_eq!(ack.accepted, [key]);
+    }
+    let last = data.list().await.expect("final listing");
+    let ours: Vec<_> = last
+        .keys
+        .iter()
+        .filter(|k| k.key.starts_with("sdk-live."))
+        .collect();
+    assert!(ours.iter().all(|k| k.removed));
+    for k in &ours {
+        eprintln!(
+            "final: {} seq {} removed {} ttl_remaining {:?}",
+            k.key, k.seq, k.removed, k.ttl_remaining
+        );
+    }
+    eprintln!("final quota {:?}", last.quota);
+    eprintln!("game data ok: set, ttl, seeding, personal data, events, removal");
+}
+
 #[tokio::test]
 async fn live_game_post() {
     let (Some(path), Some(app_id), Some(feature)) = (

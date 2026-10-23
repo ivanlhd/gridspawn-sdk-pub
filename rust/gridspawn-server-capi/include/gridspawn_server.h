@@ -109,6 +109,15 @@ typedef enum GsErrorCode {
   GS_ERROR_CODE_VOICE_MODULE_DISABLED = 30,
   // voice/unavailable (503), retryable.
   GS_ERROR_CODE_VOICE_UNAVAILABLE = 31,
+  // data/invalid_value: see gs_error_field (the field or JSON path) and
+  // gs_error_reason ("personal_data", "size", "count", ...).
+  GS_ERROR_CODE_GAME_DATA_INVALID_VALUE = 32,
+  // data/module_disabled: game data is off for the app and environment.
+  GS_ERROR_CODE_GAME_DATA_MODULE_DISABLED = 33,
+  // data/quota_exceeded (409): gs_error_field is "keys" or "bytes".
+  GS_ERROR_CODE_GAME_DATA_QUOTA_EXCEEDED = 34,
+  // data/unavailable (503), retryable; nothing was stored.
+  GS_ERROR_CODE_GAME_DATA_UNAVAILABLE = 35,
 } GsErrorCode;
 
 // A connected client. Thread-safe. Free with gs_client_free.
@@ -116,6 +125,13 @@ typedef struct GsClient GsClient;
 
 // A server credential (gsc1.<id>.<secret>). Consumed by gs_client_connect.
 typedef struct GsCredential GsCredential;
+
+// The answer to a game-data write. Free with gs_data_ack_free.
+typedef struct GsDataAck GsDataAck;
+
+// Sends the latest value of each game-data key at a fixed rate.
+// gs_game_data_publisher_free stops it.
+typedef struct GsDataPublisher GsDataPublisher;
 
 // An error. Free with gs_error_free.
 typedef struct GsError GsError;
@@ -237,6 +253,24 @@ typedef struct GsVoicePosition {
   double yaw;
   bool has_yaw;
 } GsVoicePosition;
+
+// One game-data document for gs_game_data_set_many.
+typedef struct GsDataEntry {
+  // ^[a-z][a-z0-9_.-]{0,63}$
+  const char *key;
+  // Any JSON text, at most 4 KiB.
+  const char *value_json;
+  // 0 = no TTL; otherwise 10-86400.
+  uint32_t ttl_seconds;
+} GsDataEntry;
+
+// The game-data quota of the app and environment.
+typedef struct GsDataQuota {
+  uint32_t keys;
+  uint32_t max_keys;
+  uint64_t bytes;
+  uint64_t max_bytes;
+} GsDataQuota;
 
 #ifdef __cplusplus
 extern "C" {
@@ -429,6 +463,102 @@ struct GsError *gs_voice_publisher_last_error(const struct GsVoicePublisher *pub
 
 void gs_voice_publisher_free(struct GsVoicePublisher *publisher);
 
+// Sets one document: value_json is any JSON text (at most 4 KiB).
+// ttl_seconds 0 = no TTL; otherwise 10-86400. No game session is needed.
+// The first write reads the stored keys once to seed the sequence counter.
+// ack_out may be NULL; otherwise free *ack_out with gs_data_ack_free.
+enum GsStatus gs_game_data_set(struct GsClient *client,
+                               const char *key,
+                               const char *value_json,
+                               uint32_t ttl_seconds,
+                               struct GsDataAck **ack_out,
+                               struct GsError **error);
+
+// Removes one document (the removal is kept 24 h). ack_out may be NULL.
+enum GsStatus gs_game_data_remove(struct GsClient *client,
+                                  const char *key,
+                                  struct GsDataAck **ack_out,
+                                  struct GsError **error);
+
+// One all-or-nothing write: set_len entries, then remove_len keys
+// (set_len + remove_len must be 1-40). Either array may be NULL when its
+// length is 0. ack_out may be NULL.
+enum GsStatus gs_game_data_set_many(struct GsClient *client,
+                                    const struct GsDataEntry *set,
+                                    size_t set_len,
+                                    const char *const *remove_keys,
+                                    size_t remove_len,
+                                    struct GsDataAck **ack_out,
+                                    struct GsError **error);
+
+// The writer's listing as JSON: {"keys": [{"key", "seq", "bytes",
+// "ttlRemaining", "updatedAt", "removed"}], "quota": {...}} (seconds;
+// ttlRemaining null when none). 10 per 10 s: for start-up and checks, not
+// for polling. *json_out: free with gs_string_free.
+enum GsStatus gs_game_data_list(struct GsClient *client, char **json_out, struct GsError **error);
+
+// The keys that were stored. 0 for NULL.
+size_t gs_data_ack_accepted_len(const struct GsDataAck *ack);
+
+// Borrowed until gs_data_ack_free; NULL when out of range.
+const char *gs_data_ack_accepted_key(const struct GsDataAck *ack, size_t i);
+
+// Keys still skipped after one resend: another writer owns them.
+size_t gs_data_ack_skipped_len(const struct GsDataAck *ack);
+
+// Borrowed until gs_data_ack_free; NULL when out of range.
+const char *gs_data_ack_skipped_key(const struct GsDataAck *ack, size_t i);
+
+// The stored sequence number of a skipped key; 0 when out of range.
+uint64_t gs_data_ack_skipped_seq(const struct GsDataAck *ack, size_t i);
+
+// Writes the quota; zeroes for a NULL ack. `out` must not be NULL.
+void gs_data_ack_quota(const struct GsDataAck *ack, struct GsDataQuota *out);
+
+void gs_data_ack_free(struct GsDataAck *ack);
+
+// Starts a publisher on the client's runtime: hz times a second (1-5) it
+// sends the keys changed since the last tick, latest value only, oldest
+// change first, within the service's limits.
+enum GsStatus gs_game_data_publisher_spawn(struct GsClient *client,
+                                           uint32_t hz,
+                                           struct GsDataPublisher **out,
+                                           struct GsError **error);
+
+// A key's latest value (cheap; call every frame). Checked here. Never
+// blocks. ttl_seconds 0 = no TTL; otherwise 10-86400.
+enum GsStatus gs_game_data_publisher_set(struct GsDataPublisher *publisher,
+                                         const char *key,
+                                         const char *value_json,
+                                         uint32_t ttl_seconds,
+                                         struct GsError **error);
+
+// Sends a removal on the next tick, and stops sending the key.
+void gs_game_data_publisher_remove(struct GsDataPublisher *publisher, const char *key);
+
+// Keys another writer owns, as a JSON array; NULL when none (or for a NULL
+// publisher). Free with gs_string_free.
+char *gs_game_data_publisher_skipped_json(const struct GsDataPublisher *publisher);
+
+// The failure of the last batch: a new GsError to free with gs_error_free,
+// or NULL when the last batch was sent (or for a NULL publisher).
+struct GsError *gs_game_data_publisher_last_error(const struct GsDataPublisher *publisher);
+
+void gs_game_data_publisher_free(struct GsDataPublisher *publisher);
+
+// Sends an event: payload_json is a JSON object (at most 4 KiB). id is the
+// Idempotency-Key, [A-Za-z0-9_-]{8,64}; NULL = generated by the SDK (its own
+// retries are still de-duplicated). *event_id_out (the server's sequence,
+// a string): free with gs_string_free; it may be NULL. duplicate_out may be
+// NULL.
+enum GsStatus gs_game_event_emit(struct GsClient *client,
+                                 const char *name,
+                                 const char *payload_json,
+                                 const char *id,
+                                 char **event_id_out,
+                                 bool *duplicate_out,
+                                 struct GsError **error);
+
 enum GsStatus gs_error_status(const struct GsError *error);
 
 enum GsErrorCode gs_error_code(const struct GsError *error);
@@ -445,7 +575,7 @@ uint16_t gs_error_http_status(const struct GsError *error);
 // NULL when absent.
 const char *gs_error_request_id(const struct GsError *error);
 
-// -1 when absent (neither service sends Retry-After today).
+// -1 when the answer had no Retry-After (voice and game-data 429s send it).
 int64_t gs_error_retry_after_ms(const struct GsError *error);
 
 // The request field the error is about (voice and presence payload

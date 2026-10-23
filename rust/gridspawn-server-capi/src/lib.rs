@@ -92,6 +92,15 @@ pub enum GsErrorCode {
     VoiceModuleDisabled = 30,
     /// voice/unavailable (503), retryable.
     VoiceUnavailable = 31,
+    /// data/invalid_value: see gs_error_field (the field or JSON path) and
+    /// gs_error_reason ("personal_data", "size", "count", ...).
+    GameDataInvalidValue = 32,
+    /// data/module_disabled: game data is off for the app and environment.
+    GameDataModuleDisabled = 33,
+    /// data/quota_exceeded (409): gs_error_field is "keys" or "bytes".
+    GameDataQuotaExceeded = 34,
+    /// data/unavailable (503), retryable; nothing was stored.
+    GameDataUnavailable = 35,
 }
 
 #[repr(C)]
@@ -265,6 +274,41 @@ pub struct GsVoicePublisher {
     _rt: Arc<Rt>,
 }
 
+/// The answer to a game-data write. Free with gs_data_ack_free.
+pub struct GsDataAck {
+    accepted: Vec<CString>,
+    skipped: Vec<(CString, u64)>,
+    quota: GsDataQuota,
+}
+
+/// Sends the latest value of each game-data key at a fixed rate.
+/// gs_game_data_publisher_free stops it.
+pub struct GsDataPublisher {
+    handle: Option<gs::DataPublisher>,
+    _rt: Arc<Rt>,
+}
+
+/// The game-data quota of the app and environment.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GsDataQuota {
+    pub keys: u32,
+    pub max_keys: u32,
+    pub bytes: u64,
+    pub max_bytes: u64,
+}
+
+/// One game-data document for gs_game_data_set_many.
+#[repr(C)]
+pub struct GsDataEntry {
+    /// ^[a-z][a-z0-9_.-]{0,63}$
+    pub key: *const c_char,
+    /// Any JSON text, at most 4 KiB.
+    pub value_json: *const c_char,
+    /// 0 = no TTL; otherwise 10-86400.
+    pub ttl_seconds: u32,
+}
+
 /// An error. Free with gs_error_free.
 pub struct GsError {
     status: GsStatus,
@@ -392,6 +436,10 @@ fn error_code(code: &gs::ErrorCode) -> GsErrorCode {
         C::VoiceParticipantNotFound => GsErrorCode::VoiceParticipantNotFound,
         C::VoiceModuleDisabled => GsErrorCode::VoiceModuleDisabled,
         C::VoiceUnavailable => GsErrorCode::VoiceUnavailable,
+        C::GameDataInvalidValue => GsErrorCode::GameDataInvalidValue,
+        C::GameDataModuleDisabled => GsErrorCode::GameDataModuleDisabled,
+        C::GameDataQuotaExceeded => GsErrorCode::GameDataQuotaExceeded,
+        C::GameDataUnavailable => GsErrorCode::GameDataUnavailable,
         _ => GsErrorCode::Other,
     }
 }
@@ -1539,6 +1587,450 @@ pub unsafe extern "C" fn gs_voice_publisher_free(publisher: *mut GsVoicePublishe
     });
 }
 
+// ---- game data -------------------------------------------------------------
+
+/// Parses a JSON text argument.
+fn json_arg(text: &str, name: &str) -> Result<serde_json::Value, GsError> {
+    serde_json::from_str(text).map_err(|_| GsError::invalid(format!("{name} is not valid JSON")))
+}
+
+/// `ttl_seconds` 0 = none.
+fn ttl_arg(ttl_seconds: u32) -> Option<Duration> {
+    (ttl_seconds != 0).then(|| Duration::from_secs(u64::from(ttl_seconds)))
+}
+
+fn quota(quota: gs::DataQuota) -> GsDataQuota {
+    GsDataQuota {
+        keys: u32::try_from(quota.keys).unwrap_or(u32::MAX),
+        max_keys: u32::try_from(quota.max_keys).unwrap_or(u32::MAX),
+        bytes: quota.bytes,
+        max_bytes: quota.max_bytes,
+    }
+}
+
+/// SAFETY: `ack_out` is NULL or a valid, writable `GsDataAck **`.
+unsafe fn write_data_ack(ack_out: *mut *mut GsDataAck, ack: gs::DataAck) {
+    if ack_out.is_null() {
+        return;
+    }
+    let ack = GsDataAck {
+        accepted: ack.accepted.into_iter().map(cstring).collect(),
+        skipped: ack
+            .skipped
+            .into_iter()
+            .map(|skipped| (cstring(skipped.key), skipped.seq))
+            .collect(),
+        quota: quota(ack.quota),
+    };
+    // SAFETY: non-NULL and writable per the contract.
+    unsafe { put(ack_out, Box::into_raw(Box::new(ack))) };
+}
+
+/// Sets one document: value_json is any JSON text (at most 4 KiB).
+/// ttl_seconds 0 = no TTL; otherwise 10-86400. No game session is needed.
+/// The first write reads the stored keys once to seed the sequence counter.
+/// ack_out may be NULL; otherwise free *ack_out with gs_data_ack_free.
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_data_set(
+    client: *mut GsClient,
+    key: *const c_char,
+    value_json: *const c_char,
+    ttl_seconds: u32,
+    ack_out: *mut *mut GsDataAck,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        // SAFETY: header contract.
+        let client = unsafe { handle(client, "client") }?;
+        // SAFETY: header contract.
+        let key = unsafe { text(key, "key") }?;
+        // SAFETY: header contract.
+        let value = json_arg(unsafe { text(value_json, "value_json") }?, "value_json")?;
+        let data = client.client.game().data();
+        let ack = match ttl_arg(ttl_seconds) {
+            Some(ttl) => sdk(block_on(&client.rt, data.set_with_ttl(key, value, ttl))?)?,
+            None => sdk(block_on(&client.rt, data.set(key, value))?)?,
+        };
+        // SAFETY: NULL or writable (header contract).
+        unsafe { write_data_ack(ack_out, ack) };
+        Ok(())
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// Removes one document (the removal is kept 24 h). ack_out may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_data_remove(
+    client: *mut GsClient,
+    key: *const c_char,
+    ack_out: *mut *mut GsDataAck,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        // SAFETY: header contract.
+        let client = unsafe { handle(client, "client") }?;
+        // SAFETY: header contract.
+        let key = unsafe { text(key, "key") }?;
+        let ack = sdk(block_on(
+            &client.rt,
+            client.client.game().data().remove(key),
+        )?)?;
+        // SAFETY: NULL or writable (header contract).
+        unsafe { write_data_ack(ack_out, ack) };
+        Ok(())
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// One all-or-nothing write: set_len entries, then remove_len keys
+/// (set_len + remove_len must be 1-40). Either array may be NULL when its
+/// length is 0. ack_out may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_data_set_many(
+    client: *mut GsClient,
+    set: *const GsDataEntry,
+    set_len: usize,
+    remove_keys: *const *const c_char,
+    remove_len: usize,
+    ack_out: *mut *mut GsDataAck,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        // SAFETY: header contract.
+        let client = unsafe { handle(client, "client") }?;
+        let mut batch = gs::DataBatch::new();
+        if set_len > 0 {
+            require(set, "set")?;
+        }
+        for index in 0..set_len {
+            // SAFETY: `set_len` live entries (header contract).
+            let entry = unsafe { &*set.add(index) };
+            // SAFETY: header contract.
+            let key = unsafe { text(entry.key, "set[].key") }?;
+            // SAFETY: header contract.
+            let value = json_arg(
+                unsafe { text(entry.value_json, "set[].value_json") }?,
+                "set[].value_json",
+            )?;
+            batch = match ttl_arg(entry.ttl_seconds) {
+                Some(ttl) => batch.set_with_ttl(key, value, ttl),
+                None => batch.set(key, value),
+            };
+        }
+        if remove_len > 0 {
+            require(remove_keys, "remove_keys")?;
+        }
+        for index in 0..remove_len {
+            // SAFETY: `remove_len` live strings (header contract).
+            let key = unsafe { text(*remove_keys.add(index), "remove_keys[]") }?;
+            batch = batch.remove(key);
+        }
+        let ack = sdk(block_on(
+            &client.rt,
+            client.client.game().data().set_many(&batch),
+        )?)?;
+        // SAFETY: NULL or writable (header contract).
+        unsafe { write_data_ack(ack_out, ack) };
+        Ok(())
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// The writer's listing as JSON: {"keys": [{"key", "seq", "bytes",
+/// "ttlRemaining", "updatedAt", "removed"}], "quota": {...}} (seconds;
+/// ttlRemaining null when none). 10 per 10 s: for start-up and checks, not
+/// for polling. *json_out: free with gs_string_free.
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_data_list(
+    client: *mut GsClient,
+    json_out: *mut *mut c_char,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        require(json_out, "json_out")?;
+        // SAFETY: header contract.
+        let client = unsafe { handle(client, "client") }?;
+        let listing = sdk(block_on(&client.rt, client.client.game().data().list())?)?;
+        let keys: Vec<serde_json::Value> = listing
+            .keys
+            .iter()
+            .map(|k| {
+                serde_json::json!({
+                    "key": k.key, "seq": k.seq, "bytes": k.bytes,
+                    "ttlRemaining": k.ttl_remaining.map(|t| t.as_secs_f64()),
+                    "updatedAt": k.updated_at, "removed": k.removed,
+                })
+            })
+            .collect();
+        let q = listing.quota;
+        let json = serde_json::json!({
+            "keys": keys,
+            "quota": {"keys": q.keys, "maxKeys": q.max_keys, "bytes": q.bytes, "maxBytes": q.max_bytes},
+        });
+        // SAFETY: checked non-NULL above.
+        unsafe { put(json_out, cstring(json.to_string()).into_raw()) };
+        Ok(())
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// SAFETY: NULL or a live GsDataAck.
+unsafe fn data_ack_ref<'a>(ack: *const GsDataAck) -> Option<&'a GsDataAck> {
+    // SAFETY: per the contract.
+    unsafe { ack.as_ref() }
+}
+
+/// The keys that were stored. 0 for NULL.
+#[no_mangle]
+pub unsafe extern "C" fn gs_data_ack_accepted_len(ack: *const GsDataAck) -> usize {
+    // SAFETY: header contract.
+    unsafe { data_ack_ref(ack) }.map_or(0, |a| a.accepted.len())
+}
+
+/// Borrowed until gs_data_ack_free; NULL when out of range.
+#[no_mangle]
+pub unsafe extern "C" fn gs_data_ack_accepted_key(
+    ack: *const GsDataAck,
+    i: usize,
+) -> *const c_char {
+    // SAFETY: header contract.
+    unsafe { data_ack_ref(ack) }
+        .and_then(|a| a.accepted.get(i))
+        .map_or(ptr::null(), |key| key.as_ptr())
+}
+
+/// Keys still skipped after one resend: another writer owns them.
+#[no_mangle]
+pub unsafe extern "C" fn gs_data_ack_skipped_len(ack: *const GsDataAck) -> usize {
+    // SAFETY: header contract.
+    unsafe { data_ack_ref(ack) }.map_or(0, |a| a.skipped.len())
+}
+
+/// Borrowed until gs_data_ack_free; NULL when out of range.
+#[no_mangle]
+pub unsafe extern "C" fn gs_data_ack_skipped_key(ack: *const GsDataAck, i: usize) -> *const c_char {
+    // SAFETY: header contract.
+    unsafe { data_ack_ref(ack) }
+        .and_then(|a| a.skipped.get(i))
+        .map_or(ptr::null(), |(key, _)| key.as_ptr())
+}
+
+/// The stored sequence number of a skipped key; 0 when out of range.
+#[no_mangle]
+pub unsafe extern "C" fn gs_data_ack_skipped_seq(ack: *const GsDataAck, i: usize) -> u64 {
+    // SAFETY: header contract.
+    unsafe { data_ack_ref(ack) }
+        .and_then(|a| a.skipped.get(i))
+        .map_or(0, |(_, seq)| *seq)
+}
+
+/// Writes the quota; zeroes for a NULL ack. `out` must not be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn gs_data_ack_quota(ack: *const GsDataAck, out: *mut GsDataQuota) {
+    if out.is_null() {
+        return;
+    }
+    quietly(|| {
+        // SAFETY: header contract.
+        let value = unsafe { data_ack_ref(ack) }.map_or_else(GsDataQuota::default, |a| a.quota);
+        // SAFETY: checked non-NULL above.
+        unsafe { put(out, value) };
+    });
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gs_data_ack_free(ack: *mut GsDataAck) {
+    if ack.is_null() {
+        return;
+    }
+    // SAFETY: allocated by the library, freed once (header contract).
+    quietly(|| drop(unsafe { Box::from_raw(ack) }));
+}
+
+/// Starts a publisher on the client's runtime: hz times a second (1-5) it
+/// sends the keys changed since the last tick, latest value only, oldest
+/// change first, within the service's limits.
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_data_publisher_spawn(
+    client: *mut GsClient,
+    hz: u32,
+    out: *mut *mut GsDataPublisher,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        require(out, "out")?;
+        // SAFETY: header contract.
+        let client = unsafe { handle(client, "client") }?;
+        let publisher = {
+            let _entered = client.rt.get().enter();
+            client.client.game().spawn_data_publisher(hz)
+        };
+        let handle = GsDataPublisher {
+            handle: Some(publisher),
+            _rt: client.rt.clone(),
+        };
+        // SAFETY: checked non-NULL above.
+        unsafe { put(out, Box::into_raw(Box::new(handle))) };
+        Ok(())
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// A key's latest value (cheap; call every frame). Checked here. Never
+/// blocks. ttl_seconds 0 = no TTL; otherwise 10-86400.
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_data_publisher_set(
+    publisher: *mut GsDataPublisher,
+    key: *const c_char,
+    value_json: *const c_char,
+    ttl_seconds: u32,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        // SAFETY: header contract.
+        let publisher = unsafe { handle(publisher, "publisher") }?;
+        // SAFETY: header contract.
+        let key = unsafe { text(key, "key") }?;
+        // SAFETY: header contract.
+        let value = json_arg(unsafe { text(value_json, "value_json") }?, "value_json")?;
+        let handle = publisher
+            .handle
+            .as_ref()
+            .ok_or_else(|| GsError::invalid("publisher stopped"))?;
+        match ttl_arg(ttl_seconds) {
+            Some(ttl) => sdk(handle.set_with_ttl(key, value, ttl)),
+            None => sdk(handle.set(key, value)),
+        }
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// Sends a removal on the next tick, and stops sending the key.
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_data_publisher_remove(
+    publisher: *mut GsDataPublisher,
+    key: *const c_char,
+) {
+    quietly(|| {
+        // SAFETY: NULL or live handles and strings (header contract).
+        let (Some(publisher), Ok(key)) =
+            (unsafe { publisher.as_ref() }, unsafe { text(key, "key") })
+        else {
+            return;
+        };
+        if let Some(handle) = &publisher.handle {
+            handle.remove(key);
+        }
+    });
+}
+
+/// Keys another writer owns, as a JSON array; NULL when none (or for a NULL
+/// publisher). Free with gs_string_free.
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_data_publisher_skipped_json(
+    publisher: *const GsDataPublisher,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: NULL or a live handle (header contract).
+        let skipped = unsafe { publisher.as_ref() }
+            .and_then(|p| p.handle.as_ref())
+            .map(gs::DataPublisher::skipped)
+            .unwrap_or_default();
+        if skipped.is_empty() {
+            ptr::null_mut()
+        } else {
+            cstring(serde_json::Value::from(skipped).to_string()).into_raw()
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// The failure of the last batch: a new GsError to free with gs_error_free,
+/// or NULL when the last batch was sent (or for a NULL publisher).
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_data_publisher_last_error(
+    publisher: *const GsDataPublisher,
+) -> *mut GsError {
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: NULL or a live handle (header contract).
+        unsafe { publisher.as_ref() }
+            .and_then(|p| p.handle.as_ref())
+            .and_then(gs::DataPublisher::last_error)
+            .map_or(ptr::null_mut(), |error| {
+                Box::into_raw(Box::new(GsError::from_sdk(&error)))
+            })
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_data_publisher_free(publisher: *mut GsDataPublisher) {
+    if publisher.is_null() {
+        return;
+    }
+    quietly(|| {
+        // SAFETY: allocated by the library, freed once (header contract).
+        let mut publisher = unsafe { Box::from_raw(publisher) };
+        // Stop the task before the runtime reference goes.
+        drop(publisher.handle.take());
+    });
+}
+
+/// Sends an event: payload_json is a JSON object (at most 4 KiB). id is the
+/// Idempotency-Key, [A-Za-z0-9_-]{8,64}; NULL = generated by the SDK (its own
+/// retries are still de-duplicated). *event_id_out (the server's sequence,
+/// a string): free with gs_string_free; it may be NULL. duplicate_out may be
+/// NULL.
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_event_emit(
+    client: *mut GsClient,
+    name: *const c_char,
+    payload_json: *const c_char,
+    id: *const c_char,
+    event_id_out: *mut *mut c_char,
+    duplicate_out: *mut bool,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        // SAFETY: header contract.
+        let client = unsafe { handle(client, "client") }?;
+        // SAFETY: header contract.
+        let name = unsafe { text(name, "name") }?;
+        // SAFETY: header contract.
+        let payload = json_arg(
+            unsafe { text(payload_json, "payload_json") }?,
+            "payload_json",
+        )?;
+        // SAFETY: header contract.
+        let id = unsafe { optional_text(id, "id") }?;
+        let events = client.client.game().events();
+        let receipt = match id {
+            Some(id) => sdk(block_on(
+                &client.rt,
+                events.emit_with_id(name, payload, id),
+            )?)?,
+            None => sdk(block_on(&client.rt, events.emit(name, payload))?)?,
+        };
+        if !event_id_out.is_null() {
+            // SAFETY: non-NULL and writable (header contract).
+            unsafe { put(event_id_out, cstring(receipt.id).into_raw()) };
+        }
+        if !duplicate_out.is_null() {
+            // SAFETY: non-NULL and writable (header contract).
+            unsafe { put(duplicate_out, receipt.duplicate) };
+        }
+        Ok(())
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
 // ---- errors ----------------------------------------------------------------
 
 /// SAFETY: NULL or a live GsError.
@@ -1591,7 +2083,7 @@ pub unsafe extern "C" fn gs_error_request_id(error: *const GsError) -> *const c_
         .map_or(ptr::null(), |id| id.as_ptr())
 }
 
-/// -1 when absent (neither service sends Retry-After today).
+/// -1 when the answer had no Retry-After (voice and game-data 429s send it).
 #[no_mangle]
 pub unsafe extern "C" fn gs_error_retry_after_ms(error: *const GsError) -> i64 {
     // SAFETY: header contract.
