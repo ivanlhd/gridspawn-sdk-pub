@@ -802,6 +802,122 @@ impl DataPublisher {
     pub fn stop(self) {}
 }
 
+const MAX_MARKERS: usize = 64;
+const MAX_MARKER_KIND: usize = 32;
+
+/// One marker of a [`Markers`] document (protocol 06 §2.3).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Marker {
+    id: String,
+    label: String,
+    x: f64,
+    y: f64,
+    kind: Option<String>,
+}
+
+impl Marker {
+    /// `id`: stable for this marker across updates. `label`: public text
+    /// (display names only). `x`, `y`: the game's own world units, in one
+    /// stable coordinate space.
+    pub fn new(id: impl Into<String>, label: impl Into<String>, x: f64, y: f64) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            x,
+            y,
+            kind: None,
+        }
+    }
+
+    /// Free text (at most 32 characters), for example `objective`.
+    pub fn kind(mut self, kind: impl Into<String>) -> Self {
+        self.kind = Some(kind.into());
+        self
+    }
+}
+
+/// A set of markers that club pages can draw on a "Game markers" layer
+/// (protocol 06 §2.3). Send the whole set with every update; an empty set
+/// shows nothing.
+///
+/// ```
+/// use gridspawn_server::{Marker, Markers};
+/// let markers = Markers::new()
+///     .push(Marker::new("flag-red", "Red flag", 120.5, -40.0).kind("objective"))
+///     .push(Marker::new("p-17", "Ana", 98.0, 12.25));
+/// let value = markers.to_value().unwrap();   // game.data().set("map.live", value)
+/// assert_eq!(value["markers"][0]["kind"], "objective");
+/// ```
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Markers {
+    markers: Vec<Marker>,
+}
+
+impl Markers {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(mut self, marker: Marker) -> Self {
+        self.markers.push(marker);
+        self
+    }
+
+    pub fn len(&self) -> usize {
+        self.markers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.markers.is_empty()
+    }
+
+    /// The document's value, checked here: at most 64 markers, a non-empty
+    /// id and label, finite coordinates, a kind of at most 32 characters, and
+    /// at most 4 KiB as JSON (about 60 bytes per marker when full).
+    pub fn to_value(&self) -> Result<Value, Error> {
+        if self.markers.len() > MAX_MARKERS {
+            return Err(invalid("markers", "at most 64 markers"));
+        }
+        let mut list = Vec::with_capacity(self.markers.len());
+        for marker in &self.markers {
+            if marker.id.is_empty() {
+                return Err(invalid("marker id", "not empty"));
+            }
+            if marker.label.is_empty() {
+                return Err(invalid("marker label", "not empty"));
+            }
+            if !marker.x.is_finite() || !marker.y.is_finite() {
+                return Err(invalid("marker position", "finite numbers"));
+            }
+            let mut entry = json!({
+                "id": marker.id, "label": marker.label, "x": marker.x, "y": marker.y,
+            });
+            if let Some(kind) = &marker.kind {
+                if kind.chars().count() > MAX_MARKER_KIND {
+                    return Err(invalid("marker kind", "at most 32 characters"));
+                }
+                entry["kind"] = json!(kind);
+            }
+            list.push(entry);
+        }
+        let value = json!({ "markers": list });
+        check_value(&value).map_err(|_| {
+            invalid(
+                "markers",
+                "at most 4 KiB as JSON: keep ids and labels short",
+            )
+        })?;
+        Ok(value)
+    }
+}
+
+impl DataPublisher {
+    /// As [`Self::set`] with a [`Markers`] set.
+    pub fn set_markers(&self, key: &str, markers: &Markers) -> Result<(), Error> {
+        self.set(key, markers.to_value()?)
+    }
+}
+
 /// Takes up to `limit` pending entries, oldest change first, within 32 KiB.
 fn take_batch(state: &Mutex<PublisherState>, limit: usize) -> Vec<(String, Pending)> {
     let mut s = lock(state);
@@ -940,6 +1056,75 @@ mod tests {
             vec![("a".into(), Entry::Remove)],
             "the last entry per key"
         );
+    }
+
+    #[test]
+    fn markers_serialise_to_the_reserved_shape_and_are_checked() {
+        let value = Markers::new()
+            .push(Marker::new("flag-red", "Red flag", 120.5, -40.0).kind("objective"))
+            .push(Marker::new("p-17", "Ana", 98.0, 12.25))
+            .to_value()
+            .unwrap();
+        assert_eq!(
+            value,
+            json!({"markers": [
+                {"id": "flag-red", "label": "Red flag", "x": 120.5, "y": -40.0, "kind": "objective"},
+                {"id": "p-17", "label": "Ana", "x": 98.0, "y": 12.25}
+            ]})
+        );
+        assert_eq!(
+            Markers::new().to_value().unwrap(),
+            json!({"markers": []}),
+            "an empty set shows nothing"
+        );
+        // 64 short markers fit; 65 do not.
+        let mut full = Markers::new();
+        for i in 0..64 {
+            full = full.push(Marker::new(
+                format!("m{i}"),
+                format!("P{i}"),
+                f64::from(i),
+                0.5,
+            ));
+        }
+        assert!(full.to_value().is_ok());
+        assert!(full
+            .clone()
+            .push(Marker::new("x", "x", 0.0, 0.0))
+            .to_value()
+            .is_err());
+        // Long labels pass 4 KiB before 64 markers.
+        let mut long = Markers::new();
+        for i in 0..40 {
+            long = long.push(Marker::new(format!("m{i}"), "x".repeat(100), 0.0, 0.0));
+        }
+        assert!(matches!(
+            long.to_value(),
+            Err(Error::InvalidInput {
+                field: "markers",
+                ..
+            })
+        ));
+        for (marker, field) in [
+            (Marker::new("", "a", 0.0, 0.0), "marker id"),
+            (Marker::new("a", "", 0.0, 0.0), "marker label"),
+            (Marker::new("a", "a", f64::NAN, 0.0), "marker position"),
+            (Marker::new("a", "a", 0.0, f64::INFINITY), "marker position"),
+            (
+                Marker::new("a", "a", 0.0, 0.0).kind("k".repeat(33)),
+                "marker kind",
+            ),
+        ] {
+            match Markers::new().push(marker).to_value() {
+                Err(Error::InvalidInput { field: got, .. }) => assert_eq!(got, field),
+                other => panic!("{field}: {other:?}"),
+            }
+        }
+        // 32 characters, counted as characters (not bytes).
+        assert!(Markers::new()
+            .push(Marker::new("a", "a", 0.0, 0.0).kind("é".repeat(32)))
+            .to_value()
+            .is_ok());
     }
 
     #[test]

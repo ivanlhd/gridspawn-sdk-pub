@@ -101,6 +101,49 @@ GET /v1/server/game-data
 - **`updatedAt`:** server time, for information only.
 - A writer calls it once at start-up (§3).
 
+### 2.3 Markers — Current
+
+A document whose value has this shape is a set of **markers**. Club pages can
+draw it on a "Game markers" layer of their world view: a live map of players,
+objectives or events.
+
+```json
+{
+  "markers": [
+    { "id": "flag-red", "label": "Red flag", "x": 120.5, "y": -40, "kind": "objective" },
+    { "id": "p-17", "label": "Ana", "x": 98, "y": 12.25 }
+  ]
+}
+```
+
+- **Shape:**
+  - at most 64 markers;
+  - `id` and `label` are text;
+  - `x` and `y` are finite numbers;
+  - `kind` is optional, at most 32 characters.
+  - Any other shape is an ordinary document.
+  - The value limit of §2 still applies: 64 markers must fit in 4 KiB,
+    about 60 bytes each. Keep ids and labels short.
+- **Coordinates:** `x` and `y` are in the game's own world units. There is
+  no fixed unit, origin or axis direction.
+  - The club's creator places them on the page with the layer's "Game area"
+    (minimum and maximum x and y) and a "Y points up" switch.
+  - Publish in one stable coordinate space, and say in your own docs which
+    one, so creators can set the area once.
+- **`id`:** stable for the same marker across updates. The page follows
+  markers by id from one update to the next.
+- **`label`:** public, like all game data (§6). Display names only, never
+  account ids or emails.
+- **A live picture:**
+  - Every update carries the whole set. Send it at most a few times a
+    second; the reference publisher sends 1–5 per second.
+  - When nothing should show, remove the document or send an empty list.
+  - A removed or expired document draws nothing.
+- **`kind`:** free text, for example `objective`, `ally`, `enemy`. Club pages
+  may style markers by kind later; for now each layer draws one style.
+- **Status:** storing and reading markers is live. Drawing them on club pages
+  comes with the next Gridspawn app release.
+
 ## 3. Ordering — Current
 
 - **`seq`:** each `set` and `remove` entry carries its own integer, chosen
@@ -198,6 +241,8 @@ There is no `stale_sequence` error: stale entries are skipped (§3).
 cover this document:
 - `client.game().data()`: `set`, `set_with_ttl`, `remove`, `set_many` and
   `list`.
+- 0.4.1: `Markers` / `Marker` build a §2.3 markers document with its limits
+  checked; `DataPublisher::set_markers` sends one.
 - `spawn_data_publisher(hz)` (1–5 Hz):
   - It sends the latest value per key, one batch per tick, oldest change
     first, within §5. `set` and `set_with_ttl` are cheap, so call them every

@@ -10,7 +10,7 @@ admission, tickets), `05-club.md` (club posts) and `06-game-data.md` (game
 data) in the protocol docs (`docs/protocol/` in the public repository).
 Requests never carry an `Origin` header.
 
-Status: 0.4.0, source only, not on crates.io yet. Licence: MIT OR Apache-2.0
+Status: 0.4.1, source only, not on crates.io yet. Licence: MIT OR Apache-2.0
 (see the end of this file).
 MSRV: Rust 1.83 for the library (the tests' dev-dependencies need a newer
 toolchain).
@@ -261,6 +261,23 @@ game.events().emit_with_id("round.won", json!({"round": 4}), "round-4-of-match-8
   succeed by retrying — an invalid or personal-data value, or
   `GameDataQuotaExceeded` — drops those entries and is kept in
   `last_error()`; set the key again once the cause is fixed.
+- **Markers for a live map** (protocol 06 §2.3): a `Markers` set that club
+  pages can draw on a "Game markers" layer.
+  ```rust
+  use gridspawn_server::{Marker, Markers};
+  let markers = Markers::new()
+      .push(Marker::new("flag-red", "Red flag", 120.5, -40.0).kind("objective"))
+      .push(Marker::new("p-17", "Ana", 98.0, 12.25));
+  live.set_markers("map.live", &markers)?;           // or game.data().set(key, markers.to_value()?)
+  ```
+  - **Coordinates:** `x`/`y` are in your game's own world units. Publish in
+    one stable coordinate space and say which in your docs; the club's
+    creator maps it with the layer's game area and a "Y points up" switch.
+  - **Ids** stay the same for a marker across updates. **Labels** are
+    public, so display names only.
+  - **Every update sends the whole set;** an empty set shows nothing.
+  - **Checked here:** at most 64 markers, finite coordinates, a `kind` of at
+    most 32 characters, and 4 KiB in all (about 60 bytes per marker).
 - **`list()` is for start-up and checks, not for polling** (10 per 10 s).
 - The `blocking` client has `game_data_set`, `game_data_remove`,
   `game_data_set_many`, `game_data_list` and `game_event_emit` (no background

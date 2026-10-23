@@ -105,6 +105,15 @@ gs_string_free(event_id);
 - `gs_game_event_emit` with `id` NULL generates the Idempotency-Key; pass
   your own (`[A-Za-z0-9_-]{8,64}`) for an event that may be sent again after
   a restart.
+- **Markers for a live map** (protocol 06 §2.3) are an ordinary document
+  with a reserved shape: send the whole set each update. At most 64
+  markers and 4 KiB in all. `x`/`y` are in your game's own world units; ids
+  stay stable; labels are public.
+  ```c
+  gs_game_data_publisher_set(live, "map.live",
+      "{\"markers\": [{\"id\": \"flag-red\", \"label\": \"Red flag\", \"x\": 120.5, \"y\": -40, \"kind\": \"objective\"},"
+      " {\"id\": \"p-17\", \"label\": \"Ana\", \"x\": 98, \"y\": 12.25}]}", 0, &error);
+  ```
 - `gs_game_data_list` returns the writer's listing as JSON (free it with
   `gs_string_free`). It is for start-up and checks, not for polling.
 - Errors: `GS_ERROR_CODE_GAME_DATA_*`. `gs_error_reason` is

@@ -679,3 +679,45 @@ async fn the_publisher_reports_keys_another_writer_owns() {
         "the write and its one resend"
     );
 }
+
+#[tokio::test]
+async fn the_publisher_sends_a_markers_set() {
+    let server = edge().await;
+    Mock::given(method("GET"))
+        .and(path(DATA))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"keys": [], "quota": quota()})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(DATA))
+        .respond_with(accept_all)
+        .mount(&server)
+        .await;
+    let client = client(&server).await;
+    let live = client.game().spawn_data_publisher(5);
+    let markers = gridspawn_server::Markers::new().push(
+        gridspawn_server::Marker::new("flag-red", "Red flag", 120.5, -40.0).kind("objective"),
+    );
+    live.set_markers("map.live", &markers).unwrap();
+    let too_many = (0..65).fold(gridspawn_server::Markers::new(), |set, i| {
+        set.push(gridspawn_server::Marker::new(
+            format!("m{i}"),
+            "P",
+            0.0,
+            0.0,
+        ))
+    });
+    assert!(
+        live.set_markers("map.live", &too_many).is_err(),
+        "checked at once"
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    drop(live);
+    let sent = bodies(&server, "PUT", DATA).await;
+    assert_eq!(
+        sent[0]["set"]["map.live"]["value"],
+        json!({"markers": [{"id": "flag-red", "label": "Red flag", "x": 120.5, "y": -40.0, "kind": "objective"}]})
+    );
+}

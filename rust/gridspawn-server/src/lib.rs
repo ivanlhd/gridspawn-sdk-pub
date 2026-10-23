@@ -59,7 +59,7 @@ pub use credential::Credential;
 pub use error::{ApiError, Error, ErrorCode, Service};
 pub use game_data::{
     DataAck, DataBatch, DataKey, DataListing, DataPublisher, DataQuota, EventReceipt, Game,
-    GameData, GameEvents, SkippedKey,
+    GameData, GameEvents, Marker, Markers, SkippedKey,
 };
 pub use presence::{ParticipantRef, Party, Presence, PresenceAck};
 pub use session::{
