@@ -48,7 +48,8 @@ PUT /v1/server/game-data
   "remove": [ { "key": "<key>", "seq": <int> }, … ]
 }
 ```
-- `set` and `remove` are both optional. Together they hold 1–40 entries.
+- `set` and `remove` are both optional. Together they hold 1–40 entries;
+  more is `400 data/invalid_value`, field `entries`, reason `count`.
 - The body is at most 32 KiB.
 - **All or nothing:** a validation error or a quota breach refuses the whole
   batch, and nothing is stored.
@@ -124,9 +125,12 @@ Idempotency-Key: <[A-Za-z0-9_-]{8,64}>
 ```
 - **`name`:** `^[a-z0-9][a-z0-9_.-]{0,47}$`.
 - **`payload`:** a JSON object, at most 4 KiB.
-- **`Idempotency-Key`:** a repeat with the same key within 24 h returns the
-  first answer, with `"duplicate": true`. Send one on every request, so that
-  retries are safe.
+- **`Idempotency-Key`:** **required**, `[A-Za-z0-9_-]{8,64}`.
+  - A missing header is `400 data/invalid_value`, field `Idempotency-Key`,
+    reason `missing`. Any other length or character gives reason
+    `idempotency_key`. The server never generates a key.
+  - A repeat with the same key within 24 h returns the first answer, with
+    `"duplicate": true`, so retries are safe.
 - **`id`:** the server's sequence per app and environment, as a string.
 - **Retention:** the last 100 events, none older than 7 days.
 
@@ -139,6 +143,7 @@ checked).
 |---|---|
 | document entries (`set` and `remove`, counted per entry) | 20/s (bursts of 40); per key 5/s (bursts of 10) |
 | events | 10/s |
+| the writer's listing (`GET`, §2.2) | 10 per 10 s. It is for start-up, not for polling |
 | live keys | 256 |
 | total value bytes | 256 KiB (262,144) |
 
@@ -165,7 +170,7 @@ Body: `{"ok": false, "error": {"code", "message", "field"?, "reason"?}, "request
 
 | HTTP | Code | When |
 |---|---|---|
-| 400 | `data/invalid_value` (`field`, `reason`: `key`, `name`, `json`, `depth`, `size`, `count`, `ttl`, `personal_data`) | Malformed or out of bounds. A single value over 4 KiB is `size` |
+| 400 | `data/invalid_value` (`field`, `reason`: `key`, `name`, `json`, `depth`, `size`, `count`, `ttl`, `seq`, `missing`, `idempotency_key`, `personal_data`) | Malformed or out of bounds. A single value over 4 KiB is `size`; more than 40 entries is `count`; a missing, negative, non-integer or too large `seq` is `seq`; a missing or malformed event `Idempotency-Key` is `missing` or `idempotency_key` |
 | 401 | `server/authentication_required` | Bad credential |
 | 403 | `server/scope_denied` | The key lacks `game_data.write` |
 | 403 | `data/browser_forbidden` | Any `Origin` |
