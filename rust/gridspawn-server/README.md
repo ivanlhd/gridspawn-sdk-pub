@@ -211,6 +211,51 @@ voice.mute(&guest.id, true).await?;                        // authoritative mute
   `voice_set_player_state`, `voice_mute` and `voice_publish_positions` (no
   background publisher there).
 
+## Show live game data on your club (planned, 0.4.0)
+
+**Not in this version.** The service and this API are under review
+(protocol `06-game-data.md`, Proposed). It is described here so the shape can
+be checked before it is built.
+
+Your server keeps named values current (player count, round, scoreboard,
+map markers) and sends events ("round won"). Your club shows them on its
+pages through the club layout editor. **No game session is needed:** the
+data belongs to your app and environment.
+
+```rust
+use serde_json::json;
+use std::time::Duration;
+
+let game = client.game();
+game.data().set("match.score", json!({"red": 3, "blue": 1})).await?;
+game.data().set_with_ttl("lobby.open", json!(true), Duration::from_secs(300)).await?;
+game.data().remove("lobby.open").await?;
+
+// Values that change every frame: the latest per key, one batch per tick.
+let live = game.spawn_data_publisher(4);     // 1–5 Hz
+live.set("match.clock", json!(812))?;        // cheap: every frame
+
+game.events().emit("match.ended", json!({"winner": "Red team"})).await?;
+```
+
+- **Public by nature.** Production game data appears on public club pages,
+  readable by anyone. **Publish display names only, never emails, account
+  ids or participant ids, and nothing private.** The service refuses email
+  shapes and Gridspawn id prefixes (`GameDataInvalidValue` with reason
+  `personal_data`, and the JSON path in `field`), but that check is a safety
+  net, not a filter to rely on.
+- **One writer per key.** Servers that run side by side (shards, regions)
+  write disjoint keys, for example `shard-eu.players`. On start-up the crate
+  reads your stored keys once, so a restarted server carries on where it
+  stopped. A key that another writer owns comes back in `DataAck::skipped`.
+- **Setup:** give the server key the `game_data.write` scope and switch game
+  data on for the app and environment, in the Dev Hub. What your club shows
+  is the club's choice; writing data changes no page by itself.
+- **Limits** (per app and environment): 20 entries a second (bursts of 40)
+  and 5 a second per key; up to 40 entries and 32 KiB per batch; 256 keys
+  and 256 KiB in total; values up to 4 KiB; 10 events a second. The
+  publisher stays within them by itself.
+
 ## Retries
 
 - Network errors, timeouts and HTTP 5xx are retried (`RetryPolicy`: 3
