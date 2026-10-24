@@ -13,6 +13,42 @@ use gridspawn_server::{
     VoiceRoom,
 };
 
+/// Counts the crate's `PUT /v1/server/game-data` attempts (its
+/// `gridspawn.request` spans) on this thread while installed.
+struct PutCounter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl tracing::Subscriber for PutCounter {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        struct Route(bool);
+        impl tracing::field::Visit for Route {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "route" && value == "PUT /v1/server/game-data" {
+                    self.0 = true;
+                }
+            }
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+        }
+        if span.metadata().name() == "gridspawn.request" {
+            let mut route = Route(false);
+            span.record(&mut route);
+            if route.0 {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
 fn env(names: &[&str]) -> Option<String> {
     names
         .iter()
@@ -393,8 +429,10 @@ async fn live_game_data() {
         first.id, first.duplicate, again.id, again.duplicate, generated.id, generated.duplicate
     );
 
-    // A refused entry does not hold back the others (an all-or-nothing edge:
-    // the SDK drops the named entry and sends the rest again).
+    // A refused entry does not hold back the others: one request on an edge
+    // with partial batches (protocol 06 §3.1).
+    let puts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counting = tracing::subscriber::set_default(PutCounter(puts.clone()));
     let ack = data
         .set_many(
             &gridspawn_server::DataBatch::new()
@@ -407,15 +445,18 @@ async fn live_game_data() {
         )
         .await
         .expect("a write with one refused entry");
+    drop(counting);
+    let requests = puts.load(std::sync::atomic::Ordering::SeqCst);
     let mut accepted = ack.accepted.clone();
     accepted.sort();
     assert_eq!(accepted, ["sdk-live.ok-a", "sdk-live.ok-b"], "{ack:?}");
     assert_eq!(ack.rejected.len(), 1, "{ack:?}");
     assert_eq!(ack.rejected[0].key, "sdk-live.private");
     eprintln!(
-        "partial: accepted {accepted:?}; rejected {} field {:?} reason {:?}",
+        "partial: accepted {accepted:?}; rejected {} field {:?} reason {:?}; {requests} PUT request(s)",
         ack.rejected[0].key, ack.rejected[0].field, ack.rejected[0].reason
     );
+    assert_eq!(requests, 1, "partial batches: one request, no rounds");
 
     // The publisher: per-key results, then a shutdown with pending removals.
     let summary = |result: &gridspawn_server::DataResult| match &result.outcome {

@@ -127,7 +127,9 @@ objectives or events.
   - `id` and `label` are text;
   - `x` and `y` are finite numbers;
   - `kind` is optional, at most 32 characters.
-  - Any other shape is an ordinary document.
+  - Any other shape is an ordinary document, and pages do not draw it as
+    markers: for example 65 markers, an `id` or `label` that is not text, or
+    a `kind` over 32 characters. Pages never draw part of a set.
   - The value limit of §2 still applies: 64 markers must fit in 4 KiB,
     about 60 bytes each. Keep ids and labels short.
 - **Coordinates:** `x` and `y` are in the game's own world units. There is
@@ -141,8 +143,9 @@ objectives or events.
   carry its own area: the "Game area" and "Y points up" are page settings.
   For several groups (teams, objectives), publish one key per group; the
   creator adds one layer for each.
-- **`id`:** stable for the same marker across updates. The page follows
-  markers by id from one update to the next.
+- **`id`:** stable for the same marker across updates. Updates replace the
+  set; a marker keeps its identity by `id` but is redrawn at its new
+  position — pages do not animate between positions.
 - **`label`:** public, like all game data (§6). Display names only, never
   account ids or emails.
 - **A live picture:**
@@ -150,8 +153,9 @@ objectives or events.
     second; the reference publisher sends 1–5 per second.
   - When nothing should show, remove the document or send an empty list.
   - A removed or expired document draws nothing.
-- **`kind`:** free text, for example `objective`, `ally`, `enemy`. Club pages
-  may style markers by kind later; for now each layer draws one style.
+- **`kind`:** free text, for example `objective`, `ally`, `enemy`. Pages
+  style markers per `kind` (a shape and a colour per kind); a kind without a
+  style is drawn with the layer's default style.
 - **Status:** storing and reading markers is live. Drawing them on club pages
   comes with the next Gridspawn app release.
 
