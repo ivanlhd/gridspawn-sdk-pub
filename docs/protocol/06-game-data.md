@@ -68,8 +68,8 @@ PUT /v1/server/game-data
   more is `400 data/invalid_value`, field `entries`, reason `count`.
 - The body is at most 32 KiB.
 - **All or nothing:** a validation error or a quota breach refuses the whole
-  batch, and nothing is stored. Partial mode (§3.1, Proposed) will let a
-  writer keep the valid entries.
+  batch, and nothing is stored. With partial batches (§3.1) a writer keeps
+  the valid entries.
 
 Answer:
 
@@ -179,35 +179,21 @@ objectives or events.
 - **No clock is involved.** Server times in answers are for information
   only.
 
-### 3.1 Per-entry results (partial mode) — Proposed
+### 3.1 Partial batches (opt-in) — Current
 
-Not deployed yet. A writer may send this header with a write:
-
-```
-Gridspawn-Partial: 1
-```
-
-An edge with partial mode applies the valid entries and reports the others:
-
-```json
-{
-  "ok": true,
-  "accepted": 2,
-  "skipped":  [{ "key": "match.round", "storedSeq": 57 }],
-  "rejected": [{ "key": "scoreboard", "field": "set.scoreboard.value.players[3].name",
-                 "reason": "personal_data" }],
-  "quota": { "keys": 12, "maxKeys": 256, "bytes": 20480, "maxBytes": 262144 },
-  "requestId": "…"
-}
-```
-- **Shape:** `accepted` is a count. `skipped` gives the stored sequence
-  number as `storedSeq` (§3). `rejected` names each refused entry with its
-  JSON path and reason (§7).
-- **Every entry refused:** `400 data/invalid_value` with the same
-  `rejected` array.
-- **Batch-level failures:** 429 and 409 still refuse the whole batch.
-- **Without partial mode:** an edge ignores the header and answers as in
-  §2.1. A writer that sends the header reads both answers.
+A `PUT /v1/server/game-data` request with the header `Gridspawn-Partial: 1`
+is checked entry by entry. Problems with the request as a whole (malformed
+JSON, body over the size limit, unknown top-level fields, 0 or more than 40
+entries, authentication) still refuse it with 400/401; rate limits (429 with
+`Retry-After`) and the quota (409) also still apply to the whole batch, rate
+limits counting only the valid entries. Otherwise the valid entries are
+stored and the answer is `200 {ok: true, accepted: <count>, skipped: [{key,
+storedSeq}], rejected: [{key, field, reason}], quota, requestId}`, where
+`reason` uses the usual vocabulary (`key`, `personal_data`, `seq`, `ttl`,
+`json`, `depth`, `size`, `count`). If every entry is refused nothing is
+stored and the answer is 400 with the usual error (the first refusal) and
+the same `rejected` array. Without the header a batch remains all-or-nothing
+and the responses are unchanged.
 
 ## 4. Events — Current
 
@@ -285,8 +271,8 @@ cover this document:
   `list`.
   - A refused entry does not hold back the others: it is listed in
     `DataAck::rejected`.
-  - Writes send `Gridspawn-Partial: 1` (§3.1) and read both answers. From
-    an all-or-nothing edge, the SDK drops the entry that `field` names and
+  - Writes send `Gridspawn-Partial: 1` (§3.1; the SDK edge supports it
+    since 2026-10-24) and read both answers. From an all-or-nothing edge, the SDK drops the entry that `field` names and
     sends the rest again with the same numbers, at most once per refused
     entry.
 - `Markers` / `Marker` build a §2.3 markers document with its limits
