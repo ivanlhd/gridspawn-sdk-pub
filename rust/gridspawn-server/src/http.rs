@@ -35,6 +35,8 @@ pub(crate) struct Call<'a> {
     pub auth: Auth<'a>,
     pub body: Option<&'a Value>,
     pub idempotency_key: Option<&'a str>,
+    /// Further request headers (fixed names and values, never secrets).
+    pub headers: &'a [(&'static str, &'static str)],
     /// Retry network errors, timeouts and 5xx per the policy.
     pub retry: bool,
 }
@@ -112,6 +114,9 @@ impl Http {
         if let Some(key) = call.idempotency_key {
             request = request.header("Idempotency-Key", key);
         }
+        for (name, value) in call.headers {
+            request = request.header(*name, *value);
+        }
         if let Some(body) = call.body {
             let bytes = serde_json::to_vec(body).map_err(|_| Error::InvalidInput {
                 field: "body",
@@ -161,7 +166,7 @@ fn api_error(
     header_request_id: Option<String>,
 ) -> ApiError {
     let text = |value: Option<&Value>| value.and_then(Value::as_str).map(str::to_owned);
-    let (code, message, field, reason, body_request_id) =
+    let (code, message, field, reason, body_request_id, rejected) =
         match serde_json::from_slice::<Value>(body) {
             Ok(Value::Object(map)) => {
                 let (code, message, field, reason) = match map.get("error") {
@@ -174,9 +179,22 @@ fn api_error(
                     Some(Value::String(code)) => (Some(code.clone()), None, None, None),
                     _ => (text(map.get("code")), None, None, None),
                 };
-                (code, message, field, reason, text(map.get("requestId")))
+                // Game data in partial mode: the refused entries.
+                let rejected = map
+                    .get("rejected")
+                    .filter(|value| value.is_array())
+                    .cloned()
+                    .map(Arc::new);
+                (
+                    code,
+                    message,
+                    field,
+                    reason,
+                    text(map.get("requestId")),
+                    rejected,
+                )
             }
-            _ => (None, None, None, None, None),
+            _ => (None, None, None, None, None, None),
         };
     let wire_code = code.unwrap_or_else(|| {
         if status == StatusCode::TOO_MANY_REQUESTS {
@@ -199,5 +217,6 @@ fn api_error(
             .map(Duration::from_secs),
         field,
         reason,
+        rejected,
     }
 }

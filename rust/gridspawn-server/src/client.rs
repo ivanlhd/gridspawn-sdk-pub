@@ -80,6 +80,7 @@ impl ClientBuilder {
                 auth: Auth::None,
                 body: None,
                 idempotency_key: None,
+                headers: &[],
                 retry: true,
             })
             .await?;
@@ -232,6 +233,22 @@ impl Client {
         idempotency_key: Option<&IdempotencyKey>,
         retry: bool,
     ) -> (Result<T, Error>, u32) {
+        self.edge_call(method, route, path, body, idempotency_key, &[], retry)
+            .await
+    }
+
+    /// As `edge_send_counted`, with further request headers.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn edge_call<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        route: &'static str,
+        path: &str,
+        body: Option<&Value>,
+        idempotency_key: Option<&IdempotencyKey>,
+        headers: &[(&'static str, &'static str)],
+        retry: bool,
+    ) -> (Result<T, Error>, u32) {
         self.inner
             .http
             .send_counted(Call {
@@ -242,6 +259,7 @@ impl Client {
                 auth: Auth::Server(&self.inner.credential),
                 body,
                 idempotency_key: idempotency_key.map(IdempotencyKey::as_str),
+                headers,
                 retry,
             })
             .await

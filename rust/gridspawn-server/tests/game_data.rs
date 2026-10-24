@@ -1,7 +1,8 @@
 //! Game data against a stand-in edge: start-up seeding from the listing,
 //! sequence numbers, skipped entries and the one resend, retries, events
-//! with their Idempotency-Key, typed errors, local checks and the publisher.
-//! No network.
+//! with their Idempotency-Key, typed errors, local checks, the publishers
+//! (per-key results, flush and shutdown, keep-alive, the quota split) and both
+//! write answer shapes (all or nothing, and partial). No network.
 
 use std::{
     sync::{
@@ -11,7 +12,9 @@ use std::{
     time::Duration,
 };
 
-use gridspawn_server::{Client, Credential, DataBatch, Environment, Error, ErrorCode, RetryPolicy};
+use gridspawn_server::{
+    Client, Credential, DataBatch, DataOutcome, Environment, Error, ErrorCode, RetryPolicy,
+};
 use serde_json::{json, Value};
 use url::Url;
 use wiremock::{
@@ -720,4 +723,435 @@ async fn the_publisher_sends_a_markers_set() {
         sent[0]["set"]["map.live"]["value"],
         json!({"markers": [{"id": "flag-red", "label": "Red flag", "x": 120.5, "y": -40.0, "kind": "objective"}]})
     );
+}
+
+// ---- 0.5.0: per-entry outcomes, flush/shutdown, keep-alive, events -------
+
+async fn empty_listing(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path(DATA))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"keys": [], "quota": quota()})),
+        )
+        .mount(server)
+        .await;
+}
+
+/// Today's all-or-nothing edge: refuses the first entry whose key starts
+/// with "bad" (personal data in its value), otherwise accepts everything.
+fn all_or_nothing(request: &Request) -> ResponseTemplate {
+    let body: Value = serde_json::from_slice(&request.body).unwrap();
+    if let Some(set) = body["set"].as_object() {
+        if let Some(key) = set.keys().find(|k| k.starts_with("bad")) {
+            return refused(
+                400,
+                "data/invalid_value",
+                Some(&format!("set.{key}.value.name")),
+                Some("personal_data"),
+            );
+        }
+    }
+    accept_all(request)
+}
+
+fn set_keys(body: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = body["set"]
+        .as_object()
+        .map(|set| set.keys().cloned().collect())
+        .unwrap_or_default();
+    keys.sort();
+    keys
+}
+
+#[tokio::test]
+async fn a_refused_entry_no_longer_holds_back_the_others_on_an_all_or_nothing_edge() {
+    let server = edge().await;
+    empty_listing(&server).await;
+    Mock::given(method("PUT"))
+        .and(path(DATA))
+        .respond_with(all_or_nothing)
+        .mount(&server)
+        .await;
+    let client = client(&server).await;
+    let data = client.game().data();
+    let ack = data
+        .set_many(
+            &DataBatch::new()
+                .set("score", json!(1))
+                .set("bad.board", json!({"name": "a@b.c"}))
+                .set("round", json!(4))
+                .remove("old"),
+        )
+        .await
+        .unwrap();
+    let mut accepted = ack.accepted.clone();
+    accepted.sort();
+    assert_eq!(accepted, ["old", "round", "score"]);
+    assert_eq!(ack.rejected.len(), 1);
+    assert_eq!(ack.rejected[0].key, "bad.board");
+    assert_eq!(
+        ack.rejected[0].field.as_deref(),
+        Some("set.bad.board.value.name")
+    );
+    assert_eq!(ack.rejected[0].reason.as_deref(), Some("personal_data"));
+    let sent = bodies(&server, "PUT", DATA).await;
+    assert_eq!(sent.len(), 2, "one round per refused entry");
+    assert_eq!(set_keys(&sent[1]), ["round", "score"]);
+    assert_eq!(
+        sent[0]["set"]["score"]["seq"], sent[1]["set"]["score"]["seq"],
+        "nothing was stored: the same numbers again"
+    );
+    for request in requests(&server, "PUT", DATA).await {
+        assert_eq!(request.headers.get("gridspawn-partial").unwrap(), "1");
+    }
+
+    // Several refused entries: one round each, the good ones still land.
+    let mut batch = DataBatch::new().set("good.a", json!(1));
+    for i in 0..4 {
+        batch = batch.set(format!("bad{i}"), json!({"name": "x"}));
+    }
+    let ack = data.set_many(&batch.set("good.b", json!(2))).await.unwrap();
+    let mut accepted = ack.accepted.clone();
+    accepted.sort();
+    assert_eq!(accepted, ["good.a", "good.b"]);
+    assert_eq!(ack.rejected.len(), 4);
+    assert_eq!(bodies(&server, "PUT", DATA).await.len(), 2 + 5);
+
+    // Every entry refused: the first refusal is the error.
+    let error = api(data
+        .set("bad.only", json!({"name": "x"}))
+        .await
+        .unwrap_err());
+    assert!(error.is_personal_data());
+    assert_eq!(error.field.as_deref(), Some("set.bad.only.value.name"));
+}
+
+#[tokio::test]
+async fn partial_answers_are_read_entry_by_entry() {
+    let server = edge().await;
+    empty_listing(&server).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    Mock::given(method("PUT"))
+        .and(path(DATA))
+        .respond_with(move |request: &Request| {
+            assert_eq!(request.headers.get("gridspawn-partial").unwrap(), "1");
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            match counter.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    assert_eq!(set_keys(&body), ["mine", "score", "secret"]);
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "ok": true, "accepted": 1,
+                        "skipped": [{"key": "mine", "storedSeq": 1000}],
+                        "rejected": [{"key": "secret", "field": "set.secret.value", "reason": "personal_data"}],
+                        "quota": quota(), "requestId": "req-p"
+                    }))
+                }
+                1 => {
+                    // The resend above the stored 1000.
+                    assert_eq!(set_keys(&body), ["mine"]);
+                    assert!(body["set"]["mine"]["seq"].as_u64().unwrap() > 1000);
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "ok": true, "accepted": 1, "skipped": [], "rejected": [],
+                        "quota": quota(), "requestId": "req-q"
+                    }))
+                }
+                _ => ResponseTemplate::new(400).set_body_json(json!({
+                    "ok": false,
+                    "error": {"code": "data/invalid_value", "message": "m",
+                              "field": "set.a.value", "reason": "size"},
+                    "rejected": [
+                        {"key": "a", "field": "set.a.value", "reason": "size"},
+                        {"key": "b", "field": "set.b.value", "reason": "depth"}
+                    ],
+                    "requestId": "req-r"
+                })),
+            }
+        })
+        .mount(&server)
+        .await;
+    let client = client(&server).await;
+    let data = client.game().data();
+    let ack = data
+        .set_many(
+            &DataBatch::new()
+                .set("score", json!(3))
+                .set("secret", json!("x"))
+                .set("mine", json!(1)),
+        )
+        .await
+        .unwrap();
+    let mut accepted = ack.accepted.clone();
+    accepted.sort();
+    assert_eq!(accepted, ["mine", "score"]);
+    assert_eq!(ack.rejected.len(), 1);
+    assert_eq!(
+        (
+            ack.rejected[0].key.as_str(),
+            ack.rejected[0].reason.as_deref()
+        ),
+        ("secret", Some("personal_data"))
+    );
+    assert!(ack.skipped.is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    // Every entry refused: 400 with `rejected`, one request, the first is the error.
+    let error = api(data
+        .set_many(&DataBatch::new().set("a", json!(1)).set("b", json!(2)))
+        .await
+        .unwrap_err());
+    assert_eq!(error.code, ErrorCode::GameDataInvalidValue);
+    assert_eq!(error.field.as_deref(), Some("set.a.value"));
+    assert_eq!(error.reason.as_deref(), Some("size"));
+    assert_eq!(calls.load(Ordering::SeqCst), 3, "no rounds in partial mode");
+}
+
+#[tokio::test]
+async fn the_publisher_reports_each_key_and_starts_from_the_listing() {
+    let server = edge().await;
+    listing(&server).await;
+    Mock::given(method("PUT"))
+        .and(path(DATA))
+        .respond_with(all_or_nothing)
+        .mount(&server)
+        .await;
+    let client = client(&server).await;
+    let live = client.game().spawn_data_publisher(5);
+    live.set("score", json!(1)).unwrap();
+    live.set("bad.name", json!({"name": "x"})).unwrap();
+    live.remove("lobby.open");
+    live.flush(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(live.seq_base(), Some(57), "the tombstone's 57");
+    assert_eq!(client.game().data().seq_base(), Some(57));
+    let results = live.results();
+    assert_eq!(results.len(), 3, "{results:?}");
+    let find = |key: &str| {
+        results
+            .iter()
+            .find(|r| r.key == key)
+            .unwrap_or_else(|| panic!("{key}: {results:?}"))
+    };
+    assert!(
+        matches!(find("score").outcome, DataOutcome::Stored { seq } if seq > 57),
+        "{results:?}"
+    );
+    assert!(matches!(
+        find("lobby.open").outcome,
+        DataOutcome::Removed { .. }
+    ));
+    match &find("bad.name").outcome {
+        DataOutcome::Refused(error) => assert!(error.api().unwrap().is_personal_data()),
+        other => panic!("{other:?}"),
+    }
+    assert!(live.results().is_empty(), "drained");
+    assert_eq!(live.dropped_results(), 0);
+    let error = live.last_error().expect("the refusal is the last error");
+    assert!(error.api().unwrap().is_personal_data());
+    // The next clean batch clears it.
+    live.set("score", json!(2)).unwrap();
+    live.flush(Duration::from_secs(5)).await.unwrap();
+    assert!(live.last_error().is_none());
+}
+
+#[tokio::test]
+async fn shutdown_sends_pending_removals_and_flush_reports_what_is_left() {
+    let server = edge().await;
+    empty_listing(&server).await;
+    Mock::given(method("PUT"))
+        .and(path(DATA))
+        .respond_with(accept_all)
+        .mount(&server)
+        .await;
+    let client = client(&server).await;
+    let live = client.game().spawn_data_publisher(1);
+    live.set("match.score", json!(1)).unwrap();
+    live.remove("lobby.banner");
+    live.shutdown(Duration::from_secs(5)).await.unwrap();
+    let sent = bodies(&server, "PUT", DATA).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["remove"][0]["key"], "lobby.banner");
+
+    // A slow edge: the flush times out and names the key; it is sent later.
+    server.reset().await;
+    empty_listing(&server).await;
+    Mock::given(method("PUT"))
+        .and(path(DATA))
+        .respond_with(|request: &Request| accept_all(request).set_delay(Duration::from_millis(800)))
+        .mount(&server)
+        .await;
+    let live = client.game().spawn_data_publisher(5);
+    live.set("slow", json!(1)).unwrap();
+    let unsent = live.flush(Duration::from_millis(300)).await.unwrap_err();
+    assert_eq!(unsent.pending, ["slow"]);
+    live.flush(Duration::from_secs(5)).await.unwrap();
+    assert!(matches!(
+        live.results()[0].outcome,
+        DataOutcome::Stored { .. }
+    ));
+}
+
+#[tokio::test]
+async fn over_quota_the_removals_go_again_alone_and_the_sets_are_refused() {
+    let server = edge().await;
+    empty_listing(&server).await;
+    Mock::given(method("PUT"))
+        .and(path(DATA))
+        .respond_with(|request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            if body.get("set").is_some() {
+                refused(409, "data/quota_exceeded", Some("keys"), None)
+            } else {
+                accept_all(request)
+            }
+        })
+        .mount(&server)
+        .await;
+    let client = client(&server).await;
+    let live = client.game().spawn_data_publisher(5);
+    live.set("new.key", json!(1)).unwrap();
+    live.remove("old.key");
+    live.flush(Duration::from_secs(5)).await.unwrap();
+    let results = live.results();
+    assert_eq!(results.len(), 2, "{results:?}");
+    for result in &results {
+        match (result.key.as_str(), &result.outcome) {
+            ("old.key", DataOutcome::Removed { .. }) => {}
+            ("new.key", DataOutcome::Refused(error)) => {
+                assert_eq!(error.api().unwrap().code, ErrorCode::GameDataQuotaExceeded)
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    let sent = bodies(&server, "PUT", DATA).await;
+    assert_eq!(sent.len(), 2);
+    assert!(sent[1].get("set").is_none(), "{}", sent[1]);
+}
+
+#[tokio::test]
+async fn keep_alive_needs_a_ttl() {
+    let server = edge().await;
+    let client = client(&server).await;
+    let live = client.game().spawn_data_publisher(5);
+    assert!(live.keep_alive("never.set").is_err());
+    live.set("plain", json!(1)).unwrap();
+    assert!(live.keep_alive("plain").is_err());
+    match live.keep_alive("plain") {
+        Err(Error::InvalidInput { field, .. }) => assert_eq!(field, "ttl"),
+        other => panic!("{other:?}"),
+    }
+    live.set_with_ttl("lobby", json!(1), Duration::from_secs(10))
+        .unwrap();
+    live.keep_alive("lobby").unwrap();
+    live.stop_keep_alive("lobby");
+    live.stop();
+}
+
+#[tokio::test]
+async fn the_event_publisher_keeps_order_and_retries_with_the_same_key() {
+    let server = edge().await;
+    // The first event is rate limited once; a refused one does not block the next.
+    Mock::given(method("POST"))
+        .and(path(EVENTS))
+        .respond_with(
+            refused(429, "data/rate_limited", None, None).insert_header("Retry-After", "1"),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(EVENTS))
+        .respond_with(|request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            if body["name"] == "bad" {
+                refused(
+                    400,
+                    "data/invalid_value",
+                    Some("payload"),
+                    Some("personal_data"),
+                )
+            } else {
+                ResponseTemplate::new(201)
+                    .set_body_json(json!({"ok": true, "id": "9", "duplicate": false}))
+            }
+        })
+        .mount(&server)
+        .await;
+    let client = client(&server).await;
+    let events = client.game().spawn_event_publisher();
+    let first = events.emit("round.won", json!({"round": 1})).unwrap();
+    let bad = events.emit("bad", json!({"x": 1})).unwrap();
+    let mine = events
+        .emit_with_id("match.ended", json!({}), "match-81-ended")
+        .unwrap();
+    assert_eq!(mine, "match-81-ended");
+    assert!(
+        events.emit("Bad Name", json!({})).is_err(),
+        "checked at once"
+    );
+    assert!(events.emit("ok", json!([1])).is_err());
+    assert!(events.emit_with_id("ok", json!({}), "short").is_err());
+    let error = events.last_error();
+    assert!(error.is_none() || error.unwrap().is_retryable());
+    events.shutdown(Duration::from_secs(10)).await.unwrap();
+
+    let keys: Vec<String> = requests(&server, "POST", EVENTS)
+        .await
+        .iter()
+        .map(|r| {
+            r.headers
+                .get("idempotency-key")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        [first.clone(), first, bad, mine],
+        "in order; the retry keeps its key"
+    );
+}
+
+#[tokio::test]
+async fn the_event_publisher_reports_each_event() {
+    let server = edge().await;
+    Mock::given(method("POST"))
+        .and(path(EVENTS))
+        .respond_with(|request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            if body["name"] == "bad" {
+                refused(
+                    400,
+                    "data/invalid_value",
+                    Some("payload"),
+                    Some("personal_data"),
+                )
+            } else {
+                ResponseTemplate::new(201)
+                    .set_body_json(json!({"ok": true, "id": "7", "duplicate": false}))
+            }
+        })
+        .mount(&server)
+        .await;
+    let client = client(&server).await;
+    let events = client.game().spawn_event_publisher();
+    let good = events.emit("round.won", json!({})).unwrap();
+    let bad = events.emit("bad", json!({})).unwrap();
+    events.flush(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(events.queued(), 0);
+    let results = events.results();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].id, good);
+    assert_eq!(results[0].outcome.as_ref().unwrap().id, "7");
+    assert_eq!(results[1].id, bad);
+    assert!(results[1]
+        .outcome
+        .as_ref()
+        .unwrap_err()
+        .api()
+        .unwrap()
+        .is_personal_data());
+    assert!(events.last_error().is_some());
 }

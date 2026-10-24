@@ -17,7 +17,7 @@
 //! that is skipped too, another writer owns the key ([`DataAck::skipped`]).
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
@@ -25,7 +25,10 @@ use std::{
 use reqwest::Method;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use tokio::sync::OnceCell;
+use tokio::{
+    sync::{watch, Notify, OnceCell},
+    time::Instant,
+};
 
 use crate::{
     client::Client,
@@ -44,6 +47,22 @@ const MIN_TTL: u64 = 10;
 const MAX_TTL: u64 = 86_400;
 /// Entries a second the service allows per application and environment.
 const ENTRIES_PER_SECOND: u32 = 20;
+/// Asks for per-entry results (protocol 06 §3). An edge without partial mode
+/// ignores it and answers all or nothing.
+const PARTIAL: (&str, &str) = ("Gridspawn-Partial", "1");
+/// Results a publisher keeps for [`DataPublisher::results`] and
+/// [`EventPublisher::results`]; older ones are dropped.
+const RESULTS_KEPT: usize = 256;
+/// Keep-alive needs a TTL of at least this; it refreshes at TTL/2.
+const KEEP_ALIVE_MIN_TTL: u64 = 10;
+/// Never refresh a key more often than this (a tenth of its rate limit).
+const KEEP_ALIVE_FLOOR: u64 = 5;
+const EVENT_QUEUE: usize = 1000;
+/// Events a second the service allows per application and environment.
+const EVENTS_PER_SECOND: u64 = 10;
+const EVENT_MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// The wait after a failed listing at a publisher's start.
+const SEED_RETRY: Duration = Duration::from_secs(5);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -120,6 +139,41 @@ fn check_value(value: &Value) -> Result<(), Error> {
     Ok(())
 }
 
+fn check_event(name: &str, payload: &Value) -> Result<(), Error> {
+    if !valid_event_name(name) {
+        return Err(invalid(
+            "event name",
+            "1-48 characters of a-z 0-9 _ . - starting with a letter or digit",
+        ));
+    }
+    if !payload.is_object() {
+        return Err(invalid("event payload", "a JSON object"));
+    }
+    let size = serde_json::to_vec(payload)
+        .map_err(|_| invalid("event payload", "could not be encoded as JSON"))?
+        .len();
+    if size > MAX_PAYLOAD {
+        return Err(invalid("event payload", "at most 4 KiB as JSON"));
+    }
+    Ok(())
+}
+
+fn check_event_id(id: &str) -> Result<(), Error> {
+    if valid_event_id(id) {
+        Ok(())
+    } else {
+        Err(invalid("event id", "8-64 characters of A-Z a-z 0-9 _ -"))
+    }
+}
+
+/// How long to wait before retrying after a 429 (its `Retry-After`, or 1 s).
+fn rate_limit_wait(error: &Error) -> Option<Duration> {
+    error.api().and_then(|api| {
+        (api.code == ErrorCode::RateLimited)
+            .then(|| api.retry_after.unwrap_or(Duration::from_secs(1)))
+    })
+}
+
 fn ttl_seconds(ttl: Duration) -> Result<u64, Error> {
     let seconds = ttl.as_secs();
     if ttl.subsec_nanos() != 0 || !(MIN_TTL..=MAX_TTL).contains(&seconds) {
@@ -168,8 +222,8 @@ enum Entry {
     Remove,
 }
 
-/// Several documents set or removed in one all-or-nothing request (1–40
-/// entries). A key listed twice keeps its last entry.
+/// Several documents set or removed in one request (1–40 entries; see
+/// [`GameData::set_many`]). A key listed twice keeps its last entry.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DataBatch {
     entries: Vec<(String, Entry)>,
@@ -257,6 +311,17 @@ pub struct SkippedKey {
     pub seq: u64,
 }
 
+/// An entry the service refused while the rest of the write went on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RejectedKey {
+    pub key: String,
+    /// The JSON path, for example `set.scoreboard.value.players[3].name`.
+    pub field: Option<String>,
+    /// For example `personal_data`, `size` or `depth` (protocol 06 §7).
+    pub reason: Option<String>,
+}
+
 /// The answer to a write.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -266,6 +331,10 @@ pub struct DataAck {
     /// Keys still skipped after one resend above their stored sequence
     /// number: another writer owns them. Empty when every key is yours.
     pub skipped: Vec<SkippedKey>,
+    /// Entries refused one by one (an invalid or personal-data value) while
+    /// the others were stored. When every entry is refused, the write fails
+    /// with the first refusal instead.
+    pub rejected: Vec<RejectedKey>,
     pub quota: DataQuota,
 }
 
@@ -304,13 +373,49 @@ pub struct EventReceipt {
     pub duplicate: bool,
 }
 
+/// `accepted`: the keys (all-or-nothing answer) or their number (partial
+/// answer).
 #[derive(Deserialize)]
+#[serde(untagged)]
+enum WireAccepted {
+    Keys(Vec<String>),
+    Count(u64),
+}
+
+/// `{key, seq}` (all-or-nothing answer) or `{key, storedSeq}` (partial).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireSkipped {
+    key: String,
+    #[serde(default)]
+    seq: Option<u64>,
+    #[serde(default)]
+    stored_seq: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct WireRejected {
+    key: String,
+    #[serde(default)]
+    field: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Both answer shapes of a write: today's all-or-nothing one and the partial
+/// one (`Gridspawn-Partial: 1`).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct WriteResponse {
     ok: bool,
-    accepted: Vec<String>,
+    accepted: WireAccepted,
     #[serde(default)]
-    skipped: Vec<SkippedKey>,
+    skipped: Vec<WireSkipped>,
+    #[serde(default)]
+    rejected: Vec<WireRejected>,
     quota: DataQuota,
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -339,10 +444,10 @@ struct EventResponse {
 }
 
 /// The writer's state, shared by every [`Game`] of a [`Client`]: the
-/// sequence counter, seeded once from the listing.
+/// sequence counter, seeded once from the listing (the highest listed `seq`).
 #[derive(Debug, Default)]
 pub(crate) struct GameShared {
-    seeded: OnceCell<()>,
+    seeded: OnceCell<u64>,
     last_seq: Mutex<u64>,
 }
 
@@ -397,9 +502,18 @@ impl Game {
 
     /// Sends the latest value of every key given to [`DataPublisher::set`],
     /// `hz` times a second (clamped to 1–5), on the current tokio runtime.
-    /// Stops when the handle is dropped.
+    /// It reads the listing once at start to seed the sequence counter
+    /// ([`DataPublisher::seq_base`]). Use [`DataPublisher::shutdown`] to send
+    /// what is pending before stopping; dropping it stops at once.
     pub fn spawn_data_publisher(&self, hz: u32) -> DataPublisher {
         DataPublisher::spawn(self.data(), hz)
+    }
+
+    /// Queues events and sends them in order on the current tokio runtime,
+    /// at most 10 a second, retrying network errors, 5xx and 429 with the
+    /// same `Idempotency-Key`.
+    pub fn spawn_event_publisher(&self) -> EventPublisher {
+        EventPublisher::spawn(self.events())
     }
 
     fn shared(&self) -> &GameShared {
@@ -407,19 +521,19 @@ impl Game {
     }
 
     /// Seeds the counter from the listing once (single-flight; a failure
-    /// leaves it unseeded, and the next write tries again).
-    async fn seed(&self) -> Result<(), Error> {
+    /// leaves it unseeded, and the next write tries again). The base is the
+    /// highest listed `seq`, tombstones included (0 when none).
+    async fn seed(&self) -> Result<u64, Error> {
         self.shared()
             .seeded
             .get_or_try_init(|| async {
                 let listing = self.data().list().await?;
-                if let Some(max) = listing.keys.iter().map(|k| k.seq).max() {
-                    self.shared().raise_to(max);
-                }
-                Ok::<(), Error>(())
+                let base = listing.keys.iter().map(|k| k.seq).max().unwrap_or(0);
+                self.shared().raise_to(base);
+                Ok::<u64, Error>(base)
             })
             .await
-            .map(|_| ())
+            .copied()
     }
 }
 
@@ -453,63 +567,251 @@ impl GameData {
         self.set_many(&DataBatch::new().remove(key)).await
     }
 
-    /// One all-or-nothing request of 1–40 entries. Each entry gets the next
-    /// sequence number; entries the service skips are sent once more above
-    /// their stored number (see [`DataAck::skipped`]).
+    /// One request of 1–40 entries. Each entry gets the next sequence number;
+    /// entries the service skips are sent once more above their stored
+    /// number (see [`DataAck::skipped`]).
+    ///
+    /// An entry the service refuses (an invalid or personal-data value) does
+    /// not hold back the others: they are stored and the refused one is in
+    /// [`DataAck::rejected`]. The crate asks for per-entry results
+    /// (`Gridspawn-Partial: 1`); from an edge that answers all or nothing it
+    /// drops the entry the refusal names and sends the rest again, at most
+    /// once per entry. When every entry is refused, the first refusal is the
+    /// error. Rate limits, the quota and other failures refuse the whole
+    /// write.
     pub async fn set_many(&self, batch: &DataBatch) -> Result<DataAck, Error> {
         batch.validate()?;
-        self.game.seed().await?;
+        let outcome = self.send_entries(batch.entries.clone()).await;
+        if let Some((error, _)) = outcome.failed {
+            return Err(error);
+        }
+        if outcome.stored.is_empty() && outcome.owned.is_empty() {
+            if let Some((_, error)) = outcome.rejected.into_iter().next() {
+                return Err(error);
+            }
+            return Err(Error::InvalidResponse("invalid game data answer"));
+        }
+        Ok(DataAck {
+            accepted: outcome.stored.into_iter().map(|s| s.key).collect(),
+            skipped: outcome.owned,
+            rejected: outcome.rejected.into_iter().map(|(key, _)| key).collect(),
+            quota: outcome.quota.unwrap_or_default(),
+        })
+    }
+
+    /// The highest `seq` the listing showed when the writer started (0 when
+    /// it listed none): every entry is numbered above it. `None` until the
+    /// first write or the first [`DataPublisher`] tick reads the listing.
+    pub fn seq_base(&self) -> Option<u64> {
+        self.game.shared().seeded.get().copied()
+    }
+
+    /// Numbers the entries, writes them (dropping refused ones) and resends
+    /// the skipped ones once. Never fails as a whole: see [`Outcome`].
+    async fn send_entries(&self, entries: Vec<(String, Entry)>) -> Outcome {
+        let mut outcome = Outcome::default();
+        if let Err(error) = self.game.seed().await {
+            outcome.failed = Some((error, entries.into_iter().map(|(k, _)| k).collect()));
+            return outcome;
+        }
         let shared = self.game.shared();
-        let mut sent = Vec::with_capacity(batch.entries.len());
-        for (key, entry) in &batch.entries {
-            sent.push((key.clone(), entry.clone(), shared.next_seq()?));
-        }
-        let first = self.write(&sent).await?;
-        let mut ack = DataAck {
-            accepted: first.accepted,
-            skipped: Vec::new(),
-            quota: first.quota,
-        };
-        // Skipped with our own number: an earlier attempt of this request
-        // landed (a retry). Otherwise the stored number is higher: resend
-        // once above it.
-        let mut resend = Vec::new();
-        for skipped in first.skipped {
-            let Some((key, entry, seq)) = sent.iter().find(|(k, ..)| *k == skipped.key) else {
-                continue;
-            };
-            if skipped.seq == *seq {
-                ack.accepted.push(skipped.key);
-            } else {
-                shared.raise_to(skipped.seq);
-                resend.push((key.clone(), entry.clone()));
-            }
-        }
-        if !resend.is_empty() {
-            let mut again = Vec::with_capacity(resend.len());
-            for (key, entry) in resend {
-                again.push((key, entry, shared.next_seq()?));
-            }
-            let second = self.write(&again).await?;
-            ack.accepted.extend(second.accepted);
-            ack.quota = second.quota;
-            for skipped in second.skipped {
-                let own = again
-                    .iter()
-                    .any(|(k, _, seq)| *k == skipped.key && *seq == skipped.seq);
-                if own {
-                    ack.accepted.push(skipped.key);
-                } else {
-                    shared.raise_to(skipped.seq);
-                    tracing::warn!(
-                        key = %skipped.key,
-                        "gridspawn game data key is owned by another writer (one writer per key)"
-                    );
-                    ack.skipped.push(skipped);
+        let mut sent = Vec::with_capacity(entries.len());
+        for (key, entry) in entries {
+            match shared.next_seq() {
+                Ok(seq) => sent.push(Sent { key, entry, seq }),
+                Err(error) => {
+                    let mut keys: Vec<String> = sent.into_iter().map(|s| s.key).collect();
+                    keys.push(key);
+                    outcome.failed = Some((error, keys));
+                    return outcome;
                 }
             }
         }
-        Ok(ack)
+        // Skipped with a higher stored number: resend once above it.
+        let resend = self.write_rounds(sent, false, &mut outcome).await;
+        if resend.is_empty() {
+            return outcome;
+        }
+        for (_, stored) in &resend {
+            shared.raise_to(*stored);
+        }
+        let mut again = Vec::with_capacity(resend.len());
+        for (sent, _) in resend {
+            match shared.next_seq() {
+                Ok(seq) => again.push(Sent { seq, ..sent }),
+                Err(error) => {
+                    outcome.failed = Some((error, vec![sent.key]));
+                    return outcome;
+                }
+            }
+        }
+        self.write_rounds(again, true, &mut outcome).await;
+        outcome
+    }
+
+    /// Writes `sent` until the service answers 200 or nothing is left. A
+    /// refusal from an all-or-nothing edge names its first offending entry:
+    /// that entry is dropped and the rest go again (one round per entry at
+    /// most; rounds refused by the edge cost no rate-limit tokens). Returns
+    /// the entries skipped with a higher stored number (`last`: none; they
+    /// are owned by another writer).
+    async fn write_rounds(
+        &self,
+        mut sent: Vec<Sent>,
+        last: bool,
+        outcome: &mut Outcome,
+    ) -> Vec<(Sent, u64)> {
+        let mut resend = Vec::new();
+        while !sent.is_empty() {
+            let error = match self.write(&sent).await {
+                Ok(response) => {
+                    if let Err(error) = self.read_answer(response, sent, last, outcome, &mut resend)
+                    {
+                        outcome.failed = Some(error);
+                    }
+                    return resend;
+                }
+                Err(error) => error,
+            };
+            let Some(api) = error.api() else {
+                outcome.failed = Some((error, sent.into_iter().map(|s| s.key).collect()));
+                return resend;
+            };
+            // Partial mode, every entry refused: 400 with `rejected`.
+            if let Some(list) = api.rejected.as_deref().and_then(Value::as_array) {
+                let refused = parse_rejected(list);
+                if !refused.is_empty() {
+                    for rejected in refused {
+                        if let Some(at) = sent.iter().position(|s| s.key == rejected.key) {
+                            sent.remove(at);
+                            let error = entry_error(api, &rejected);
+                            outcome.rejected.push((rejected, error));
+                        }
+                    }
+                    if !sent.is_empty() {
+                        // Not named, so not refused: not stored either.
+                        outcome.failed = Some((error, sent.into_iter().map(|s| s.key).collect()));
+                    }
+                    return resend;
+                }
+            }
+            // All or nothing: the first offending entry, by its path.
+            let offender = (api.status == 400 && api.code == ErrorCode::GameDataInvalidValue)
+                .then(|| {
+                    api.field
+                        .as_deref()
+                        .and_then(|field| offender(&sent, field))
+                })
+                .flatten();
+            let Some(at) = offender else {
+                outcome.failed = Some((error, sent.into_iter().map(|s| s.key).collect()));
+                return resend;
+            };
+            let dropped = sent.remove(at);
+            tracing::warn!(
+                key = %dropped.key,
+                reason = api.reason.as_deref().unwrap_or(""),
+                "gridspawn game data entry refused; sending the others again"
+            );
+            outcome.rejected.push((
+                RejectedKey {
+                    key: dropped.key,
+                    field: api.field.clone(),
+                    reason: api.reason.clone(),
+                },
+                error.clone(),
+            ));
+        }
+        resend
+    }
+
+    /// Reads a 200 answer of either shape into `outcome`.
+    fn read_answer(
+        &self,
+        response: WriteResponse,
+        mut sent: Vec<Sent>,
+        last: bool,
+        outcome: &mut Outcome,
+        resend: &mut Vec<(Sent, u64)>,
+    ) -> Result<(), (Error, Vec<String>)> {
+        let keys = |sent: &[Sent]| sent.iter().map(|s| s.key.clone()).collect::<Vec<_>>();
+        if !response.ok {
+            let keys = keys(&sent);
+            return Err((Error::InvalidResponse("invalid game data answer"), keys));
+        }
+        outcome.quota = Some(response.quota);
+        let shared = self.game.shared();
+        let mut skipped = Vec::with_capacity(response.skipped.len());
+        for wire in response.skipped {
+            let Some(stored) = wire.stored_seq.or(wire.seq) else {
+                let keys = keys(&sent);
+                return Err((Error::InvalidResponse("invalid game data answer"), keys));
+            };
+            skipped.push((wire.key, stored));
+        }
+        for wire in response.rejected {
+            if let Some(at) = sent.iter().position(|s| s.key == wire.key) {
+                let dropped = sent.remove(at);
+                let rejected = RejectedKey {
+                    key: dropped.key,
+                    field: wire.field,
+                    reason: wire.reason,
+                };
+                let error = Error::Api(Box::new(ApiError {
+                    service: crate::error::Service::Edge,
+                    status: 400,
+                    code: ErrorCode::GameDataInvalidValue,
+                    wire_code: "data/invalid_value".to_owned(),
+                    message: Some("the entry was refused".to_owned()),
+                    request_id: response.request_id.clone(),
+                    retry_after: None,
+                    field: rejected.field.clone(),
+                    reason: rejected.reason.clone(),
+                    rejected: None,
+                }));
+                outcome.rejected.push((rejected, error));
+            }
+        }
+        for (key, stored) in skipped {
+            let Some(at) = sent.iter().position(|s| s.key == key) else {
+                continue;
+            };
+            let entry = sent.remove(at);
+            if stored == entry.seq {
+                // An earlier attempt of this request landed (a retry).
+                outcome.stored.push(entry);
+            } else if last {
+                shared.raise_to(stored);
+                tracing::warn!(
+                    key = %key,
+                    "gridspawn game data key is owned by another writer (one writer per key)"
+                );
+                outcome.owned.push(SkippedKey { key, seq: stored });
+            } else {
+                resend.push((entry, stored));
+            }
+        }
+        match response.accepted {
+            WireAccepted::Keys(accepted) => {
+                for key in accepted {
+                    if let Some(at) = sent.iter().position(|s| s.key == key) {
+                        outcome.stored.push(sent.remove(at));
+                    }
+                }
+            }
+            WireAccepted::Count(count) => {
+                // The rest of the batch.
+                if count != sent.len() as u64 {
+                    tracing::warn!(
+                        count,
+                        left = sent.len(),
+                        "gridspawn game data answer counts differ"
+                    );
+                }
+                outcome.stored.append(&mut sent);
+            }
+        }
+        Ok(())
     }
 
     /// The writer's listing: every key with its sequence number, size, time
@@ -552,10 +854,10 @@ impl GameData {
         })
     }
 
-    async fn write(&self, entries: &[(String, Entry, u64)]) -> Result<WriteResponse, Error> {
+    async fn write(&self, entries: &[Sent]) -> Result<WriteResponse, Error> {
         let mut set = Map::new();
         let mut remove = Vec::new();
-        for (key, entry, seq) in entries {
+        for Sent { key, entry, seq } in entries {
             match entry {
                 Entry::Set { value, ttl } => {
                     let mut item = json!({ "value": value, "seq": seq });
@@ -582,23 +884,96 @@ impl GameData {
             return Err(invalid("game data batch", "at most 32 KiB as JSON"));
         }
         // Each entry carries its sequence number: retrying is safe.
-        let response: WriteResponse = self
-            .game
+        self.game
             .client
-            .edge_send(
+            .edge_call(
                 Method::PUT,
                 "PUT /v1/server/game-data",
                 "/v1/server/game-data",
                 Some(&body),
                 None,
+                &[PARTIAL],
                 true,
             )
-            .await?;
-        if !response.ok {
-            return Err(Error::InvalidResponse("invalid game data answer"));
-        }
-        Ok(response)
+            .await
+            .0
     }
+}
+
+/// One numbered entry of a write.
+#[derive(Clone, Debug)]
+struct Sent {
+    key: String,
+    entry: Entry,
+    seq: u64,
+}
+
+/// What a write did, entry by entry.
+#[derive(Default)]
+struct Outcome {
+    /// Stored or removed, with the sequence number that landed.
+    stored: Vec<Sent>,
+    /// Still skipped after the one resend: another writer owns them.
+    owned: Vec<SkippedKey>,
+    /// Refused one by one.
+    rejected: Vec<(RejectedKey, Error)>,
+    quota: Option<DataQuota>,
+    /// The request failed as a whole: none of these keys was stored.
+    failed: Option<(Error, Vec<String>)>,
+}
+
+fn parse_rejected(list: &[Value]) -> Vec<RejectedKey> {
+    let text =
+        |value: &Value, name: &str| value.get(name).and_then(Value::as_str).map(str::to_owned);
+    list.iter()
+        .filter_map(|item| {
+            Some(RejectedKey {
+                key: text(item, "key")?,
+                field: text(item, "field"),
+                reason: text(item, "reason"),
+            })
+        })
+        .collect()
+}
+
+/// The batch's refusal, narrowed to one entry.
+fn entry_error(api: &ApiError, rejected: &RejectedKey) -> Error {
+    let mut api = api.clone();
+    api.field = rejected.field.clone();
+    api.reason = rejected.reason.clone();
+    api.rejected = None;
+    Error::Api(Box::new(api))
+}
+
+/// The entry an all-or-nothing refusal names: `set.<key>…` (the longest sent
+/// key that fits, since keys may contain dots) or `remove[<i>]…` (the i-th
+/// removal as sent).
+fn offender(sent: &[Sent], field: &str) -> Option<usize> {
+    if let Some(path) = field.strip_prefix("set.") {
+        return sent
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| matches!(s.entry, Entry::Set { .. }))
+            .filter(|(_, s)| {
+                path == s.key
+                    || path
+                        .strip_prefix(s.key.as_str())
+                        .is_some_and(|rest| rest.starts_with('.'))
+            })
+            .max_by_key(|(_, s)| s.key.len())
+            .map(|(at, _)| at);
+    }
+    let index: usize = field
+        .strip_prefix("remove[")?
+        .split(']')
+        .next()?
+        .parse()
+        .ok()?;
+    sent.iter()
+        .enumerate()
+        .filter(|(_, s)| s.entry == Entry::Remove)
+        .nth(index)
+        .map(|(at, _)| at)
 }
 
 /// Events: an append-only stream of `{name, payload}`.
@@ -623,28 +998,12 @@ impl GameEvents {
         payload: Value,
         id: &str,
     ) -> Result<EventReceipt, Error> {
-        if !valid_event_id(id) {
-            return Err(invalid("event id", "8-64 characters of A-Z a-z 0-9 _ -"));
-        }
+        check_event_id(id)?;
         self.send(name, payload, id.to_owned()).await
     }
 
     async fn send(&self, name: &str, payload: Value, id: String) -> Result<EventReceipt, Error> {
-        if !valid_event_name(name) {
-            return Err(invalid(
-                "event name",
-                "1-48 characters of a-z 0-9 _ . - starting with a letter or digit",
-            ));
-        }
-        if !payload.is_object() {
-            return Err(invalid("event payload", "a JSON object"));
-        }
-        let size = serde_json::to_vec(&payload)
-            .map_err(|_| invalid("event payload", "could not be encoded as JSON"))?
-            .len();
-        if size > MAX_PAYLOAD {
-            return Err(invalid("event payload", "at most 4 KiB as JSON"));
-        }
+        check_event(name, &payload)?;
         let key = IdempotencyKey::new(id)?;
         let response: EventResponse = self
             .game
@@ -674,26 +1033,298 @@ struct Pending {
     order: u64,
 }
 
+/// A bounded log of results: the oldest is dropped when full.
+struct Ring<T> {
+    items: VecDeque<T>,
+    dropped: u64,
+}
+
+impl<T> Default for Ring<T> {
+    fn default() -> Self {
+        Self {
+            items: VecDeque::new(),
+            dropped: 0,
+        }
+    }
+}
+
+impl<T> Ring<T> {
+    fn push(&mut self, item: T) {
+        if self.items.len() == RESULTS_KEPT {
+            self.items.pop_front();
+            self.dropped += 1;
+        }
+        self.items.push_back(item);
+    }
+
+    fn drain(&mut self) -> Vec<T> {
+        self.items.drain(..).collect()
+    }
+}
+
+/// What became of a key's value in a [`DataPublisher`] (final outcomes
+/// only: what can succeed later is retried, not reported).
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum DataOutcome {
+    /// Stored with this sequence number.
+    Stored { seq: u64 },
+    /// Removed; the tombstone has this sequence number.
+    Removed { seq: u64 },
+    /// Still skipped after one resend: another writer owns the key.
+    OwnedElsewhere { stored_seq: u64 },
+    /// Refused, and retrying cannot fix it: an invalid or personal-data value
+    /// ([`ApiError::field`] names it), the quota, a missing scope, game data
+    /// switched off. The value is dropped.
+    Refused(Error),
+}
+
+/// One key's outcome, from [`DataPublisher::results`].
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct DataResult {
+    pub key: String,
+    pub outcome: DataOutcome,
+}
+
+/// What a publisher had not sent when [`DataPublisher::flush`] (or
+/// [`EventPublisher::flush`]) reached its timeout.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{} items were not sent in time", pending.len())]
+#[non_exhaustive]
+pub struct Unsent {
+    /// Document keys, or the `Idempotency-Key`s of events, still waiting or
+    /// in flight.
+    pub pending: Vec<String>,
+}
+
 #[derive(Default)]
 struct PublisherState {
     pending: HashMap<String, Pending>,
     next_order: u64,
+    /// The keys of the batch being sent.
+    in_flight: Vec<String>,
     skipped: BTreeSet<String>,
     last_error: Option<Error>,
+    results: Ring<DataResult>,
+    /// The latest value given with a TTL, per key (what keep-alive resends).
+    ttl_values: HashMap<String, (Value, u64)>,
+    /// When a value with a TTL was last stored, and its TTL.
+    stored_at: HashMap<String, (Instant, u64)>,
+    /// Keys kept alive, with their next refresh (`None` until the latest
+    /// value is stored).
+    keep: HashMap<String, Option<Instant>>,
+    seq_base: Option<u64>,
+}
+
+/// Keep-alive resends at TTL/2: a refresh can be late by half the TTL and
+/// the document still lives. Never more often than every 5 s.
+fn refresh_interval(ttl: u64) -> Duration {
+    Duration::from_secs((ttl / 2).max(KEEP_ALIVE_FLOOR))
 }
 
 impl PublisherState {
+    /// A new value from the game.
     fn put(&mut self, key: String, entry: Entry) {
+        match &entry {
+            Entry::Set {
+                value,
+                ttl: Some(ttl),
+            } => {
+                if *ttl < KEEP_ALIVE_MIN_TTL {
+                    self.keep.remove(&key);
+                } else if let Some(due) = self.keep.get_mut(&key) {
+                    // Restarts from this value's store.
+                    *due = None;
+                }
+                self.ttl_values.insert(key.clone(), (value.clone(), *ttl));
+            }
+            Entry::Set { ttl: None, .. } | Entry::Remove => {
+                self.keep.remove(&key);
+                self.ttl_values.remove(&key);
+            }
+        }
+        self.queue(key, entry);
+    }
+
+    fn queue(&mut self, key: String, entry: Entry) {
         self.next_order += 1;
         let order = self.next_order;
         self.pending.insert(key, Pending { entry, order });
     }
+
+    fn keep_alive(&mut self, key: &str) -> Result<(), Error> {
+        let Some((_, ttl)) = self.ttl_values.get(key) else {
+            return Err(invalid(
+                "ttl",
+                "keep_alive needs a TTL: give the key's value one with set_with_ttl first",
+            ));
+        };
+        if *ttl < KEEP_ALIVE_MIN_TTL {
+            return Err(invalid("ttl", "keep_alive needs a TTL of at least 10 s"));
+        }
+        if self.keep.contains_key(key) {
+            return Ok(());
+        }
+        let waiting = self.pending.contains_key(key) || self.in_flight.iter().any(|k| k == key);
+        let due = if waiting {
+            None
+        } else {
+            self.stored_at
+                .get(key)
+                .map(|(at, ttl)| *at + refresh_interval(*ttl))
+        };
+        self.keep.insert(key.to_owned(), due);
+        Ok(())
+    }
+
+    /// A key's entry was stored at `now`.
+    fn on_stored(&mut self, key: &str, entry: &Entry, now: Instant) {
+        match entry {
+            Entry::Set { ttl: Some(ttl), .. } => {
+                self.stored_at.insert(key.to_owned(), (now, *ttl));
+                if !self.pending.contains_key(key) {
+                    if let Some(due) = self.keep.get_mut(key) {
+                        *due = Some(now + refresh_interval(*ttl));
+                    }
+                }
+            }
+            _ => {
+                self.stored_at.remove(key);
+            }
+        }
+    }
+
+    /// A key's value was dropped for good.
+    fn on_refused(&mut self, key: &str) {
+        if !self.pending.contains_key(key) {
+            self.keep.remove(key);
+            self.ttl_values.remove(key);
+        }
+    }
+
+    /// Queues the latest value again for every kept key whose refresh is
+    /// due. A refresh is an ordinary entry with a new sequence number (a
+    /// resend of the stored number would be skipped and refresh nothing).
+    fn queue_due_refreshes(&mut self, now: Instant) {
+        let due: Vec<String> = self
+            .keep
+            .iter()
+            .filter(|(key, due)| {
+                due.is_some_and(|at| at <= now) && !self.pending.contains_key(*key)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in due {
+            match self.ttl_values.get(&key).cloned() {
+                Some((value, ttl)) => {
+                    self.keep.insert(key.clone(), None);
+                    self.queue(
+                        key,
+                        Entry::Set {
+                            value,
+                            ttl: Some(ttl),
+                        },
+                    );
+                }
+                None => {
+                    self.keep.remove(&key);
+                }
+            }
+        }
+    }
+
+    fn unsent(&self) -> Unsent {
+        let mut pending: Vec<String> = self.pending.keys().cloned().collect();
+        pending.extend(self.in_flight.iter().cloned());
+        pending.sort();
+        pending.dedup();
+        Unsent { pending }
+    }
+
+    fn idle(&self) -> bool {
+        self.pending.is_empty() && self.in_flight.is_empty()
+    }
+
+    /// Records a write's outcome. Returns the wait a 429 asked for.
+    fn apply(
+        &mut self,
+        taken: &[(String, Pending)],
+        outcome: Outcome,
+        now: Instant,
+    ) -> Option<Duration> {
+        let mut clean = true;
+        for sent in outcome.stored {
+            self.skipped.remove(&sent.key);
+            self.on_stored(&sent.key, &sent.entry, now);
+            let outcome = match sent.entry {
+                Entry::Remove => DataOutcome::Removed { seq: sent.seq },
+                Entry::Set { .. } => DataOutcome::Stored { seq: sent.seq },
+            };
+            self.results.push(DataResult {
+                key: sent.key,
+                outcome,
+            });
+        }
+        for skipped in outcome.owned {
+            self.skipped.insert(skipped.key.clone());
+            self.results.push(DataResult {
+                key: skipped.key,
+                outcome: DataOutcome::OwnedElsewhere {
+                    stored_seq: skipped.seq,
+                },
+            });
+        }
+        for (rejected, error) in outcome.rejected {
+            clean = false;
+            self.on_refused(&rejected.key);
+            self.results.push(DataResult {
+                key: rejected.key,
+                outcome: DataOutcome::Refused(error.clone()),
+            });
+            self.last_error = Some(error);
+        }
+        let mut wait = None;
+        if let Some((error, unsent)) = outcome.failed {
+            clean = false;
+            tracing::warn!(%error, "gridspawn game data not sent");
+            if error.is_retryable() {
+                // Put back what no newer value replaced.
+                for key in unsent {
+                    if let Some((_, pending)) = taken.iter().find(|(k, _)| *k == key) {
+                        self.pending.entry(key).or_insert_with(|| pending.clone());
+                    }
+                }
+                wait = rate_limit_wait(&error);
+            } else {
+                for key in unsent {
+                    self.on_refused(&key);
+                    self.results.push(DataResult {
+                        key,
+                        outcome: DataOutcome::Refused(error.clone()),
+                    });
+                }
+            }
+            self.last_error = Some(error);
+        }
+        if clean {
+            self.last_error = None;
+        }
+        wait
+    }
 }
 
 /// Coalesces values to the latest per key and sends the changed keys, oldest
-/// change first, in one batch per tick. Stops when dropped.
+/// change first, in one batch per tick.
+///
+/// - [`Self::results`]: what became of each key, entry by entry.
+/// - [`Self::flush`] and [`Self::shutdown`]: send what is pending before
+///   going on or stopping. Dropping the publisher (or [`Self::stop`]) stops
+///   at once, and entries not sent yet are lost: removals included.
+/// - [`Self::keep_alive`]: refreshes a document's TTL while the game runs.
 pub struct DataPublisher {
     state: Arc<Mutex<PublisherState>>,
+    progress: watch::Receiver<u64>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -705,55 +1336,55 @@ impl DataPublisher {
         let per_tick = ((ENTRIES_PER_SECOND / hz) as usize).clamp(4, MAX_ENTRIES);
         let shared = Arc::new(Mutex::new(PublisherState::default()));
         let state = shared.clone();
+        let (progress_tx, progress) = watch::channel(0u64);
         let task = tokio::spawn(async move {
             let mut ticks = tokio::time::interval(period);
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut seeded = false;
             loop {
                 ticks.tick().await;
-                let taken = take_batch(&state, per_tick);
+                if !seeded {
+                    // The listing once, so the numbering (and its base) is
+                    // known before the first batch.
+                    match data.game.seed().await {
+                        Ok(base) => {
+                            seeded = true;
+                            lock(&state).seq_base = Some(base);
+                            tracing::info!(
+                                seq_base = base,
+                                "gridspawn game data publisher started; sequence numbers continue above the stored ones"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "gridspawn game data listing failed; retrying");
+                            let wait = rate_limit_wait(&error).unwrap_or(SEED_RETRY);
+                            lock(&state).last_error = Some(error);
+                            progress_tx.send_modify(|n| *n += 1);
+                            tokio::time::sleep(wait).await;
+                            continue;
+                        }
+                    }
+                }
+                let taken = {
+                    let mut s = lock(&state);
+                    s.queue_due_refreshes(Instant::now());
+                    let taken = take_batch(&mut s, per_tick);
+                    s.in_flight = taken.iter().map(|(key, _)| key.clone()).collect();
+                    taken
+                };
                 if taken.is_empty() {
                     continue;
                 }
-                let mut batch = DataBatch::new();
-                for (key, pending) in &taken {
-                    batch.entries.push((key.clone(), pending.entry.clone()));
-                }
-                match data.set_many(&batch).await {
-                    Ok(ack) => {
-                        let mut s = lock(&state);
-                        s.last_error = None;
-                        for key in &ack.accepted {
-                            s.skipped.remove(key);
-                        }
-                        for skipped in ack.skipped {
-                            s.skipped.insert(skipped.key);
-                        }
-                    }
-                    Err(error) => {
-                        let wait = error.api().and_then(|api| {
-                            (api.code == ErrorCode::RateLimited)
-                                .then(|| api.retry_after.unwrap_or(Duration::from_secs(1)))
-                        });
-                        tracing::warn!(%error, "gridspawn game data not sent");
-                        {
-                            let mut s = lock(&state);
-                            if error.is_retryable() {
-                                // Put back what no newer value replaced.
-                                for (key, pending) in taken {
-                                    s.pending.entry(key).or_insert(pending);
-                                }
-                            }
-                            s.last_error = Some(error);
-                        }
-                        if let Some(wait) = wait {
-                            tokio::time::sleep(wait).await;
-                        }
-                    }
+                let wait = send_taken(&data, &state, &taken).await;
+                progress_tx.send_modify(|n| *n += 1);
+                if let Some(wait) = wait {
+                    tokio::time::sleep(wait).await;
                 }
             }
         });
         Self {
             state: shared,
+            progress,
             task,
         }
     }
@@ -789,17 +1420,366 @@ impl DataPublisher {
         }
     }
 
+    /// Keeps a document with a TTL alive: its latest value is sent again
+    /// (with a new sequence number) every TTL/2 after it was stored, never
+    /// more often than every 5 s, until [`Self::stop_keep_alive`], a
+    /// [`Self::set`] without TTL or a [`Self::remove`]. A short TTL hides the
+    /// value soon after the server stops or crashes.
+    ///
+    /// The key's latest value must have a TTL (at least 10 s). Each refresh
+    /// costs one entry of the key's and the app's rate limits, sends an
+    /// update to every page that shows the key, and moves its `updatedAt`.
+    /// When the value rarely changes, prefer a TTL of 60 s or more, or no
+    /// TTL and a [`Self::remove`] before [`Self::shutdown`].
+    pub fn keep_alive(&self, key: &str) -> Result<(), Error> {
+        check_key(key)?;
+        lock(&self.state).keep_alive(key)
+    }
+
+    /// Stops refreshing the key; it expires at the end of its TTL.
+    pub fn stop_keep_alive(&self, key: &str) {
+        lock(&self.state).keep.remove(key);
+    }
+
+    /// What became of each key since the last call, oldest first (at most
+    /// the last 256; see [`Self::dropped_results`]). Values that will be
+    /// retried are not reported; [`Self::last_error`] shows why.
+    pub fn results(&self) -> Vec<DataResult> {
+        lock(&self.state).results.drain()
+    }
+
+    /// Results dropped because [`Self::results`] was not called often enough.
+    pub fn dropped_results(&self) -> u64 {
+        lock(&self.state).results.dropped
+    }
+
     /// Keys another writer owns (still skipped after one resend).
     pub fn skipped(&self) -> Vec<String> {
         lock(&self.state).skipped.iter().cloned().collect()
     }
 
-    /// The failure of the last batch, if it failed.
+    /// The failure of the last batch (or of one of its entries), if any.
+    /// Cleared by the next batch that goes through without a refusal.
     pub fn last_error(&self) -> Option<Error> {
         lock(&self.state).last_error.clone()
     }
 
+    /// The highest `seq` the listing showed at start (0 when none): every
+    /// entry is numbered above it. `None` until the listing was read.
+    pub fn seq_base(&self) -> Option<u64> {
+        lock(&self.state).seq_base
+    }
+
+    /// Waits until everything given so far was sent (stored, refused or
+    /// owned elsewhere), within the usual rate. On timeout, the keys still
+    /// waiting; they are still sent later.
+    pub async fn flush(&self, timeout: Duration) -> Result<(), Unsent> {
+        let deadline = Instant::now() + timeout;
+        let mut progress = self.progress.clone();
+        loop {
+            progress.borrow_and_update();
+            {
+                let s = lock(&self.state);
+                if s.idle() {
+                    return Ok(());
+                }
+            }
+            match tokio::time::timeout_at(deadline, progress.changed()).await {
+                Ok(Ok(())) => {}
+                // Timed out, or the task is gone.
+                _ => return Err(lock(&self.state).unsent()),
+            }
+        }
+    }
+
+    /// [`Self::flush`], then stops. Use it at shutdown so removals and last
+    /// values are not lost. Keep-alive stops; kept documents expire at the
+    /// end of their TTL.
+    pub async fn shutdown(self, timeout: Duration) -> Result<(), Unsent> {
+        let result = self.flush(timeout).await;
+        drop(self);
+        result
+    }
+
+    /// Stops at once, like dropping it: entries not sent yet are lost. Use
+    /// [`Self::shutdown`] to send them first.
     pub fn stop(self) {}
+}
+
+/// Sends one tick's batch and records the outcome. A refused batch (400) has
+/// already lost only its refused entries ([`GameData::set_many`]). On 409
+/// (quota) the removals go again alone, since they free space, and the sets
+/// are refused: the service cannot say which one passed the quota.
+async fn send_taken(
+    data: &GameData,
+    state: &Mutex<PublisherState>,
+    taken: &[(String, Pending)],
+) -> Option<Duration> {
+    let entries: Vec<(String, Entry)> = taken
+        .iter()
+        .map(|(key, pending)| (key.clone(), pending.entry.clone()))
+        .collect();
+    let mut outcome = data.send_entries(entries).await;
+    let mut second = None;
+    let quota = outcome.failed.as_ref().is_some_and(|(error, _)| {
+        error
+            .api()
+            .is_some_and(|api| api.code == ErrorCode::GameDataQuotaExceeded)
+    });
+    if quota {
+        let (error, unsent) = outcome.failed.take().expect("checked above");
+        let mut removals = Vec::new();
+        for key in unsent {
+            let is_removal = taken
+                .iter()
+                .any(|(k, pending)| *k == key && pending.entry == Entry::Remove);
+            if is_removal {
+                removals.push((key, Entry::Remove));
+            } else {
+                let field = error.api().and_then(|api| api.field.clone());
+                outcome.rejected.push((
+                    RejectedKey {
+                        key,
+                        field,
+                        reason: None,
+                    },
+                    error.clone(),
+                ));
+            }
+        }
+        if !removals.is_empty() {
+            second = Some(data.send_entries(removals).await);
+        }
+    }
+    let now = Instant::now();
+    let mut s = lock(state);
+    s.in_flight.clear();
+    let mut wait = s.apply(taken, outcome, now);
+    if let Some(second) = second {
+        wait = s.apply(taken, second, now).or(wait);
+    }
+    wait
+}
+
+#[derive(Clone, Debug)]
+struct QueuedEvent {
+    name: String,
+    payload: Value,
+    id: String,
+}
+
+/// One event's outcome, from [`EventPublisher::results`].
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct EventResult {
+    /// The event's `Idempotency-Key` (what `emit` returned).
+    pub id: String,
+    /// The receipt, or a refusal that retrying cannot fix (the event is
+    /// dropped).
+    pub outcome: Result<EventReceipt, Error>,
+}
+
+#[derive(Default)]
+struct EventState {
+    queue: VecDeque<QueuedEvent>,
+    in_flight: Option<String>,
+    results: Ring<EventResult>,
+    last_error: Option<Error>,
+}
+
+impl EventState {
+    fn idle(&self) -> bool {
+        self.queue.is_empty() && self.in_flight.is_none()
+    }
+
+    fn unsent(&self) -> Unsent {
+        Unsent {
+            pending: self.queue.iter().map(|event| event.id.clone()).collect(),
+        }
+    }
+}
+
+/// Sends events in order, one at a time and at most 10 a second. Network
+/// errors, 5xx and 429 (after its `Retry-After`) are retried with the same
+/// `Idempotency-Key`, backing off up to 30 s, so a retried event is never
+/// counted twice. Dropping it (or [`Self::stop`]) stops at once; use
+/// [`Self::shutdown`] to send the queue first.
+pub struct EventPublisher {
+    state: Arc<Mutex<EventState>>,
+    wake: Arc<Notify>,
+    progress: watch::Receiver<u64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl EventPublisher {
+    fn spawn(events: GameEvents) -> Self {
+        let shared = Arc::new(Mutex::new(EventState::default()));
+        let state = shared.clone();
+        let wake = Arc::new(Notify::new());
+        let woken = wake.clone();
+        let (progress_tx, progress) = watch::channel(0u64);
+        let pace = Duration::from_millis(1000 / EVENTS_PER_SECOND);
+        let task = tokio::spawn(async move {
+            let mut failures: u32 = 0;
+            loop {
+                let next = {
+                    let mut s = lock(&state);
+                    let next = s.queue.front().cloned();
+                    s.in_flight = next.as_ref().map(|event| event.id.clone());
+                    next
+                };
+                let Some(event) = next else {
+                    woken.notified().await;
+                    continue;
+                };
+                let result = events
+                    .send(&event.name, event.payload.clone(), event.id.clone())
+                    .await;
+                let wait = {
+                    let mut s = lock(&state);
+                    s.in_flight = None;
+                    match result {
+                        Ok(receipt) => {
+                            failures = 0;
+                            s.queue.pop_front();
+                            s.last_error = None;
+                            s.results.push(EventResult {
+                                id: event.id,
+                                outcome: Ok(receipt),
+                            });
+                            pace
+                        }
+                        Err(error) if error.is_retryable() => {
+                            failures = failures.saturating_add(1);
+                            tracing::warn!(%error, "gridspawn game event not sent; retrying");
+                            let backoff = Duration::from_secs(1)
+                                .saturating_mul(1u32 << (failures - 1).min(5))
+                                .min(EVENT_MAX_BACKOFF);
+                            let wait = rate_limit_wait(&error).unwrap_or(backoff);
+                            s.last_error = Some(error);
+                            wait
+                        }
+                        Err(error) => {
+                            failures = 0;
+                            tracing::warn!(%error, "gridspawn game event refused");
+                            s.queue.pop_front();
+                            s.results.push(EventResult {
+                                id: event.id,
+                                outcome: Err(error.clone()),
+                            });
+                            s.last_error = Some(error);
+                            pace
+                        }
+                    }
+                };
+                progress_tx.send_modify(|n| *n += 1);
+                tokio::time::sleep(wait).await;
+            }
+        });
+        Self {
+            state: shared,
+            wake,
+            progress,
+            task,
+        }
+    }
+
+    /// Queues an event with a generated `Idempotency-Key`, returned. Checked
+    /// here; never blocks.
+    pub fn emit(&self, name: &str, payload: Value) -> Result<String, Error> {
+        self.push(name, payload, generated_event_id())
+    }
+
+    /// As [`Self::emit`] with your own id (`[A-Za-z0-9_-]{8,64}`), for an
+    /// event that may be sent again after a restart: a repeat within 24 h
+    /// returns the first answer with `duplicate: true`.
+    pub fn emit_with_id(&self, name: &str, payload: Value, id: &str) -> Result<String, Error> {
+        check_event_id(id)?;
+        self.push(name, payload, id.to_owned())
+    }
+
+    fn push(&self, name: &str, payload: Value, id: String) -> Result<String, Error> {
+        check_event(name, &payload)?;
+        {
+            let mut s = lock(&self.state);
+            if s.queue.len() >= EVENT_QUEUE {
+                return Err(invalid(
+                    "game event queue",
+                    "full: 1000 events wait to be sent (see last_error)",
+                ));
+            }
+            s.queue.push_back(QueuedEvent {
+                name: name.to_owned(),
+                payload,
+                id: id.clone(),
+            });
+        }
+        self.wake.notify_one();
+        Ok(id)
+    }
+
+    /// Events sent or refused since the last call, oldest first (at most the
+    /// last 256; see [`Self::dropped_results`]).
+    pub fn results(&self) -> Vec<EventResult> {
+        lock(&self.state).results.drain()
+    }
+
+    /// Results dropped because [`Self::results`] was not called often enough.
+    pub fn dropped_results(&self) -> u64 {
+        lock(&self.state).results.dropped
+    }
+
+    /// Events waiting, the one in flight included.
+    pub fn queued(&self) -> usize {
+        lock(&self.state).queue.len()
+    }
+
+    /// The last failure, retried or not; cleared by the next event sent.
+    pub fn last_error(&self) -> Option<Error> {
+        lock(&self.state).last_error.clone()
+    }
+
+    /// Waits until the queue is empty. On timeout, the ids still queued;
+    /// they are still sent later.
+    pub async fn flush(&self, timeout: Duration) -> Result<(), Unsent> {
+        let deadline = Instant::now() + timeout;
+        let mut progress = self.progress.clone();
+        loop {
+            progress.borrow_and_update();
+            if lock(&self.state).idle() {
+                return Ok(());
+            }
+            match tokio::time::timeout_at(deadline, progress.changed()).await {
+                Ok(Ok(())) => {}
+                _ => return Err(lock(&self.state).unsent()),
+            }
+        }
+    }
+
+    /// [`Self::flush`], then stops.
+    pub async fn shutdown(self, timeout: Duration) -> Result<(), Unsent> {
+        let result = self.flush(timeout).await;
+        drop(self);
+        result
+    }
+
+    /// Stops at once, like dropping it: queued events are lost.
+    pub fn stop(self) {}
+}
+
+impl Drop for EventPublisher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl std::fmt::Debug for EventPublisher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = lock(&self.state);
+        f.debug_struct("EventPublisher")
+            .field("queued", &s.queue.len())
+            .finish()
+    }
 }
 
 const MAX_MARKERS: usize = 64;
@@ -919,8 +1899,7 @@ impl DataPublisher {
 }
 
 /// Takes up to `limit` pending entries, oldest change first, within 32 KiB.
-fn take_batch(state: &Mutex<PublisherState>, limit: usize) -> Vec<(String, Pending)> {
-    let mut s = lock(state);
+fn take_batch(s: &mut PublisherState, limit: usize) -> Vec<(String, Pending)> {
     let mut order: Vec<(u64, String)> = s
         .pending
         .iter()
@@ -954,6 +1933,8 @@ fn take_batch(state: &Mutex<PublisherState>, limit: usize) -> Vec<(String, Pendi
     taken
 }
 
+/// Stops at once: what was not sent is lost (best effort; see
+/// [`DataPublisher::shutdown`]).
 impl Drop for DataPublisher {
     fn drop(&mut self) {
         self.task.abort();
@@ -1141,45 +2122,180 @@ mod tests {
 
     #[test]
     fn the_publisher_takes_oldest_changes_first_within_the_limit() {
-        let state = Mutex::new(PublisherState::default());
-        {
-            let mut s = lock(&state);
-            for key in ["c", "a", "b", "d"] {
-                s.put(
-                    key.into(),
-                    Entry::Set {
-                        value: json!(1),
-                        ttl: None,
-                    },
-                );
-            }
-            // A newer value for "c" moves it to the back.
+        let mut s = PublisherState::default();
+        for key in ["c", "a", "b", "d"] {
             s.put(
-                "c".into(),
+                key.into(),
                 Entry::Set {
-                    value: json!(2),
+                    value: json!(1),
                     ttl: None,
                 },
             );
         }
-        let taken: Vec<String> = take_batch(&state, 3).into_iter().map(|(k, _)| k).collect();
+        // A newer value for "c" moves it to the back.
+        s.put(
+            "c".into(),
+            Entry::Set {
+                value: json!(2),
+                ttl: None,
+            },
+        );
+        let taken: Vec<String> = take_batch(&mut s, 3).into_iter().map(|(k, _)| k).collect();
         assert_eq!(taken, ["a", "b", "d"]);
-        let rest: Vec<String> = take_batch(&state, 3).into_iter().map(|(k, _)| k).collect();
+        let rest: Vec<String> = take_batch(&mut s, 3).into_iter().map(|(k, _)| k).collect();
         assert_eq!(rest, ["c"]);
         // A batch never passes 32 KiB.
-        {
-            let mut s = lock(&state);
-            for i in 0..12 {
-                s.put(
-                    format!("big{i:02}"),
-                    Entry::Set {
-                        value: json!("x".repeat(4000)),
-                        ttl: None,
-                    },
-                );
-            }
+        for i in 0..12 {
+            s.put(
+                format!("big{i:02}"),
+                Entry::Set {
+                    value: json!("x".repeat(4000)),
+                    ttl: None,
+                },
+            );
         }
-        let first = take_batch(&state, 40);
+        let first = take_batch(&mut s, 40);
         assert!(first.len() < 12 && first.len() >= 7, "{}", first.len());
+    }
+
+    #[test]
+    fn an_all_or_nothing_refusal_names_its_entry() {
+        let set = || Entry::Set {
+            value: json!(1),
+            ttl: None,
+        };
+        let sent = |key: &str, entry: Entry| Sent {
+            key: key.into(),
+            entry,
+            seq: 1,
+        };
+        let batch = vec![
+            sent("match", set()),
+            sent("match.score", set()),
+            sent("lobby", Entry::Remove),
+            sent("old", Entry::Remove),
+        ];
+        // Keys contain dots: the longest key that fits the path.
+        assert_eq!(
+            offender(&batch, "set.match.score.value.players[3].name"),
+            Some(1)
+        );
+        assert_eq!(offender(&batch, "set.match.score"), Some(1));
+        assert_eq!(offender(&batch, "set.match.value"), Some(0));
+        assert_eq!(offender(&batch, "set.match"), Some(0));
+        assert_eq!(offender(&batch, "set.matchx.value"), None);
+        // remove[i]: the i-th removal as sent.
+        assert_eq!(offender(&batch, "remove[0].seq"), Some(2));
+        assert_eq!(offender(&batch, "remove[1].key"), Some(3));
+        assert_eq!(offender(&batch, "remove[2].key"), None);
+        // Not one entry: the whole batch.
+        assert_eq!(offender(&batch, "entries"), None);
+        assert_eq!(offender(&batch, "body"), None);
+    }
+
+    #[test]
+    fn results_keep_the_last_256() {
+        let mut ring = Ring::default();
+        for i in 0..300u32 {
+            ring.push(i);
+        }
+        assert_eq!(ring.dropped, 44);
+        let kept = ring.drain();
+        assert_eq!(kept.len(), 256);
+        assert_eq!((kept[0], kept[255]), (44, 299), "oldest first");
+        assert!(ring.drain().is_empty(), "drained");
+    }
+
+    /// Keep-alive timing with explicit instants: no clock is read here.
+    #[test]
+    fn keep_alive_refreshes_the_latest_value_at_half_the_ttl() {
+        let t0 = Instant::now();
+        let s = &mut PublisherState::default();
+        let with_ttl = |value: Value, ttl: u64| Entry::Set {
+            value,
+            ttl: Some(ttl),
+        };
+        let sec = Duration::from_secs;
+        // A TTL is needed (at least 10 s; set_with_ttl allows no less).
+        s.put(
+            "plain".into(),
+            Entry::Set {
+                value: json!(1),
+                ttl: None,
+            },
+        );
+        assert!(s.keep_alive("plain").is_err());
+        assert!(s.keep_alive("never-set").is_err());
+        s.put("short".into(), with_ttl(json!(1), 9));
+        assert!(s.keep_alive("short").is_err());
+        s.put("ten".into(), with_ttl(json!(1), 10));
+        s.keep_alive("ten").unwrap();
+        s.keep.remove("ten");
+        take_batch(s, 40);
+
+        s.put("lobby".into(), with_ttl(json!("open"), 120));
+        s.keep_alive("lobby").unwrap();
+        // Waiting to be sent: the timer starts when it is stored.
+        assert_eq!(s.keep["lobby"], None);
+        let taken = take_batch(s, 40);
+        s.on_stored("lobby", &taken[0].1.entry, t0);
+        assert_eq!(s.keep["lobby"], Some(t0 + sec(60)));
+        s.queue_due_refreshes(t0 + sec(59));
+        assert!(s.pending.is_empty());
+        s.queue_due_refreshes(t0 + sec(60));
+        assert_eq!(s.pending["lobby"].entry, with_ttl(json!("open"), 120));
+        // Not queued twice while it waits.
+        s.queue_due_refreshes(t0 + sec(90));
+        assert_eq!(s.pending.len(), 1);
+        let taken = take_batch(s, 40);
+        s.on_stored("lobby", &taken[0].1.entry, t0 + sec(61));
+        assert_eq!(s.keep["lobby"], Some(t0 + sec(121)));
+
+        // A newer value is what gets refreshed, and restarts the timer.
+        s.put("lobby".into(), with_ttl(json!("closing"), 300));
+        assert_eq!(s.keep["lobby"], None);
+        let taken = take_batch(s, 40);
+        s.on_stored("lobby", &taken[0].1.entry, t0 + sec(70));
+        assert_eq!(s.keep["lobby"], Some(t0 + sec(220)));
+        s.queue_due_refreshes(t0 + sec(220));
+        assert_eq!(s.pending["lobby"].entry, with_ttl(json!("closing"), 300));
+        take_batch(s, 40);
+
+        // Kept alive after its store: counted from that store.
+        s.put("round".into(), with_ttl(json!(4), 100));
+        let taken = take_batch(s, 40);
+        s.on_stored("round", &taken[0].1.entry, t0);
+        s.keep_alive("round").unwrap();
+        assert_eq!(s.keep["round"], Some(t0 + sec(50)));
+        s.queue_due_refreshes(t0 + sec(80));
+        assert!(s.pending.contains_key("round"), "already due");
+        take_batch(s, 40);
+
+        // A value without TTL, a removal or stop_keep_alive end it.
+        s.put(
+            "round".into(),
+            Entry::Set {
+                value: json!(5),
+                ttl: None,
+            },
+        );
+        assert!(!s.keep.contains_key("round"));
+        // A new TTL value restarts it from that value's store.
+        s.put("lobby".into(), with_ttl(json!("x"), 30));
+        assert_eq!(s.keep["lobby"], None);
+        s.put("a".into(), with_ttl(json!(1), 60));
+        s.keep_alive("a").unwrap();
+        s.put("a".into(), Entry::Remove);
+        assert!(!s.keep.contains_key("a"));
+        // A refused value ends it too (when nothing newer waits).
+        s.put("b".into(), with_ttl(json!(1), 60));
+        s.keep_alive("b").unwrap();
+        take_batch(s, 40);
+        s.on_refused("b");
+        assert!(!s.keep.contains_key("b"));
+        assert_eq!(refresh_interval(60), sec(30));
+        assert_eq!(refresh_interval(10), sec(5));
+        assert_eq!(refresh_interval(11), sec(5), "never under 5 s");
+        assert_eq!(refresh_interval(86_400), sec(43_200));
     }
 }

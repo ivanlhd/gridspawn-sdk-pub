@@ -106,6 +106,9 @@ pub struct ApiError {
     /// Why that field was refused (`error.reason`, voice payload errors), for
     /// example `count` or `range`.
     pub reason: Option<String>,
+    /// The body's `rejected` array (game data in partial mode), read by the
+    /// game-data writer.
+    pub(crate) rejected: Option<Arc<serde_json::Value>>,
 }
 
 /// The documented error codes of protocols 02 and 03 and the voice routes

@@ -130,11 +130,17 @@ typedef struct GsCredential GsCredential;
 typedef struct GsDataAck GsDataAck;
 
 // Sends the latest value of each game-data key at a fixed rate.
-// gs_game_data_publisher_free stops it.
+// gs_game_data_publisher_free stops it at once; gs_game_data_publisher_shutdown
+// sends what is pending first.
 typedef struct GsDataPublisher GsDataPublisher;
 
 // An error. Free with gs_error_free.
 typedef struct GsError GsError;
+
+// Sends game events in order, retrying with the same Idempotency-Key.
+// gs_game_event_publisher_free stops it at once; gs_game_event_publisher_shutdown
+// sends the queue first.
+typedef struct GsEventPublisher GsEventPublisher;
 
 // An admitted player or guest. Free with gs_participant_free.
 typedef struct GsParticipant GsParticipant;
@@ -480,9 +486,11 @@ enum GsStatus gs_game_data_remove(struct GsClient *client,
                                   struct GsDataAck **ack_out,
                                   struct GsError **error);
 
-// One all-or-nothing write: set_len entries, then remove_len keys
-// (set_len + remove_len must be 1-40). Either array may be NULL when its
-// length is 0. ack_out may be NULL.
+// One write: set_len entries, then remove_len keys (set_len + remove_len
+// must be 1-40). Either array may be NULL when its length is 0. ack_out may
+// be NULL. An entry the service refuses (an invalid or personal-data value)
+// does not hold back the others; when every entry is refused, the first
+// refusal is the error.
 enum GsStatus gs_game_data_set_many(struct GsClient *client,
                                     const struct GsDataEntry *set,
                                     size_t set_len,
@@ -519,7 +527,8 @@ void gs_data_ack_free(struct GsDataAck *ack);
 
 // Starts a publisher on the client's runtime: hz times a second (1-5) it
 // sends the keys changed since the last tick, latest value only, oldest
-// change first, within the service's limits.
+// change first, within the service's limits. It reads the stored keys once
+// at start to seed the sequence numbers (gs_game_data_publisher_seq_base).
 enum GsStatus gs_game_data_publisher_spawn(struct GsClient *client,
                                            uint32_t hz,
                                            struct GsDataPublisher **out,
@@ -536,14 +545,70 @@ enum GsStatus gs_game_data_publisher_set(struct GsDataPublisher *publisher,
 // Sends a removal on the next tick, and stops sending the key.
 void gs_game_data_publisher_remove(struct GsDataPublisher *publisher, const char *key);
 
+// Keeps a document with a TTL alive: its latest value is sent again (with a
+// new sequence number) every TTL/2 after it was stored, never more often
+// than every 5 s, until gs_game_data_publisher_stop_keep_alive, a set
+// without TTL or a removal. The key's latest value must have a TTL (10 s at
+// least). Each refresh costs one entry of the rate limits and sends an
+// update to the pages showing the key: when the value rarely changes, prefer
+// a TTL of 60 s or more, or no TTL and a removal before
+// gs_game_data_publisher_shutdown.
+enum GsStatus gs_game_data_publisher_keep_alive(struct GsDataPublisher *publisher,
+                                                const char *key,
+                                                struct GsError **error);
+
+// Stops refreshing the key; it expires at the end of its TTL.
+void gs_game_data_publisher_stop_keep_alive(struct GsDataPublisher *publisher, const char *key);
+
 // Keys another writer owns, as a JSON array; NULL when none (or for a NULL
 // publisher). Free with gs_string_free.
 char *gs_game_data_publisher_skipped_json(const struct GsDataPublisher *publisher);
 
-// The failure of the last batch: a new GsError to free with gs_error_free,
-// or NULL when the last batch was sent (or for a NULL publisher).
+// What became of each key since the last call, oldest first, as a JSON
+// array; NULL when there is nothing new. Each item is {"key", "outcome"}
+// with outcome "stored" or "removed" (+ "seq"), "owned_elsewhere"
+// (+ "storedSeq": another writer owns the key) or "refused" (+ "error":
+// {"message", "code", "httpStatus", "field", "reason", "requestId",
+// "retryable"}; the value was dropped). At most the last 256 are kept (see
+// gs_game_data_publisher_dropped_results). Values that will be retried are
+// not listed. Free with gs_string_free.
+char *gs_game_data_publisher_results_json(const struct GsDataPublisher *publisher);
+
+// Results dropped because gs_game_data_publisher_results_json was not called
+// often enough. 0 for NULL.
+uint64_t gs_game_data_publisher_dropped_results(const struct GsDataPublisher *publisher);
+
+// The highest seq the stored keys had when the publisher started (0 when
+// none): every entry is numbered above it. Returns false (and leaves *out)
+// until the publisher has read the stored keys.
+bool gs_game_data_publisher_seq_base(const struct GsDataPublisher *publisher, uint64_t *out);
+
+// The failure of the last batch (or of one of its entries): a new GsError
+// to free with gs_error_free, or NULL when the last batch went through (or
+// for a NULL publisher).
 struct GsError *gs_game_data_publisher_last_error(const struct GsDataPublisher *publisher);
 
+// Waits up to timeout_ms until everything given so far was sent (stored,
+// refused or owned elsewhere), within the usual rate. GS_STATUS_TIMEOUT when
+// time ran out: *unsent_json_out (may be NULL; set to NULL on success) gets
+// the keys still waiting as a JSON array, free with gs_string_free; they are
+// still sent later. Blocks: not from a Gridspawn callback.
+enum GsStatus gs_game_data_publisher_flush(struct GsDataPublisher *publisher,
+                                           uint32_t timeout_ms,
+                                           char **unsent_json_out,
+                                           struct GsError **error);
+
+// gs_game_data_publisher_flush, then stops the publisher, so removals and
+// last values are not lost at shutdown. Later calls report "publisher
+// stopped"; free it with gs_game_data_publisher_free as usual. Keep-alive
+// stops; kept documents expire at the end of their TTL.
+enum GsStatus gs_game_data_publisher_shutdown(struct GsDataPublisher *publisher,
+                                              uint32_t timeout_ms,
+                                              char **unsent_json_out,
+                                              struct GsError **error);
+
+// Stops the publisher at once (entries not sent yet are lost; see
+// gs_game_data_publisher_shutdown) and frees it. NULL is ignored.
 void gs_game_data_publisher_free(struct GsDataPublisher *publisher);
 
 // Sends an event: payload_json is a JSON object (at most 4 KiB). id is the
@@ -558,6 +623,58 @@ enum GsStatus gs_game_event_emit(struct GsClient *client,
                                  char **event_id_out,
                                  bool *duplicate_out,
                                  struct GsError **error);
+
+// Starts an event publisher on the client's runtime: events are sent in
+// order, one at a time and at most 10 a second; network errors, 5xx and 429
+// are retried with the same Idempotency-Key (backing off up to 30 s).
+enum GsStatus gs_game_event_publisher_spawn(struct GsClient *client,
+                                            struct GsEventPublisher **out,
+                                            struct GsError **error);
+
+// Queues an event: payload_json is a JSON object (at most 4 KiB). id is the
+// Idempotency-Key, [A-Za-z0-9_-]{8,64}; NULL = generated. *id_out (may be
+// NULL) gets the key used, free with gs_string_free. Checked here; never
+// blocks. At most 1000 events wait; more is GS_STATUS_INVALID_ARGUMENT.
+enum GsStatus gs_game_event_publisher_emit(struct GsEventPublisher *publisher,
+                                           const char *name,
+                                           const char *payload_json,
+                                           const char *id,
+                                           char **id_out,
+                                           struct GsError **error);
+
+// Events sent or refused since the last call, oldest first, as a JSON array;
+// NULL when there is nothing new. Each item is {"id" (the Idempotency-Key),
+// "ok": true, "eventId", "duplicate"} or {"id", "ok": false, "error": {...}}
+// (refused for good; the event was dropped). At most the last 256 are kept.
+// Free with gs_string_free.
+char *gs_game_event_publisher_results_json(const struct GsEventPublisher *publisher);
+
+// Events waiting, the one in flight included. 0 for NULL.
+size_t gs_game_event_publisher_queued(const struct GsEventPublisher *publisher);
+
+// The last failure, retried or not: a new GsError to free with
+// gs_error_free, or NULL (cleared by the next event sent).
+struct GsError *gs_game_event_publisher_last_error(const struct GsEventPublisher *publisher);
+
+// Waits up to timeout_ms until the queue is empty. GS_STATUS_TIMEOUT when
+// time ran out: *unsent_json_out (may be NULL; set to NULL on success) gets
+// the ids still queued as a JSON array, free with gs_string_free; they are
+// still sent later. Blocks: not from a Gridspawn callback.
+enum GsStatus gs_game_event_publisher_flush(struct GsEventPublisher *publisher,
+                                            uint32_t timeout_ms,
+                                            char **unsent_json_out,
+                                            struct GsError **error);
+
+// gs_game_event_publisher_flush, then stops the publisher. Later calls
+// report "publisher stopped"; free it with gs_game_event_publisher_free.
+enum GsStatus gs_game_event_publisher_shutdown(struct GsEventPublisher *publisher,
+                                               uint32_t timeout_ms,
+                                               char **unsent_json_out,
+                                               struct GsError **error);
+
+// Stops the publisher at once (queued events are lost; see
+// gs_game_event_publisher_shutdown) and frees it. NULL is ignored.
+void gs_game_event_publisher_free(struct GsEventPublisher *publisher);
 
 enum GsStatus gs_error_status(const struct GsError *error);
 

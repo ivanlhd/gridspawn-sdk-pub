@@ -393,6 +393,82 @@ async fn live_game_data() {
         first.id, first.duplicate, again.id, again.duplicate, generated.id, generated.duplicate
     );
 
+    // A refused entry does not hold back the others (an all-or-nothing edge:
+    // the SDK drops the named entry and sends the rest again).
+    let ack = data
+        .set_many(
+            &gridspawn_server::DataBatch::new()
+                .set("sdk-live.ok-a", json!(1))
+                .set(
+                    "sdk-live.private",
+                    json!({"contact": "someone@example.com"}),
+                )
+                .set("sdk-live.ok-b", json!(2)),
+        )
+        .await
+        .expect("a write with one refused entry");
+    let mut accepted = ack.accepted.clone();
+    accepted.sort();
+    assert_eq!(accepted, ["sdk-live.ok-a", "sdk-live.ok-b"], "{ack:?}");
+    assert_eq!(ack.rejected.len(), 1, "{ack:?}");
+    assert_eq!(ack.rejected[0].key, "sdk-live.private");
+    eprintln!(
+        "partial: accepted {accepted:?}; rejected {} field {:?} reason {:?}",
+        ack.rejected[0].key, ack.rejected[0].field, ack.rejected[0].reason
+    );
+
+    // The publisher: per-key results, then a shutdown with pending removals.
+    let summary = |result: &gridspawn_server::DataResult| match &result.outcome {
+        gridspawn_server::DataOutcome::Stored { seq } => format!("{} stored {seq}", result.key),
+        gridspawn_server::DataOutcome::Removed { seq } => format!("{} removed {seq}", result.key),
+        gridspawn_server::DataOutcome::Refused(error) => format!(
+            "{} refused {:?}",
+            result.key,
+            error.api().and_then(|api| api.reason.clone())
+        ),
+        other => format!("{} {other:?}", result.key),
+    };
+    let live = client.game().spawn_data_publisher(2);
+    live.set("sdk-live.pub", json!({"n": 1})).unwrap();
+    live.set(
+        "sdk-live.private2",
+        json!({"contact": "someone@example.com"}),
+    )
+    .unwrap();
+    live.flush(Duration::from_secs(10)).await.expect("flush");
+    let results: Vec<String> = live.results().iter().map(summary).collect();
+    eprintln!("publisher: seq_base {:?}; {results:?}", live.seq_base());
+    assert!(live.seq_base().is_some());
+    assert!(results.iter().any(|r| r.starts_with("sdk-live.pub stored")));
+    assert!(results
+        .iter()
+        .any(|r| r.starts_with("sdk-live.private2 refused")));
+    for key in ["sdk-live.pub", "sdk-live.ok-a", "sdk-live.ok-b"] {
+        live.remove(key);
+    }
+    live.shutdown(Duration::from_secs(10))
+        .await
+        .expect("shutdown sends the removals");
+
+    // Events through the queue.
+    let queue = client.game().spawn_event_publisher();
+    let queued = queue
+        .emit("sdk-live.queued", json!({"n": 1}))
+        .expect("queued");
+    queue
+        .flush(Duration::from_secs(10))
+        .await
+        .expect("event flush");
+    let sent = queue.results();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].id, queued);
+    let receipt = sent[0].outcome.as_ref().expect("event sent");
+    eprintln!(
+        "event publisher: id {} (duplicate {})",
+        receipt.id, receipt.duplicate
+    );
+    queue.shutdown(Duration::from_secs(5)).await.expect("idle");
+
     for key in ["sdk-live.rust", "sdk-live.banner"] {
         let ack = data.remove(key).await.expect("remove");
         assert_eq!(ack.accepted, [key]);
@@ -411,7 +487,9 @@ async fn live_game_data() {
         );
     }
     eprintln!("final quota {:?}", last.quota);
-    eprintln!("game data ok: set, ttl, seeding, personal data, events, removal");
+    eprintln!(
+        "game data ok: set, ttl, seeding, personal data, partial write, publisher results and shutdown, events and the event queue, removal"
+    );
 }
 
 #[tokio::test]

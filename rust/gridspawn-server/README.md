@@ -10,7 +10,7 @@ admission, tickets), `05-club.md` (club posts) and `06-game-data.md` (game
 data) in the protocol docs (`docs/protocol/` in the public repository).
 Requests never carry an `Origin` header.
 
-Status: 0.4.1, source only, not on crates.io yet. Licence: MIT OR Apache-2.0
+Status: 0.5.0, source only, not on crates.io yet. Licence: MIT OR Apache-2.0
 (see the end of this file).
 MSRV: Rust 1.83 for the library (the tests' dev-dependencies need a newer
 toolchain).
@@ -216,7 +216,7 @@ voice.mute(&guest.id, true).await?;                        // authoritative mute
 Your server keeps named values current (player count, round, scoreboard,
 map markers) and sends events ("round won"). Your club shows them on its
 pages through the club layout editor (protocol `06-game-data.md`). **No game
-session is needed:** the data belongs to your app and environment. Values
+session is needed:** the data belongs to your app. Values
 are `serde_json::Value` (add `serde_json = "1"`).
 
 ```rust
@@ -228,7 +228,7 @@ let game = client.game();
 let ack = game.data().set("match.score", json!({"red": 3, "blue": 1})).await?;
 game.data().set_with_ttl("lobby.open", json!(true), Duration::from_secs(300)).await?;
 game.data().remove("lobby.open").await?;
-game.data().set_many(&DataBatch::new()                 // 1–40 entries, all or nothing
+game.data().set_many(&DataBatch::new()                 // 1–40 entries
     .set("match.round", json!(4))
     .remove("lobby.banner")).await?;
 let listing = game.data().list().await?;               // keys, seq, sizes, removals, quota
@@ -236,15 +236,36 @@ let listing = game.data().list().await?;               // keys, seq, sizes, remo
 // Values that change every frame: the latest per key, one batch per tick.
 let live = game.spawn_data_publisher(4);     // 1–5 Hz
 live.set("match.clock", json!(812))?;        // cheap: every frame
-// live.skipped(): keys another writer owns; live.last_error(); drop(live) stops it
+live.set_with_ttl("lobby.open", json!(true), Duration::from_secs(120))?;
+live.keep_alive("lobby.open")?;              // sent again every 60 s while the server runs
+for result in live.results() {               // what became of each key
+    println!("{}: {:?}", result.key, result.outcome);   // Stored, Removed, OwnedElsewhere, Refused
+}
+live.remove("match.clock");
+live.shutdown(Duration::from_secs(5)).await.ok();      // sends what is pending, then stops
 
+// Events through a queue: in order, retried with the same Idempotency-Key.
+let events = game.spawn_event_publisher();
+let id = events.emit("round.won", json!({"round": 4}))?;   // never blocks
+events.shutdown(Duration::from_secs(5)).await.ok();
+
+// Or one request at a time:
 game.events().emit("match.ended", json!({"winner": "Red team"})).await?;
 game.events().emit_with_id("round.won", json!({"round": 4}), "round-4-of-match-81").await?;
 ```
 
 - **`DataAck`:** `accepted` (the keys stored), `skipped` (keys another
-  writer owns, with their stored sequence number) and `quota` (`keys`,
+  writer owns, with their stored sequence number), `rejected` (entries
+  refused one by one, with `field` and `reason`) and `quota` (`keys`,
   `max_keys`, `bytes`, `max_bytes`).
+- **A refused entry does not hold back the others.** One invalid or
+  personal-data value is reported in `DataAck::rejected` and the rest of the
+  batch is stored; when every entry is refused, the first refusal is the
+  error. The crate asks the service for per-entry results
+  (`Gridspawn-Partial: 1`). From a service that still answers all or
+  nothing, it drops the entry the refusal names and sends the rest again: at
+  most one extra request per refused entry. Rate limits, the quota and other
+  failures still refuse the whole write.
 - **Events:** every event carries an `Idempotency-Key`, so a retry is never
   counted twice. `emit` generates one; `emit_with_id` takes yours
   (`[A-Za-z0-9_-]{8,64}`). Use your own when the same event may be sent again
@@ -258,9 +279,43 @@ game.events().emit_with_id("round.won", json!({"round": 4}), "round-4-of-match-8
   object up to 4 KiB.
 - **The publisher** retries what can succeed later (network errors, 5xx,
   429 after `Retry-After`) with the newest values. A refusal that cannot
-  succeed by retrying — an invalid or personal-data value, or
-  `GameDataQuotaExceeded` — drops those entries and is kept in
-  `last_error()`; set the key again once the cause is fixed.
+  succeed by retrying (an invalid or personal-data value, the quota, a
+  missing scope) drops only the entries it concerns. Set the key again once
+  the cause is fixed.
+  - **`results()`** drains what became of each key since the last call:
+    `Stored { seq }`, `Removed { seq }`, `OwnedElsewhere { stored_seq }` or
+    `Refused(error)`. It keeps the last 256 (`dropped_results()` counts the
+    rest). Values that will be retried are not reported; `last_error()`
+    shows the latest failure until a batch goes through cleanly.
+  - **Over the quota** (`GameDataQuotaExceeded`), removals in the batch go
+    again on their own, since they free space. The sets are refused: the
+    service cannot say which one passed the quota.
+  - **`flush(timeout)`** waits until everything given so far was sent.
+    **`shutdown(timeout)`** flushes, then stops. On timeout, both return
+    `Unsent` with the keys still waiting.
+  - **Dropping the publisher, or `stop()`, stops at once:** entries not sent
+    yet are lost, removals included. Call `shutdown` when your server stops.
+  - **`seq_base()`:** the highest stored `seq` the listing showed when the
+    publisher started; it logs it too. Every entry is numbered above it.
+- **Keep-alive.** `keep_alive(key)` sends the key's latest value again,
+  with a new sequence number, every TTL/2 after it was stored. A resend with
+  the same number would be skipped and refresh nothing.
+  - The value must have a TTL (10 s at least). Refreshes come at most every
+    5 s, a tenth of the key's rate limit. A short TTL hides the value soon
+    after your server stops or crashes.
+  - It ends with `stop_keep_alive(key)`, a `set` without TTL or a `remove`.
+  - Each refresh costs one entry of the key's and the app's rate limits,
+    sends an update to every page that shows the key, and moves its
+    `updatedAt`. When the value rarely changes, prefer a TTL of 60 s or
+    more, or no TTL and a `remove` before `shutdown`.
+- **The event publisher** (`spawn_event_publisher()`) sends events in order,
+  one at a time, at most 10 a second. Network errors, 5xx and 429 (after
+  `Retry-After`) are retried with the same `Idempotency-Key`, backing off up
+  to 30 s, so a retried event is never counted twice.
+  - `emit` and `emit_with_id` check the event, queue it and return its key;
+    they never block. At most 1000 events wait.
+  - `results()` gives each event's receipt or final refusal.
+  - `flush`, `shutdown` and `stop` work as for documents.
 - **Markers for a live map** (protocol 06 §2.3): a `Markers` set that club
   pages can draw on a "Game markers" layer.
   ```rust
@@ -283,9 +338,12 @@ game.events().emit_with_id("round.won", json!({"round": 4}), "round-4-of-match-8
   `game_data_set_many`, `game_data_list` and `game_event_emit` (no background
   publisher there).
 
-- **Public by nature.** Production game data appears on public club pages,
-  readable by anyone. **Publish display names only, never emails, account
-  ids or participant ids, and nothing private.** The service refuses email
+- **Public by nature.** Everything you publish can appear on public club
+  pages, readable by anyone. Data from a development or staging key is not
+  a preview: it shows like any other. A page shows one value per key: the
+  production value when there is one, otherwise the newest development or
+  staging value. **Publish display names only, never emails, account ids or
+  participant ids, and nothing private.** The service refuses email
   shapes and Gridspawn id prefixes (`GameDataInvalidValue` with reason
   `personal_data`, and the JSON path in `field`), but that check is a safety
   net, not a filter to rely on.
@@ -293,12 +351,13 @@ game.events().emit_with_id("round.won", json!({"round": 4}), "round-4-of-match-8
   in-process counter per `Client`; the service skips a write that is not
   newer than the key's stored one. Servers that run side by side (shards,
   regions) write disjoint keys, for example `shard-eu.players`. The first
-  write reads your stored keys once and starts above them, so a restarted
+  write (or a publisher's start) reads your stored keys once and starts above
+  the highest `seq` listed, removals included (`seq_base()`). A restarted
   server carries on where it stopped; no clock is involved. A key that is
   still skipped after one resend belongs to another writer and comes back in
   `DataAck::skipped`.
-- **Setup:** give the server key the `game_data.write` scope and switch game
-  data on for the app and environment, in the Dev Hub. What your club shows
+- **Setup:** give the server key the `game_data.write` scope, and turn on
+  the game's one "Game data" switch in the Dev Hub. What your club shows
   is the club's choice; writing data changes no page by itself.
 - **Limits** (per app and environment): 20 entries a second (bursts of 40)
   and 5 a second per key; up to 40 entries and 32 KiB per batch; 256 keys
@@ -313,7 +372,8 @@ game.events().emit_with_id("round.won", json!({"round": 4}), "round-4-of-match-8
 - 429 is not retried: you get `ErrorCode::RateLimited` and decide.
   `ApiError::retry_after` carries `Retry-After` when sent (presence limits
   send it, as do voice and game data; the posting limits are fixed one-minute
-  windows without it). The game-data publisher waits it out by itself.
+  windows without it). The game-data and event publishers wait it out by
+  themselves.
 - Game-data writes need no Idempotency-Key: their sequence numbers make a
   repeat harmless. Events always carry one.
 - Ticket issue is never retried (each call issues a new ticket).

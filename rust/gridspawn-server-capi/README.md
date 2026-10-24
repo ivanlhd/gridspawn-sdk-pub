@@ -4,7 +4,7 @@ C ABI for [`gridspawn-server`](../gridspawn-server): Gridspawn's server SDK
 for C, C++ and Unreal. Server-side only. Linux is built and tested; other
 platforms are not yet.
 
-Status: 0.3.0, source only. Licence: MIT OR Apache-2.0 (see the end of this
+Status: 0.4.0, source only. Licence: MIT OR Apache-2.0 (see the end of this
 file). ABI version 1 (`GS_ABI_VERSION`). The rules are the preamble of
 `include/gridspawn_server.h`.
 
@@ -91,9 +91,20 @@ gs_game_data_set_many(client, set, 1, removes, 1, NULL, &error);    /* 1-40 entr
 GsDataPublisher *live;
 gs_game_data_publisher_spawn(client, 4, &live, &error);              /* 1-5 Hz */
 gs_game_data_publisher_set(live, "match.clock", "812", 0, &error);   /* every frame */
+gs_game_data_publisher_set(live, "lobby.open", "true", 120, &error);
+gs_game_data_publisher_keep_alive(live, "lobby.open", &error);       /* re-sent every 60 s */
+char *results = gs_game_data_publisher_results_json(live);           /* NULL when nothing new */
+gs_string_free(results);
+gs_game_data_publisher_shutdown(live, 5000, NULL, &error);           /* sends what is pending */
 gs_game_data_publisher_free(live);
 
-char *event_id;
+GsEventPublisher *events;                                            /* in order, retried */
+gs_game_event_publisher_spawn(client, &events, &error);
+gs_game_event_publisher_emit(events, "round.won", "{\"round\": 4}", NULL, NULL, &error);
+gs_game_event_publisher_shutdown(events, 5000, NULL, &error);
+gs_game_event_publisher_free(events);
+
+char *event_id;                                                      /* or one at a time */
 gs_game_event_emit(client, "match.ended", "{\"winner\": \"Red team\"}", NULL, &event_id, NULL, &error);
 gs_string_free(event_id);
 ```
@@ -119,9 +130,34 @@ gs_string_free(event_id);
 - Errors: `GS_ERROR_CODE_GAME_DATA_*`. `gs_error_reason` is
   `"personal_data"` when an email or a Gridspawn id was found, and
   `gs_error_field` holds the JSON path.
-- `gs_game_data_publisher_skipped_json` and
-  `gs_game_data_publisher_last_error` report what the publisher could not
-  send.
+- A refused entry (an invalid or personal-data value) does not hold back the
+  others in `gs_game_data_set_many` or the publisher.
+- **The publisher:**
+  - `gs_game_data_publisher_results_json` drains what became of each key:
+    `[{"key", "outcome": "stored" | "removed" | "owned_elsewhere" |
+    "refused", "seq" / "storedSeq" / "error": {...}}]`. It keeps the last
+    256.
+  - `gs_game_data_publisher_skipped_json` lists keys another writer owns.
+    `gs_game_data_publisher_last_error` gives the latest failure.
+  - `gs_game_data_publisher_flush` and `_shutdown` wait up to `timeout_ms`.
+    `GS_STATUS_TIMEOUT` means time ran out; `*unsent_json_out` then lists
+    what is still waiting.
+  - `gs_game_data_publisher_free` stops at once: entries not sent yet are
+    lost, removals included. Call `_shutdown` first when your server stops.
+  - `gs_game_data_publisher_keep_alive` needs a TTL (10 s at least) and
+    refreshes at TTL/2, never more often than every 5 s. Each refresh costs
+    one entry of the rate limits: when the value rarely changes, prefer a
+    TTL of 60 s or more, or no TTL and a removal before shutdown.
+  - `gs_game_data_publisher_seq_base` gives the highest stored `seq` when
+    the publisher started.
+- **The event publisher:** `gs_game_event_publisher_emit` queues an event
+  (at most 1000 wait) and never blocks.
+  - Events are sent in order, at most 10 a second, and retried with the
+    same Idempotency-Key.
+  - `_results_json` gives `[{"id", "ok", "eventId", "duplicate"}]` or
+    `{"id", "ok": false, "error"}` per event.
+  - `_queued`, `_last_error`, `_flush`, `_shutdown` and `_free` work as for
+    documents.
 
 ## Rules in short
 

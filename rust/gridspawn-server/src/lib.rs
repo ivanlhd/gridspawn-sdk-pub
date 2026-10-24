@@ -58,8 +58,9 @@ pub use club::{Link, Post, PostReceipt};
 pub use credential::Credential;
 pub use error::{ApiError, Error, ErrorCode, Service};
 pub use game_data::{
-    DataAck, DataBatch, DataKey, DataListing, DataPublisher, DataQuota, EventReceipt, Game,
-    GameData, GameEvents, Marker, Markers, SkippedKey,
+    DataAck, DataBatch, DataKey, DataListing, DataOutcome, DataPublisher, DataQuota, DataResult,
+    EventPublisher, EventReceipt, EventResult, Game, GameData, GameEvents, Marker, Markers,
+    RejectedKey, SkippedKey, Unsent,
 };
 pub use presence::{ParticipantRef, Party, Presence, PresenceAck};
 pub use session::{

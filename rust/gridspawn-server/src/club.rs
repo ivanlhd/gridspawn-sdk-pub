@@ -218,6 +218,7 @@ impl Client {
                     auth: Auth::Bearer(grant.as_str()),
                     body: Some(&payload),
                     idempotency_key: Some(idempotency_key.as_str()),
+                    headers: &[],
                     retry: true,
                 })
                 .await;

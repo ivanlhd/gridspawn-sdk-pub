@@ -13,7 +13,7 @@ use std::{
     future::Future,
     panic::{catch_unwind, AssertUnwindSafe},
     ptr,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -282,10 +282,36 @@ pub struct GsDataAck {
 }
 
 /// Sends the latest value of each game-data key at a fixed rate.
-/// gs_game_data_publisher_free stops it.
+/// gs_game_data_publisher_free stops it at once; gs_game_data_publisher_shutdown
+/// sends what is pending first.
 pub struct GsDataPublisher {
-    handle: Option<gs::DataPublisher>,
+    // An Arc, so a flush runs without holding the lock that set() takes.
+    handle: Mutex<Option<Arc<gs::DataPublisher>>>,
     _rt: Arc<Rt>,
+}
+
+/// Sends game events in order, retrying with the same Idempotency-Key.
+/// gs_game_event_publisher_free stops it at once; gs_game_event_publisher_shutdown
+/// sends the queue first.
+pub struct GsEventPublisher {
+    handle: Mutex<Option<Arc<gs::EventPublisher>>>,
+    _rt: Arc<Rt>,
+}
+
+/// The live handle of a publisher, or None once it was shut down.
+fn live<T>(handle: &Mutex<Option<Arc<T>>>) -> Option<Arc<T>> {
+    handle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Takes the handle out (shutdown and free).
+fn take<T>(handle: &Mutex<Option<Arc<T>>>) -> Option<Arc<T>> {
+    handle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
 }
 
 /// The game-data quota of the app and environment.
@@ -1684,9 +1710,11 @@ pub unsafe extern "C" fn gs_game_data_remove(
     unsafe { boundary(error, body) }
 }
 
-/// One all-or-nothing write: set_len entries, then remove_len keys
-/// (set_len + remove_len must be 1-40). Either array may be NULL when its
-/// length is 0. ack_out may be NULL.
+/// One write: set_len entries, then remove_len keys (set_len + remove_len
+/// must be 1-40). Either array may be NULL when its length is 0. ack_out may
+/// be NULL. An entry the service refuses (an invalid or personal-data value)
+/// does not hold back the others; when every entry is refused, the first
+/// refusal is the error.
 #[no_mangle]
 pub unsafe extern "C" fn gs_game_data_set_many(
     client: *mut GsClient,
@@ -1853,7 +1881,8 @@ pub unsafe extern "C" fn gs_data_ack_free(ack: *mut GsDataAck) {
 
 /// Starts a publisher on the client's runtime: hz times a second (1-5) it
 /// sends the keys changed since the last tick, latest value only, oldest
-/// change first, within the service's limits.
+/// change first, within the service's limits. It reads the stored keys once
+/// at start to seed the sequence numbers (gs_game_data_publisher_seq_base).
 #[no_mangle]
 pub unsafe extern "C" fn gs_game_data_publisher_spawn(
     client: *mut GsClient,
@@ -1870,7 +1899,7 @@ pub unsafe extern "C" fn gs_game_data_publisher_spawn(
             client.client.game().spawn_data_publisher(hz)
         };
         let handle = GsDataPublisher {
-            handle: Some(publisher),
+            handle: Mutex::new(Some(Arc::new(publisher))),
             _rt: client.rt.clone(),
         };
         // SAFETY: checked non-NULL above.
@@ -1898,10 +1927,8 @@ pub unsafe extern "C" fn gs_game_data_publisher_set(
         let key = unsafe { text(key, "key") }?;
         // SAFETY: header contract.
         let value = json_arg(unsafe { text(value_json, "value_json") }?, "value_json")?;
-        let handle = publisher
-            .handle
-            .as_ref()
-            .ok_or_else(|| GsError::invalid("publisher stopped"))?;
+        let handle =
+            live(&publisher.handle).ok_or_else(|| GsError::invalid("publisher stopped"))?;
         match ttl_arg(ttl_seconds) {
             Some(ttl) => sdk(handle.set_with_ttl(key, value, ttl)),
             None => sdk(handle.set(key, value)),
@@ -1924,8 +1951,54 @@ pub unsafe extern "C" fn gs_game_data_publisher_remove(
         else {
             return;
         };
-        if let Some(handle) = &publisher.handle {
+        if let Some(handle) = live(&publisher.handle) {
             handle.remove(key);
+        }
+    });
+}
+
+/// Keeps a document with a TTL alive: its latest value is sent again (with a
+/// new sequence number) every TTL/2 after it was stored, never more often
+/// than every 5 s, until gs_game_data_publisher_stop_keep_alive, a set
+/// without TTL or a removal. The key's latest value must have a TTL (10 s at
+/// least). Each refresh costs one entry of the rate limits and sends an
+/// update to the pages showing the key: when the value rarely changes, prefer
+/// a TTL of 60 s or more, or no TTL and a removal before
+/// gs_game_data_publisher_shutdown.
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_data_publisher_keep_alive(
+    publisher: *mut GsDataPublisher,
+    key: *const c_char,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        // SAFETY: header contract.
+        let publisher = unsafe { handle(publisher, "publisher") }?;
+        // SAFETY: header contract.
+        let key = unsafe { text(key, "key") }?;
+        let handle =
+            live(&publisher.handle).ok_or_else(|| GsError::invalid("publisher stopped"))?;
+        sdk(handle.keep_alive(key))
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// Stops refreshing the key; it expires at the end of its TTL.
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_data_publisher_stop_keep_alive(
+    publisher: *mut GsDataPublisher,
+    key: *const c_char,
+) {
+    quietly(|| {
+        // SAFETY: NULL or live handles and strings (header contract).
+        let (Some(publisher), Ok(key)) =
+            (unsafe { publisher.as_ref() }, unsafe { text(key, "key") })
+        else {
+            return;
+        };
+        if let Some(handle) = live(&publisher.handle) {
+            handle.stop_keep_alive(key);
         }
     });
 }
@@ -1939,8 +2012,8 @@ pub unsafe extern "C" fn gs_game_data_publisher_skipped_json(
     catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: NULL or a live handle (header contract).
         let skipped = unsafe { publisher.as_ref() }
-            .and_then(|p| p.handle.as_ref())
-            .map(gs::DataPublisher::skipped)
+            .and_then(|p| live(&p.handle))
+            .map(|h| h.skipped())
             .unwrap_or_default();
         if skipped.is_empty() {
             ptr::null_mut()
@@ -1951,8 +2024,127 @@ pub unsafe extern "C" fn gs_game_data_publisher_skipped_json(
     .unwrap_or(ptr::null_mut())
 }
 
-/// The failure of the last batch: a new GsError to free with gs_error_free,
-/// or NULL when the last batch was sent (or for a NULL publisher).
+/// An error as JSON for the results lists: {"message", "code"?, "httpStatus"?,
+/// "field"?, "reason"?, "requestId"?, "retryable"}.
+fn error_json(error: &gs::Error) -> serde_json::Value {
+    let mut out = serde_json::json!({
+        "message": error.to_string(),
+        "retryable": error.is_retryable(),
+    });
+    if let Some(api) = error.api() {
+        out["code"] = api.wire_code.clone().into();
+        out["httpStatus"] = api.status.into();
+        if let Some(field) = &api.field {
+            out["field"] = field.clone().into();
+        }
+        if let Some(reason) = &api.reason {
+            out["reason"] = reason.clone().into();
+        }
+        if let Some(id) = &api.request_id {
+            out["requestId"] = id.clone().into();
+        }
+    }
+    out
+}
+
+/// What became of each key since the last call, oldest first, as a JSON
+/// array; NULL when there is nothing new. Each item is {"key", "outcome"}
+/// with outcome "stored" or "removed" (+ "seq"), "owned_elsewhere"
+/// (+ "storedSeq": another writer owns the key) or "refused" (+ "error":
+/// {"message", "code", "httpStatus", "field", "reason", "requestId",
+/// "retryable"}; the value was dropped). At most the last 256 are kept (see
+/// gs_game_data_publisher_dropped_results). Values that will be retried are
+/// not listed. Free with gs_string_free.
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_data_publisher_results_json(
+    publisher: *const GsDataPublisher,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: NULL or a live handle (header contract).
+        let results = unsafe { publisher.as_ref() }
+            .and_then(|p| live(&p.handle))
+            .map(|h| h.results())
+            .unwrap_or_default();
+        if results.is_empty() {
+            return ptr::null_mut();
+        }
+        let items: Vec<serde_json::Value> = results
+            .iter()
+            .map(|result| {
+                let mut item = serde_json::json!({ "key": result.key });
+                match &result.outcome {
+                    gs::DataOutcome::Stored { seq } => {
+                        item["outcome"] = "stored".into();
+                        item["seq"] = (*seq).into();
+                    }
+                    gs::DataOutcome::Removed { seq } => {
+                        item["outcome"] = "removed".into();
+                        item["seq"] = (*seq).into();
+                    }
+                    gs::DataOutcome::OwnedElsewhere { stored_seq } => {
+                        item["outcome"] = "owned_elsewhere".into();
+                        item["storedSeq"] = (*stored_seq).into();
+                    }
+                    gs::DataOutcome::Refused(error) => {
+                        item["outcome"] = "refused".into();
+                        item["error"] = error_json(error);
+                    }
+                    _ => item["outcome"] = "other".into(),
+                }
+                item
+            })
+            .collect();
+        cstring(serde_json::Value::from(items).to_string()).into_raw()
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// Results dropped because gs_game_data_publisher_results_json was not called
+/// often enough. 0 for NULL.
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_data_publisher_dropped_results(
+    publisher: *const GsDataPublisher,
+) -> u64 {
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: NULL or a live handle (header contract).
+        unsafe { publisher.as_ref() }
+            .and_then(|p| live(&p.handle))
+            .map_or(0, |h| h.dropped_results())
+    }))
+    .unwrap_or(0)
+}
+
+/// The highest seq the stored keys had when the publisher started (0 when
+/// none): every entry is numbered above it. Returns false (and leaves *out)
+/// until the publisher has read the stored keys.
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_data_publisher_seq_base(
+    publisher: *const GsDataPublisher,
+    out: *mut u64,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: NULL or a live handle (header contract).
+        let base = unsafe { publisher.as_ref() }
+            .and_then(|p| live(&p.handle))
+            .and_then(|h| h.seq_base());
+        match base {
+            Some(base) => {
+                // SAFETY: checked non-NULL above.
+                unsafe { put(out, base) };
+                true
+            }
+            None => false,
+        }
+    }))
+    .unwrap_or(false)
+}
+
+/// The failure of the last batch (or of one of its entries): a new GsError
+/// to free with gs_error_free, or NULL when the last batch went through (or
+/// for a NULL publisher).
 #[no_mangle]
 pub unsafe extern "C" fn gs_game_data_publisher_last_error(
     publisher: *const GsDataPublisher,
@@ -1960,8 +2152,8 @@ pub unsafe extern "C" fn gs_game_data_publisher_last_error(
     catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: NULL or a live handle (header contract).
         unsafe { publisher.as_ref() }
-            .and_then(|p| p.handle.as_ref())
-            .and_then(gs::DataPublisher::last_error)
+            .and_then(|p| live(&p.handle))
+            .and_then(|h| h.last_error())
             .map_or(ptr::null_mut(), |error| {
                 Box::into_raw(Box::new(GsError::from_sdk(&error)))
             })
@@ -1969,6 +2161,91 @@ pub unsafe extern "C" fn gs_game_data_publisher_last_error(
     .unwrap_or(ptr::null_mut())
 }
 
+/// The status of a flush that ran out of time: GS_STATUS_TIMEOUT, and the
+/// items still waiting as a JSON array in *unsent_json_out (when not NULL).
+///
+/// SAFETY: `unsent_json_out` is NULL or a valid, writable `char **`.
+unsafe fn flushed(
+    result: Result<(), gs::Unsent>,
+    unsent_json_out: *mut *mut c_char,
+) -> Result<(), GsError> {
+    let result = result.map_err(|unsent| {
+        let message = unsent.to_string();
+        if !unsent_json_out.is_null() {
+            let json = serde_json::Value::from(unsent.pending).to_string();
+            // SAFETY: non-NULL and writable per the contract.
+            unsafe { put(unsent_json_out, cstring(json).into_raw()) };
+        }
+        GsError::new(GsStatus::Timeout, message)
+    });
+    if result.is_ok() && !unsent_json_out.is_null() {
+        // SAFETY: non-NULL and writable per the contract.
+        unsafe { put(unsent_json_out, ptr::null_mut()) };
+    }
+    result
+}
+
+/// Waits up to timeout_ms until everything given so far was sent (stored,
+/// refused or owned elsewhere), within the usual rate. GS_STATUS_TIMEOUT when
+/// time ran out: *unsent_json_out (may be NULL; set to NULL on success) gets
+/// the keys still waiting as a JSON array, free with gs_string_free; they are
+/// still sent later. Blocks: not from a Gridspawn callback.
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_data_publisher_flush(
+    publisher: *mut GsDataPublisher,
+    timeout_ms: u32,
+    unsent_json_out: *mut *mut c_char,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        // SAFETY: header contract.
+        let publisher = unsafe { handle(publisher, "publisher") }?;
+        let handle =
+            live(&publisher.handle).ok_or_else(|| GsError::invalid("publisher stopped"))?;
+        let timeout = Duration::from_millis(u64::from(timeout_ms));
+        let result = block_on(&publisher._rt, handle.flush(timeout))?;
+        // SAFETY: header contract.
+        unsafe { flushed(result, unsent_json_out) }
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// gs_game_data_publisher_flush, then stops the publisher, so removals and
+/// last values are not lost at shutdown. Later calls report "publisher
+/// stopped"; free it with gs_game_data_publisher_free as usual. Keep-alive
+/// stops; kept documents expire at the end of their TTL.
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_data_publisher_shutdown(
+    publisher: *mut GsDataPublisher,
+    timeout_ms: u32,
+    unsent_json_out: *mut *mut c_char,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        // SAFETY: header contract.
+        let publisher = unsafe { handle(publisher, "publisher") }?;
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(GsError::invalid(
+                "blocking call from a Gridspawn callback or from inside an async runtime",
+            ));
+        }
+        let handle =
+            take(&publisher.handle).ok_or_else(|| GsError::invalid("publisher stopped"))?;
+        let timeout = Duration::from_millis(u64::from(timeout_ms));
+        let result = block_on(&publisher._rt, handle.flush(timeout))?;
+        // The task stops when the last reference goes (now, unless another
+        // thread is inside a call).
+        drop(handle);
+        // SAFETY: header contract.
+        unsafe { flushed(result, unsent_json_out) }
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// Stops the publisher at once (entries not sent yet are lost; see
+/// gs_game_data_publisher_shutdown) and frees it. NULL is ignored.
 #[no_mangle]
 pub unsafe extern "C" fn gs_game_data_publisher_free(publisher: *mut GsDataPublisher) {
     if publisher.is_null() {
@@ -1976,9 +2253,9 @@ pub unsafe extern "C" fn gs_game_data_publisher_free(publisher: *mut GsDataPubli
     }
     quietly(|| {
         // SAFETY: allocated by the library, freed once (header contract).
-        let mut publisher = unsafe { Box::from_raw(publisher) };
+        let publisher = unsafe { Box::from_raw(publisher) };
         // Stop the task before the runtime reference goes.
-        drop(publisher.handle.take());
+        drop(take(&publisher.handle));
     });
 }
 
@@ -2029,6 +2306,212 @@ pub unsafe extern "C" fn gs_game_event_emit(
     };
     // SAFETY: header contract for `error`.
     unsafe { boundary(error, body) }
+}
+
+/// Starts an event publisher on the client's runtime: events are sent in
+/// order, one at a time and at most 10 a second; network errors, 5xx and 429
+/// are retried with the same Idempotency-Key (backing off up to 30 s).
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_event_publisher_spawn(
+    client: *mut GsClient,
+    out: *mut *mut GsEventPublisher,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        require(out, "out")?;
+        // SAFETY: header contract.
+        let client = unsafe { handle(client, "client") }?;
+        let publisher = {
+            let _entered = client.rt.get().enter();
+            client.client.game().spawn_event_publisher()
+        };
+        let handle = GsEventPublisher {
+            handle: Mutex::new(Some(Arc::new(publisher))),
+            _rt: client.rt.clone(),
+        };
+        // SAFETY: checked non-NULL above.
+        unsafe { put(out, Box::into_raw(Box::new(handle))) };
+        Ok(())
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// Queues an event: payload_json is a JSON object (at most 4 KiB). id is the
+/// Idempotency-Key, [A-Za-z0-9_-]{8,64}; NULL = generated. *id_out (may be
+/// NULL) gets the key used, free with gs_string_free. Checked here; never
+/// blocks. At most 1000 events wait; more is GS_STATUS_INVALID_ARGUMENT.
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_event_publisher_emit(
+    publisher: *mut GsEventPublisher,
+    name: *const c_char,
+    payload_json: *const c_char,
+    id: *const c_char,
+    id_out: *mut *mut c_char,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        // SAFETY: header contract.
+        let publisher = unsafe { handle(publisher, "publisher") }?;
+        // SAFETY: header contract.
+        let name = unsafe { text(name, "name") }?;
+        // SAFETY: header contract.
+        let payload = json_arg(
+            unsafe { text(payload_json, "payload_json") }?,
+            "payload_json",
+        )?;
+        // SAFETY: header contract.
+        let id = unsafe { optional_text(id, "id") }?;
+        let handle =
+            live(&publisher.handle).ok_or_else(|| GsError::invalid("publisher stopped"))?;
+        let used = match id {
+            Some(id) => sdk(handle.emit_with_id(name, payload, id))?,
+            None => sdk(handle.emit(name, payload))?,
+        };
+        if !id_out.is_null() {
+            // SAFETY: non-NULL and writable (header contract).
+            unsafe { put(id_out, cstring(used).into_raw()) };
+        }
+        Ok(())
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// Events sent or refused since the last call, oldest first, as a JSON array;
+/// NULL when there is nothing new. Each item is {"id" (the Idempotency-Key),
+/// "ok": true, "eventId", "duplicate"} or {"id", "ok": false, "error": {...}}
+/// (refused for good; the event was dropped). At most the last 256 are kept.
+/// Free with gs_string_free.
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_event_publisher_results_json(
+    publisher: *const GsEventPublisher,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: NULL or a live handle (header contract).
+        let results = unsafe { publisher.as_ref() }
+            .and_then(|p| live(&p.handle))
+            .map(|h| h.results())
+            .unwrap_or_default();
+        if results.is_empty() {
+            return ptr::null_mut();
+        }
+        let items: Vec<serde_json::Value> = results
+            .iter()
+            .map(|result| match &result.outcome {
+                Ok(receipt) => serde_json::json!({
+                    "id": result.id, "ok": true,
+                    "eventId": receipt.id, "duplicate": receipt.duplicate,
+                }),
+                Err(error) => serde_json::json!({
+                    "id": result.id, "ok": false, "error": error_json(error),
+                }),
+            })
+            .collect();
+        cstring(serde_json::Value::from(items).to_string()).into_raw()
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// Events waiting, the one in flight included. 0 for NULL.
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_event_publisher_queued(
+    publisher: *const GsEventPublisher,
+) -> usize {
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: NULL or a live handle (header contract).
+        unsafe { publisher.as_ref() }
+            .and_then(|p| live(&p.handle))
+            .map_or(0, |h| h.queued())
+    }))
+    .unwrap_or(0)
+}
+
+/// The last failure, retried or not: a new GsError to free with
+/// gs_error_free, or NULL (cleared by the next event sent).
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_event_publisher_last_error(
+    publisher: *const GsEventPublisher,
+) -> *mut GsError {
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: NULL or a live handle (header contract).
+        unsafe { publisher.as_ref() }
+            .and_then(|p| live(&p.handle))
+            .and_then(|h| h.last_error())
+            .map_or(ptr::null_mut(), |error| {
+                Box::into_raw(Box::new(GsError::from_sdk(&error)))
+            })
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// Waits up to timeout_ms until the queue is empty. GS_STATUS_TIMEOUT when
+/// time ran out: *unsent_json_out (may be NULL; set to NULL on success) gets
+/// the ids still queued as a JSON array, free with gs_string_free; they are
+/// still sent later. Blocks: not from a Gridspawn callback.
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_event_publisher_flush(
+    publisher: *mut GsEventPublisher,
+    timeout_ms: u32,
+    unsent_json_out: *mut *mut c_char,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        // SAFETY: header contract.
+        let publisher = unsafe { handle(publisher, "publisher") }?;
+        let handle =
+            live(&publisher.handle).ok_or_else(|| GsError::invalid("publisher stopped"))?;
+        let timeout = Duration::from_millis(u64::from(timeout_ms));
+        let result = block_on(&publisher._rt, handle.flush(timeout))?;
+        // SAFETY: header contract.
+        unsafe { flushed(result, unsent_json_out) }
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// gs_game_event_publisher_flush, then stops the publisher. Later calls
+/// report "publisher stopped"; free it with gs_game_event_publisher_free.
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_event_publisher_shutdown(
+    publisher: *mut GsEventPublisher,
+    timeout_ms: u32,
+    unsent_json_out: *mut *mut c_char,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        // SAFETY: header contract.
+        let publisher = unsafe { handle(publisher, "publisher") }?;
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(GsError::invalid(
+                "blocking call from a Gridspawn callback or from inside an async runtime",
+            ));
+        }
+        let handle =
+            take(&publisher.handle).ok_or_else(|| GsError::invalid("publisher stopped"))?;
+        let timeout = Duration::from_millis(u64::from(timeout_ms));
+        let result = block_on(&publisher._rt, handle.flush(timeout))?;
+        drop(handle);
+        // SAFETY: header contract.
+        unsafe { flushed(result, unsent_json_out) }
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// Stops the publisher at once (queued events are lost; see
+/// gs_game_event_publisher_shutdown) and frees it. NULL is ignored.
+#[no_mangle]
+pub unsafe extern "C" fn gs_game_event_publisher_free(publisher: *mut GsEventPublisher) {
+    if publisher.is_null() {
+        return;
+    }
+    quietly(|| {
+        // SAFETY: allocated by the library, freed once (header contract).
+        let publisher = unsafe { Box::from_raw(publisher) };
+        // Stop the task before the runtime reference goes.
+        drop(take(&publisher.handle));
+    });
 }
 
 // ---- errors ----------------------------------------------------------------

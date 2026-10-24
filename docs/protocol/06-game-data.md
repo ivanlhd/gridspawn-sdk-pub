@@ -21,11 +21,14 @@ also publishes **events** ("round won", "boss defeated"). Clubs build their
 pages from the game's keys with the club layout editor. Writing data changes
 no page by itself.
 
-- **No game session is needed.** Data belongs to the app and environment of
-  the server credential.
-- **Public by nature.** Production data appears on public club pages,
-  readable by anyone. Publish display names only, never emails, account or
-  participant ids, or anything private (§6).
+- **No game session is needed.** Data belongs to the app, stored under the
+  environment of the server credential.
+- **Public by nature.** Everything published can appear on public club
+  pages, readable by anyone. Development and staging data is not a preview:
+  it shows like any other. Publish display names only, never emails,
+  account or participant ids, or anything private (§6).
+- **One value per key on a page:** the production value when there is one,
+  otherwise the newest development or staging value.
 
 ## 1. Authentication — Current
 
@@ -33,7 +36,9 @@ no page by itself.
 Authorization: GridspawnServer <credential>
 ```
 - **Scope:** `game_data.write`, given to the server key in the Dev Hub.
-- **Module:** `game_data` must be switched on for the app and environment.
+- **Module:** `game_data` must be on for the app and environment. The
+  game's one "Game data" switch in the Dev Hub turns it on in every
+  environment.
 - **Origin:** any `Origin` header is refused (`data/browser_forbidden`).
   These routes are for game servers only.
 - **Caching:** every answer has `Cache-Control: no-store`.
@@ -63,7 +68,8 @@ PUT /v1/server/game-data
   more is `400 data/invalid_value`, field `entries`, reason `count`.
 - The body is at most 32 KiB.
 - **All or nothing:** a validation error or a quota breach refuses the whole
-  batch, and nothing is stored.
+  batch, and nothing is stored. Partial mode (§3.1, Proposed) will let a
+  writer keep the valid entries.
 
 Answer:
 
@@ -173,6 +179,36 @@ objectives or events.
 - **No clock is involved.** Server times in answers are for information
   only.
 
+### 3.1 Per-entry results (partial mode) — Proposed
+
+Not deployed yet. A writer may send this header with a write:
+
+```
+Gridspawn-Partial: 1
+```
+
+An edge with partial mode applies the valid entries and reports the others:
+
+```json
+{
+  "ok": true,
+  "accepted": 2,
+  "skipped":  [{ "key": "match.round", "storedSeq": 57 }],
+  "rejected": [{ "key": "scoreboard", "field": "set.scoreboard.value.players[3].name",
+                 "reason": "personal_data" }],
+  "quota": { "keys": 12, "maxKeys": 256, "bytes": 20480, "maxBytes": 262144 },
+  "requestId": "…"
+}
+```
+- **Shape:** `accepted` is a count. `skipped` gives the stored sequence
+  number as `storedSeq` (§3). `rejected` names each refused entry with its
+  JSON path and reason (§7).
+- **Every entry refused:** `400 data/invalid_value` with the same
+  `rejected` array.
+- **Batch-level failures:** 429 and 409 still refuse the whole batch.
+- **Without partial mode:** an edge ignores the header and answers as in
+  §2.1. A writer that sends the header reads both answers.
+
 ## 4. Events — Current
 
 ```
@@ -211,7 +247,8 @@ checked).
 
 ## 6. Public by nature — Current
 
-- **What to publish:** production game data is shown on public club pages.
+- **What to publish:** game data from every environment can be shown on
+  public club pages.
   Publish display names only. Never publish emails, account ids,
   participant ids or anything private.
 - **What the server refuses** (a safety net, not a filter to rely on):
@@ -242,11 +279,17 @@ There is no `stale_sequence` error: stale entries are skipped (§3).
 
 ## 8. SDKs — Current
 
-`gridspawn-server` 0.4.1 (Rust) and its C ABI `gridspawn-server-capi` 0.3.0
+`gridspawn-server` 0.5.0 (Rust) and its C ABI `gridspawn-server-capi` 0.4.0
 cover this document:
 - `client.game().data()`: `set`, `set_with_ttl`, `remove`, `set_many` and
   `list`.
-- 0.4.1: `Markers` / `Marker` build a §2.3 markers document with its limits
+  - A refused entry does not hold back the others: it is listed in
+    `DataAck::rejected`.
+  - Writes send `Gridspawn-Partial: 1` (§3.1) and read both answers. From
+    an all-or-nothing edge, the SDK drops the entry that `field` names and
+    sends the rest again with the same numbers, at most once per refused
+    entry.
+- `Markers` / `Marker` build a §2.3 markers document with its limits
   checked; `DataPublisher::set_markers` sends one.
 - `spawn_data_publisher(hz)` (1–5 Hz):
   - It sends the latest value per key, one batch per tick, oldest change
@@ -254,14 +297,26 @@ cover this document:
     frame.
   - It retries what can succeed later (network errors, 5xx, 429 after
     `Retry-After`) with the newest values.
-  - A refusal that retrying cannot fix drops those entries and is reported
-    as the last error: an invalid or personal-data value, or
-    `data/quota_exceeded`.
+  - A refusal that retrying cannot fix drops only the entries it concerns:
+    an invalid or personal-data value, or `data/quota_exceeded`. Over the
+    quota, the batch's removals are sent again on their own.
+  - `results()` gives each key's outcome: stored, removed, owned by another
+    writer, or refused.
+  - `flush` and `shutdown` send what is pending. Dropping the publisher
+    stops at once.
+  - `keep_alive(key)` sends a document's latest value again with a new
+    `seq` every TTL/2, never more often than every 5 s.
+  - It reads the listing once at start; `seq_base()` is the highest listed
+    `seq` (§3).
+- `spawn_event_publisher()`: a queue sent in order, at most 10 a second,
+  retried with the same `Idempotency-Key`.
 - `client.game().events().emit` and `emit_with_id`: an `Idempotency-Key` on
   every request, either generated or the caller's.
 - The ordering of §3: one in-process counter, seeded once from the listing,
   and one resend. No clock is involved.
-- The C ABI mirrors all of this (`gs_game_data_*`, `gs_game_event_emit`).
+- The C ABI mirrors all of this (`gs_game_data_*`, `gs_game_event_*`).
+- History: 0.4.0 first release; 0.4.1 markers; 0.5.0 per-entry results,
+  flush and shutdown, keep-alive, the event publisher, `seq_base`.
 
 Game clients and the Godot addon have nothing to do here: this is a
 server-side feature.
