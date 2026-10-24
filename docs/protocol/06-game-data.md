@@ -130,6 +130,11 @@ objectives or events.
     (minimum and maximum x and y) and a "Y points up" switch.
   - Publish in one stable coordinate space, and say in your own docs which
     one, so creators can set the area once.
+- **One layer, one document:** a "Game markers" layer draws exactly one
+  document (one key). A document cannot span several keys, and it does not
+  carry its own area: the "Game area" and "Y points up" are page settings.
+  For several groups (teams, objectives), publish one key per group; the
+  creator adds one layer for each.
 - **`id`:** stable for the same marker across updates. The page follows
   markers by id from one update to the next.
 - **`label`:** public, like all game data (§6). Display names only, never
@@ -237,7 +242,7 @@ There is no `stale_sequence` error: stale entries are skipped (§3).
 
 ## 8. SDKs — Current
 
-`gridspawn-server` 0.4.0 (Rust) and its C ABI `gridspawn-server-capi` 0.3.0
+`gridspawn-server` 0.4.1 (Rust) and its C ABI `gridspawn-server-capi` 0.3.0
 cover this document:
 - `client.game().data()`: `set`, `set_with_ttl`, `remove`, `set_many` and
   `list`.
