@@ -27,13 +27,39 @@ verifies them with `signtool verify /pa`, and zips them into `dist\`.
 
 ## Build (Windows)
 
-The voice crate builds Opus and WebRTC audio processing, so it needs the same
-tools as the Godot voice build: Visual Studio 2022 (x64), meson and ninja on
-`PATH`, and `LIBCLANG_PATH` pointing at LLVM's `bin`.
+The voice crate builds Opus (CMake) and WebRTC audio processing (meson and
+ninja, compiled by MSVC with `/std:c++20`), and generates its Rust bindings
+with bindgen, which runs LLVM's libclang over MSVC's headers. Build from an
+"x64 Native Tools Command Prompt for VS 2022" (or after `vcvars64.bat`), with:
 
 ```
+set CC=cl
+set CXX=cl
+set "LIBCLANG_PATH=C:\Program Files\LLVM\bin"
 cargo build --release
 ```
+
+`CC`/`CXX` make meson compile with MSVC even when LLVM, MinGW or Strawberry
+compilers are on `PATH`; `package_windows.ps1` sets the same three variables.
+
+Tested toolchain (the build that produced 0.1.1's companion, 2026-10-28):
+
+| Tool | Version |
+|---|---|
+| Rust (`rustc -V`) | 1.95.0, `stable-x86_64-pc-windows-msvc`; the crate needs 1.91 or newer |
+| Visual Studio 2022 | 17.14.18 (Community) |
+| MSVC toolset (`VCToolsVersion`) | 14.44.35207 (`cl` 19.44.35219) |
+| Windows SDK | 10.0.26100.0 |
+| LLVM, at `LIBCLANG_PATH` (`clang --version`) | 22.1.5 |
+| meson / ninja | 1.12.1 / 1.12.1 |
+| Python (for meson) | 3.12.10 |
+| CMake | 4.0.2 |
+
+Keep LLVM at least as new as MSVC's C++ library requires. With an older LLVM,
+bindgen stops with MSVC's `STL1000` error, "Unexpected compiler version,
+expected Clang NN.0.0 or newer" (the 14.44 toolset requires Clang 19). Newer
+MSVC toolsets than 14.44 are not tested yet. With several toolsets installed,
+`vcvars64.bat -vcvars_ver=14.44` selects the tested one.
 
 The executable is `target\release\gridspawn-companion.exe`; put it next to
 `gridspawn_rathena.dll`.

@@ -19,6 +19,10 @@ Background: `rathena-companion.md` (design, C surface) and
   **ninja**, and **LLVM** with `LIBCLANG_PATH` pointing at LLVM's `bin`
   folder. The build fetches some sources over the network (meson's abseil
   wrap).
+- **The tested versions** (MSVC toolset, LLVM, meson, ...) are listed in
+  `gridspawn-companion`'s README, under "Build (Windows)", together with the
+  environment variables to set. Start from those: the voice build is
+  sensitive to the MSVC and LLVM versions.
 - **A short checkout path**, for example `C:\gs`. The WebRTC audio build
   compiles sources through deep paths under `target\`; under a long root,
   cl.exe stops with "Cannot open source file" (its 260-character limit).
@@ -45,6 +49,9 @@ up in `examples\windows\<name>\build\Release\` of their crate.
 3. **Companion** (x64 Native Tools prompt):
    ```bat
    cd gridspawn-companion
+   set CC=cl
+   set CXX=cl
+   set "LIBCLANG_PATH=C:\Program Files\LLVM\bin"
    cargo build --release
    ```
 4. **Example game client** (x86). It needs steps 2 and 3 first: its
