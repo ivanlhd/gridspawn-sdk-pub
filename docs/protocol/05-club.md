@@ -42,10 +42,12 @@ chat `chat-gateway-rs/src/webhooks.rs`. Design and deploy:
    Core creates the game's SDK application, `game-<game id>` (or `game-` plus 24
    hex characters of the id's SHA-256 when the id does not fit
    `^[A-Za-z0-9_-]{3,128}$`), with `production` turned on.
-2. The owner makes a **server key** for an environment (`production`, `staging`
-   or `development`). It is shown once, with the App ID. At most 2 keys per
-   environment are active, so a server can move to a new key before the old one
-   is revoked. Keys carry the scopes `club.post` and `session.manage` (02).
+2. The owner makes a **server key** (**Dev Hub → Game servers → New server
+   key**). Every new key is made for the `production` environment; keys made
+   before this rule keep their environment. A key is shown once, with the App
+   ID. At most 2 keys per environment are active, so a server can move to a new
+   key before the old one is revoked. Keys carry the scopes `club.post` and
+   `session.manage` (02).
 3. The club's owner, or a member with **Manage Integrations**, chooses where each
    **feature** goes: a feature is a name the server sends with its posts
    (`patch-notes`, `match.results`; `^[a-z0-9][a-z0-9_.-]{0,47}$`), and its

@@ -1,0 +1,27 @@
+[package]
+name = "gridspawn-rathena-dll"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+description = "The thin game-side DLL of the Gridspawn companion for rAthena / Ragexe clients (x86 C ABI over local pipes)."
+authors = ["Gridspawn"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ivanlhd/gridspawn-sdk-pub"
+# Not on crates.io yet.
+publish = false
+
+[lib]
+name = "gridspawn_rathena"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+getrandom = "0.3"
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+panic = "unwind"

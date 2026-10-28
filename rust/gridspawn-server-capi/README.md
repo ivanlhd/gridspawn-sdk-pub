@@ -1,8 +1,8 @@
 # gridspawn-server-capi
 
 C ABI for [`gridspawn-server`](../gridspawn-server): Gridspawn's server SDK
-for C, C++ and Unreal. Server-side only. Linux is built and tested; other
-platforms are not yet.
+for C, C++ and Unreal. Server-side only. Built and tested on Linux x86_64
+and Windows x64 (MSVC); other platforms are not yet.
 
 Status: 0.4.0, source only. Licence: MIT OR Apache-2.0 (see the end of this
 file). ABI version 1 (`GS_ABI_VERSION`). The rules are the preamble of
@@ -28,6 +28,78 @@ rewrites it).
 Linking the static library on Linux also needs `-lpthread -ldl -lm -lrt` (the
 set the tests use); `cargo rustc --lib --crate-type staticlib -- --print native-static-libs`
 prints the full list for your toolchain.
+
+## Windows (x64, MSVC)
+
+Build from a "x64 Native Tools Command Prompt for VS 2022" (or after
+`vcvars64.bat`), with a short checkout path:
+
+```bat
+cd gridspawn-sdk-pub\rust\gridspawn-server-capi
+cargo build --release
+```
+
+`target\release\` then holds:
+
+| File | Use |
+|---|---|
+| `gridspawn_server_capi.dll` | the library, shipped next to your server executable |
+| `gridspawn_server_capi.dll.lib` | import library: link it to use the DLL |
+| `gridspawn_server_capi.lib` | static library |
+| `gridspawn_server_capi.pdb` | debug symbols |
+
+- **Header:** the same `include/gridspawn_server.h` (the header test passes
+  on Windows).
+- **Static linking** also needs `bcrypt.lib advapi32.lib kernel32.lib ntdll.lib
+  userenv.lib ws2_32.lib dbghelp.lib` (`cargo rustc --release --lib
+  --crate-type staticlib -- --print native-static-libs`).
+- **CRT:** the library uses the release dynamic CRT (`/defaultlib:msvcrt`):
+  compile your code with `/MD` (Visual Studio: Runtime Library
+  "Multi-threaded DLL").
+- **Credential file:** the "readable by other users" check of
+  `gs_credential_from_file` is Unix-only. On Windows, protect the key file
+  with NTFS permissions (only the service account may read it).
+- **Tests:** `cargo test` compiles `examples/c/club_post.c` with `cl`, so run
+  it from the same prompt.
+
+`examples/windows/rathena_voice/` is a Visual Studio 2022 project (C, x64) for
+a game server whose players have no Gridspawn account, for example an rAthena
+map-server. It uses one session per voice group (a party or a guild),
+the layout of `docs/platforms/rathena-packets.md`:
+- the party's session is created when its first member asks for voice
+  (`maxParticipants` 64, lease renewed by the library, one `match` room in
+  channels mode);
+- the character is admitted as a guest (`externalPlayerId`
+  `rathena-char-<char-id>`, never an email; the character name as display
+  name) with the channel `party:<id>`, and gets a voice ticket (printed by
+  length only);
+- switch to guild voice: the guild's session, a ticket for it, removal from
+  the party's voice (no channel), and the party's session ended because it
+  is empty;
+- a server mute and unmute in the guild's session.
+
+For a local test with the x86 example game client of `gridspawn-rathena-dll`,
+`--print-ticket` prints the party ticket once and skips the switch and the
+mute (testing only).
+
+Configurations: `Release` links the DLL and copies it next to the executable;
+`ReleaseStatic` links the static library.
+
+```bat
+msbuild examples\windows\rathena_voice\rathena_voice.vcxproj /p:Configuration=Release /p:Platform=x64
+set GRIDSPAWN_APP_ID=game-...
+set GRIDSPAWN_ENVIRONMENT=development
+set GRIDSPAWN_CREDENTIAL_FILE=C:\keys\gridspawn-server-key
+examples\windows\rathena_voice\build\Release\rathena_voice.exe prontera 150001 "Aria Swordsman" 42 7
+```
+
+Limits that shape a large game (protocol 04 §1 and §4.2):
+- A session has one voice room clients can join (`match`), and a room holds
+  at most **64** players in voice, whatever the session's
+  `maxParticipants`.
+- Channels only decide who hears whom inside that room.
+- The app and environment must allow guests (02 §4), and a guest's ticket
+  can carry only the modules guests may use (voice on the test application).
 
 ## Example
 

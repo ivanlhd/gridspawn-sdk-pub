@@ -2,7 +2,7 @@
 
 ## 0.4.0 (2026-10-23)
 
-- **The in-app sign-in needs a Gridspawn desktop app release that is not out yet.** Until then, `sign_in()` uses the browser exactly as before.
+- **The released Gridspawn desktop app on Windows** (0.1.12+604, stable since 2026-10-27) answers the in-app sign-in; with an older app (or on Linux/macOS, where the app hosts no pipe) the browser is used as before.
 - One login (gridspawn-client 0.3.0): `sign_in()` asks the Gridspawn app when it is open, and the player just confirms there; otherwise the browser opens as before. The player has 2 minutes to answer in the app (`sign_in/timed_out` after that); declining is `auth/access_denied`.
 - `browser_only` property (always use the browser); `sign_in_method()` returns `"app"`, `"browser"` or `""`. `cancel_sign_in()` also closes the app's confirmation.
 

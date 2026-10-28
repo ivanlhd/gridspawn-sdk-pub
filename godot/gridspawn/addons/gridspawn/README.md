@@ -66,8 +66,9 @@ the player signs in again.
   in, `sign_in()` asks the app: the player confirms there and no browser
   opens. Otherwise, or if the app is not installed, the browser opens as
   before. You do not need to do anything for this.
-  - **This needs a Gridspawn desktop app release that is not out yet.**
-    Until it ships, `sign_in()` uses the browser exactly as before.
+  - **The released Gridspawn desktop app on Windows** (0.1.12+604, stable
+    since 2026-10-27) answers the in-app sign-in; with an older app (or on
+    Linux/macOS, where the app hosts no pipe) the browser is used as before.
   - The player has 2 minutes to answer in the app; then `sign_in_failed`
     comes with `sign_in/timed_out`.
   - Declining in the app is `auth/access_denied`, as in the browser.

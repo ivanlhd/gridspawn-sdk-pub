@@ -65,10 +65,9 @@ async fn main() -> Result<(), gridspawn_client::Error> {
 }
 ```
 
-- **Needs a Gridspawn desktop app release that is not out yet.** Until it
-  ships, `sign_in` finds no app that can answer and uses the browser exactly
-  as before. Nothing changes for players, and nothing needs changing in your
-  game when the app release comes.
+- **The released Gridspawn desktop app on Windows** (0.1.12+604, stable
+  since 2026-10-27) answers the in-app sign-in; with an older app (or on
+  Linux/macOS, where the app hosts no pipe) the browser is used as before.
 - **One login.** If the player has the Gridspawn desktop app open and signed
   in, `sign_in` asks the app (protocol 01 §6, Proposed). The player confirms there,
   and no browser opens. Otherwise, or if the app is not installed or cannot

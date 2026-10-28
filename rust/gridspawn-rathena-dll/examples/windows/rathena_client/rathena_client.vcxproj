@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Visual Studio 2022 (v143), x86 (Win32): the 32-bit game side. Build first, from
+     sdk\rust: the DLL for i686-pc-windows-msvc (gridspawn-rathena-dll) and the companion
+     for x64 (gridspawn-companion), both with the release profile. The post-build step copies
+     gridspawn_rathena.dll and gridspawn-companion.exe next to the exe. The exe loads the DLL
+     with LoadLibrary, so nothing is linked. -->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{8C3D1A52-7E14-4F6B-A2D9-5B0E6C1F3A27}</ProjectGuid>
+    <RootNamespace>rathena_client</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <GridspawnDll>$(ProjectDir)..\..\..\</GridspawnDll>
+    <GridspawnCompanion>$(ProjectDir)..\..\..\..\gridspawn-companion\</GridspawnCompanion>
+    <OutDir>$(ProjectDir)build\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)build\obj\$(Configuration)\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(GridspawnDll)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <!-- Explicit, like the header: every gs_rag_* function and callback is __cdecl. -->
+      <CallingConvention>Cdecl</CallingConvention>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+    </Link>
+    <PostBuildEvent>
+      <Command>copy /Y "$(GridspawnDll)target\i686-pc-windows-msvc\release\gridspawn_rathena.dll" "$(OutDir)" &amp;&amp; copy /Y "$(GridspawnCompanion)target\release\gridspawn-companion.exe" "$(OutDir)"</Command>
+      <Message>Copy gridspawn_rathena.dll (x86) and gridspawn-companion.exe (x64) next to the executable</Message>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="rathena_client.c" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

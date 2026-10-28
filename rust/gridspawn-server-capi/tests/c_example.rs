@@ -1,6 +1,7 @@
-//! Compiles examples/c/club_post.c with the system cc against the static
-//! library built by this `cargo test`, and runs it against a mock server
-//! (and, under gate 1, against the live test application).
+//! Compiles examples/c/club_post.c against the static library built by this
+//! `cargo test` (the system cc on Unix, MSVC cl on Windows), and runs it
+//! against a mock server (and, under gate 1, against the live test
+//! application).
 
 use std::{
     collections::HashSet,
@@ -34,7 +35,17 @@ fn compile() -> PathBuf {
 fn compile_example() -> PathBuf {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let profile = profile_dir();
-    let library = profile.join("libgridspawn_server_capi.a");
+    let name = if cfg!(windows) {
+        "gridspawn_server_capi.lib"
+    } else {
+        "libgridspawn_server_capi.a"
+    };
+    // `cargo test` on Windows leaves the staticlib in deps/ (it does not copy
+    // it next to the import library); `cargo build` does.
+    let library = [profile.join(name), profile.join("deps").join(name)]
+        .into_iter()
+        .find(|path| path.exists())
+        .unwrap_or_else(|| profile.join(name));
     assert!(
         library.exists(),
         "{} is missing (it is built by `cargo test` because the crate lists staticlib)",
@@ -42,36 +53,72 @@ fn compile_example() -> PathBuf {
     );
     let out_dir = profile.join("c-example");
     std::fs::create_dir_all(&out_dir).unwrap();
-    let binary = out_dir.join("club_post");
-    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
-    let output = Command::new(&cc)
-        .args(["-std=c99", "-Wall", "-Wextra", "-Werror", "-I"])
-        .arg(crate_dir.join("include"))
-        .arg(crate_dir.join("examples/c/club_post.c"))
-        .arg(&library)
-        .args(["-lpthread", "-ldl", "-lm", "-lrt", "-o"])
-        .arg(&binary)
-        .output()
-        .unwrap_or_else(|error| panic!("the C compiler `{cc}` could not run: {error}"));
+    let binary = out_dir.join(format!("club_post{}", std::env::consts::EXE_SUFFIX));
+    let output = if cfg!(windows) {
+        // MSVC (run from a Developer prompt, or after vcvars64.bat). The system
+        // libraries are the list `--print native-static-libs` gives for the
+        // staticlib; `getenv` needs _CRT_SECURE_NO_WARNINGS under /WX.
+        Command::new("cl")
+            .current_dir(&out_dir)
+            .args(["/nologo", "/W4", "/WX", "/D_CRT_SECURE_NO_WARNINGS", "/I"])
+            .arg(crate_dir.join("include"))
+            .arg(crate_dir.join("examples/c/club_post.c"))
+            .arg(&library)
+            .args(WINDOWS_SYSTEM_LIBS)
+            .arg(format!("/Fe:{}", binary.display()))
+            .output()
+            .unwrap_or_else(|error| panic!("the MSVC compiler `cl` could not run: {error}"))
+    } else {
+        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
+        Command::new(&cc)
+            .args(["-std=c99", "-Wall", "-Wextra", "-Werror", "-I"])
+            .arg(crate_dir.join("include"))
+            .arg(crate_dir.join("examples/c/club_post.c"))
+            .arg(&library)
+            .args(["-lpthread", "-ldl", "-lm", "-lrt", "-o"])
+            .arg(&binary)
+            .output()
+            .unwrap_or_else(|error| panic!("the C compiler `{cc}` could not run: {error}"))
+    };
     assert!(
         output.status.success(),
-        "cc failed:\n{}",
+        "the C compiler failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     binary
 }
 
+/// What the static library needs on Windows (MSVC, x86_64), from
+/// `cargo rustc --lib --crate-type staticlib -- --print native-static-libs`.
+const WINDOWS_SYSTEM_LIBS: [&str; 7] = [
+    "bcrypt.lib",
+    "advapi32.lib",
+    "kernel32.lib",
+    "ntdll.lib",
+    "userenv.lib",
+    "ws2_32.lib",
+    "dbghelp.lib",
+];
+
 fn credential_file(dir: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let file = dir.join("credential");
     std::fs::write(&file, format!("{CRED}\n")).unwrap();
-    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     file
 }
 
 fn run(binary: &Path, env: &[(&str, String)], args: &[&str]) -> Output {
     let mut command = Command::new(binary);
     command.env_clear().args(args);
+    // Windows sockets need SystemRoot even in an otherwise empty environment.
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", root);
+    }
     for (name, value) in env {
         command.env(name, value);
     }

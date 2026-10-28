@@ -156,8 +156,8 @@ server over the game's own connection; the server redeems it (02 §3).
 
 ## 6. Sign in through the Gridspawn app — Proposed
 
-Not implemented; the shape is under review. Source: the platform's one-login
-design note (`docs/game-sdk/one-login.md`, §2 and §6).
+Proposed; the released desktop app (0.1.12+604) answers it. This section
+specifies the app-brokered flow.
 
 When the player has the Gridspawn desktop app open and signed in, a native
 game can ask the app instead of opening the browser. The player confirms in
@@ -231,8 +231,10 @@ Client → app, opcode 1, once per connection:
 - **The player's answer:** the app shows a confirmation naming the game and
   the requested scopes. If the player has already agreed to these scopes for
   this game, the app answers without asking and shows a short notice. The
-  client waits for the answer as long as it would wait for the browser (5
-  minutes by default).
+  app dismisses an unanswered confirmation after 5 minutes. `gridspawn-client`
+  waits at most 120 s, or its sign-in timeout when that is shorter
+  (`sdk/rust/gridspawn-client/src/broker.rs:26`, `auth.rs:435`), then closes
+  the connection, which dismisses the confirmation.
 - **Cancelling:** if the client closes the connection, the app dismisses the
   confirmation.
 - **One request per connection:** one `AUTHORIZE` per connection, and the

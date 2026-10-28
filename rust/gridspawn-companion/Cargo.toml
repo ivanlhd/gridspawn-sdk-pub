@@ -1,0 +1,46 @@
+[package]
+name = "gridspawn-companion"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+description = "The Gridspawn companion process for rAthena / Ragexe clients: voice, sign-in and presence for a 32-bit game through gridspawn_rathena.dll."
+authors = ["Gridspawn"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ivanlhd/gridspawn-sdk-pub"
+# Not on crates.io yet.
+publish = false
+
+[features]
+# Testing-only switches (the launch line's testTone). Off in the signed package;
+# package_windows.ps1 asserts that.
+testing = []
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
+gridspawn-client = { path = "../gridspawn-client" }
+gridspawn-voice = { path = "../gridspawn-voice", features = ["cpal"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+url = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+# examples/two_client_voice.rs plays the map-server.
+gridspawn-server = { path = "../gridspawn-server" }
+
+[[example]]
+name = "two_client_voice"
+required-features = ["testing"]
+
+[profile.release]
+strip = true
+lto = "thin"
