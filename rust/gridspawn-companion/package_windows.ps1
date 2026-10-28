@@ -77,6 +77,14 @@ function Invoke-Build([string]$Arch, [string]$Dir, [string]$CargoArgs, [string]$
 }
 
 if (-not $SkipSigning) { Assert-SigningReady }
+# An absolute -MesonDir that holds meson.exe: checked before anything is built.
+if ($MesonDir) {
+  if (!(Test-Path $MesonDir -PathType Container)) { throw "-MesonDir not found: $MesonDir" }
+  $MesonDir = (Resolve-Path $MesonDir).Path
+  if (!(Test-Path (Join-Path $MesonDir "meson.exe") -PathType Leaf)) {
+    throw "meson.exe not found in -MesonDir ($MesonDir)."
+  }
+}
 if ($companion.Length -gt 24) {
   Write-Warning "Long checkout path ($($companion.Length) characters): the WebRTC build may fail with 'Cannot open source file'."
 }
@@ -84,8 +92,17 @@ if ($companion.Length -gt 24) {
 if (-not $SkipBuild) {
   Invoke-Build "x64_x86" $dllCrate "--target i686-pc-windows-msvc"
   $env_ = "set CC=cl&& set CXX=cl&& set `"LIBCLANG_PATH=$LibclangDir`"&&"
-  if ($MesonDir) { $env_ += " set `"PATH=$MesonDir;%PATH%`"&&" }
-  Invoke-Build "x64" $companion "" $env_
+  # -MesonDir goes on this process's PATH, which the build's cmd inherits and vcvarsall
+  # extends. Not as `set PATH=<dir>;%PATH%` inside the one-line cmd: cmd expands %PATH%
+  # when it parses the line, before vcvarsall runs, so the MSVC tools would drop off PATH
+  # and meson setup would fail without a message.
+  $pathBefore = $env:PATH
+  if ($MesonDir) { $env:PATH = "$MesonDir;$env:PATH" }
+  try {
+    Invoke-Build "x64" $companion "" $env_
+  } finally {
+    $env:PATH = $pathBefore
+  }
 }
 
 $dll = Join-Path $dllCrate "target\i686-pc-windows-msvc\release\gridspawn_rathena.dll"

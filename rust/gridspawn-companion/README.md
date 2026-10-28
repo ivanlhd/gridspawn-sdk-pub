@@ -61,6 +61,19 @@ expected Clang NN.0.0 or newer" (the 14.44 toolset requires Clang 19). Newer
 MSVC toolsets than 14.44 are not tested yet. With several toolsets installed,
 `vcvars64.bat -vcvars_ver=14.44` selects the tested one.
 
+Use one toolset for the whole build and never mix 14.xx toolsets in one
+`target\`: clean the WebRTC crate after any toolset or LLVM change, since its
+meson build directory keeps the compiler it was first configured with.
+
+```
+cargo clean --release -p webrtc-audio-processing-sys
+```
+
+(Without `--release`, `cargo clean -p` cleans only the debug build.)
+
+Rust releases newer than 1.95.0 are not tested; `rustup toolchain install
+1.95.0` and `cargo +1.95.0 build --release` use the tested one.
+
 The executable is `target\release\gridspawn-companion.exe`; put it next to
 `gridspawn_rathena.dll`.
 
