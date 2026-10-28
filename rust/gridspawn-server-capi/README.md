@@ -88,7 +88,7 @@ Configurations: `Release` links the DLL and copies it next to the executable;
 ```bat
 msbuild examples\windows\rathena_voice\rathena_voice.vcxproj /p:Configuration=Release /p:Platform=x64
 set GRIDSPAWN_APP_ID=game-...
-set GRIDSPAWN_ENVIRONMENT=development
+set GRIDSPAWN_ENVIRONMENT=production
 set GRIDSPAWN_CREDENTIAL_FILE=C:\keys\gridspawn-server-key
 examples\windows\rathena_voice\build\Release\rathena_voice.exe prontera 150001 "Aria Swordsman" 42 7
 ```
@@ -108,7 +108,7 @@ Limits that shape a large game (protocol 04 §1 and §4.2):
 ```sh
 cc -std=c99 examples/c/club_post.c -Iinclude target/release/libgridspawn_server_capi.a \
    -lpthread -ldl -lm -lrt -o club_post
-GRIDSPAWN_APP_ID=game-… GRIDSPAWN_ENVIRONMENT=development \
+GRIDSPAWN_APP_ID=game-… GRIDSPAWN_ENVIRONMENT=production \
 GRIDSPAWN_CREDENTIAL_FILE=/path/to/0600-key-file ./club_post patch-notes
 ```
 

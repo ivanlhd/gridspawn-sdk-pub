@@ -12,7 +12,8 @@
 //!
 //!   set GRIDSPAWN_TEST_APP_ID=...            (an app with guests and voice on)
 //!   set GRIDSPAWN_TEST_CREDENTIAL_FILE=...   (its server key)
-//!   cargo run --release --example two_client_voice -- <path\to\rathena_client.exe>
+//!   set GRIDSPAWN_ENVIRONMENT=production     (the key's environment; unset = production)
+//!   cargo run --release --features testing --example two_client_voice -- <path\to\rathena_client.exe>
 
 use std::{
     path::PathBuf,
@@ -88,13 +89,23 @@ async fn main() {
     let app_id = std::env::var("GRIDSPAWN_TEST_APP_ID").expect("GRIDSPAWN_TEST_APP_ID");
     let key_file =
         std::env::var("GRIDSPAWN_TEST_CREDENTIAL_FILE").expect("GRIDSPAWN_TEST_CREDENTIAL_FILE");
+    // Dev Hub keys are made for production; another environment needs a key
+    // made for it.
+    let environment =
+        std::env::var("GRIDSPAWN_ENVIRONMENT").unwrap_or_else(|_| "production".to_owned());
+    let environment_kind = match environment.as_str() {
+        "production" => Environment::Production,
+        "staging" => Environment::Staging,
+        "development" => Environment::Development,
+        other => panic!("GRIDSPAWN_ENVIRONMENT: unknown environment {other:?}"),
+    };
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
     let client = Client::builder(
         app_id.clone(),
-        Environment::Development,
+        environment_kind,
         Credential::from_file_unchecked(&key_file).expect("credential"),
     )
     .connect()
@@ -117,7 +128,7 @@ async fn main() {
         command
             .current_dir(&dir)
             .env("GRIDSPAWN_APP_ID", &app_id)
-            .env("GRIDSPAWN_ENVIRONMENT", "development")
+            .env("GRIDSPAWN_ENVIRONMENT", &environment)
             .args([ticket, "--tone", "--seconds", seconds, "--log"])
             .arg(dir.join(log))
             .args(extra)

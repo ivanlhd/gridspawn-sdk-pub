@@ -6,7 +6,7 @@
 // then a server mute and unmute.
 //
 //   set GRIDSPAWN_APP_ID=game-...
-//   set GRIDSPAWN_ENVIRONMENT=development
+//   set GRIDSPAWN_ENVIRONMENT=production   (the key's environment; unset = production)
 //   set GRIDSPAWN_CREDENTIAL_FILE=C:\keys\gridspawn-server-key
 //   rathena_voice.exe <map-server> <char-id> <character-name> [party-id] [guild-id] [hold-seconds]
 //                     [--print-ticket]
@@ -198,7 +198,7 @@ int main(int argc, char **argv) {
   gs_client_options_init(&options);
   options.app_id = app_id;
   GsEnvironment parsed;
-  GsStatus status = gs_environment_parse(environment != NULL ? environment : "development",
+  GsStatus status = gs_environment_parse(environment != NULL ? environment : "production",
                                          &parsed, &error);
   if (status != GS_STATUS_OK) return fail("environment", status, error);
   options.environment = (uint32_t)parsed;

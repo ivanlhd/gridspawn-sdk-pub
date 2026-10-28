@@ -3,7 +3,7 @@
  *
  *   cc -std=c99 club_post.c -I../../include ../../target/release/libgridspawn_server_capi.a \
  *      -lpthread -ldl -lm -lrt -o club_post
- *   GRIDSPAWN_APP_ID=game-… GRIDSPAWN_ENVIRONMENT=development \
+ *   GRIDSPAWN_APP_ID=game-… GRIDSPAWN_ENVIRONMENT=production \
  *   GRIDSPAWN_CREDENTIAL_FILE=/path/to/0600-key-file ./club_post patch-notes
  */
 #include <stdio.h>
@@ -44,7 +44,7 @@ int main(int argc, char **argv) {
   gs_client_options_init(&options);
   options.app_id = app_id;
   GsEnvironment parsed;
-  GsStatus status = gs_environment_parse(environment != NULL ? environment : "development",
+  GsStatus status = gs_environment_parse(environment != NULL ? environment : "production",
                                          &parsed, &error);
   if (status != GS_STATUS_OK) return fail("environment", status, error);
   options.environment = (uint32_t)parsed;

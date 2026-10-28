@@ -3,7 +3,7 @@
 // your map-server sent, join voice, then shut down cleanly.
 //
 //   set GRIDSPAWN_APP_ID=game-...
-//   set GRIDSPAWN_ENVIRONMENT=development
+//   set GRIDSPAWN_ENVIRONMENT=production   (unset = production)
 //   rathena_client.exe <ticket> [--seconds N] [--ptt] [--window] [--tone] [--log <file>]
 //                      [--next-ticket-file <file>]
 //

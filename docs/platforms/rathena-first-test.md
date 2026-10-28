@@ -76,9 +76,8 @@ get the signed package (section 7).
 
 Use the **production** environment everywhere in this test: set
 `GRIDSPAWN_ENVIRONMENT=production` for the server and the example client
-(`GsRagConfig.environment` NULL also means production). The examples'
-own comments show `development`; that matches a key made for a development
-environment, which the Dev Hub does not make.
+(`GsRagConfig.environment` NULL also means production; the examples use
+production when the variable is unset).
 
 ## 4. First session: four steps
 
@@ -106,9 +105,15 @@ environment, which the Dev Hub does not make.
    client attaches it (the party session is left first). Then try a server
    mute and unmute from the map-server.
 
-The companion's automated two-client test (`examples/two_client_voice.rs`)
-runs against a development environment only, so it does not work with a key
-from the Dev Hub.
+Optional, before step 3: the companion's automated two-client test
+(`gridspawn-companion\examples\two_client_voice.rs`) runs step 2 for two
+characters and a party → guild switch, with a test tone instead of the
+microphones. Build the companion with `--features testing` (before building
+the example client), set `GRIDSPAWN_TEST_APP_ID` to your App ID and
+`GRIDSPAWN_TEST_CREDENTIAL_FILE` to your key file, then run
+`cargo run --release --features testing --example two_client_voice -- <path\to\rathena_client.exe>`
+from `gridspawn-companion`. A testing build is for this test only, never for
+players.
 
 ## 5. Limits
 

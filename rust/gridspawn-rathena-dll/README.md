@@ -49,7 +49,7 @@ load → init → callbacks → attach → voice → shutdown:
 
 ```
 set GRIDSPAWN_APP_ID=game-...
-set GRIDSPAWN_ENVIRONMENT=development
+set GRIDSPAWN_ENVIRONMENT=production
 rathena_client.exe <ticket> [--seconds N] [--ptt] [--window] [--tone] [--log file]
                    [--next-ticket-file file]
 ```
