@@ -121,6 +121,11 @@ What already limits a captured ticket:
 - **Short-lived:** 120 s (02 §5).
 - **Sent to one connection:** only that player's, never broadcast.
 
+The ticket is bound to the app, the environment, the session and the
+participant only, not to an IP address, a device, the game connection or a
+client key, so whoever attaches first within the 120 s holds the
+participant's grants.
+
 Residual risk:
 - **Who can exploit it:** an attacker on the network path who reads the
   ticket and attaches before the player's client.

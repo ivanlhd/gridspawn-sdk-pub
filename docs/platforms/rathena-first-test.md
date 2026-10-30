@@ -23,6 +23,16 @@ Background: `rathena-companion.md` (design, C surface) and
   `gridspawn-companion`'s README, under "Build (Windows)", together with the
   environment variables to set. Start from those: the voice build is
   sensitive to the MSVC and LLVM versions.
+- **Use the tested toolchain.** Build the companion with MSVC toolset
+  14.44.35207 (`vcvars64.bat -vcvars_ver=14.44`), LLVM/libclang 22.1.5 at
+  `LIBCLANG_PATH`, meson and ninja 1.12.1 and Rust 1.95.0. Newer MSVC
+  toolsets are not tested and need a newer Clang: with an older LLVM,
+  bindgen stops with MSVC's `STL1000` error. Use one toolset for the whole
+  build. After any toolset or LLVM change, run
+  `cargo clean --release -p webrtc-audio-processing-sys`: the WebRTC meson
+  build directory keeps the compiler it was first configured with, and a
+  build that mixes toolsets fails, for example with C2440 in
+  `rtc_base/checks.h`.
 - **A short checkout path**, for example `C:\gs`. The WebRTC audio build
   compiles sources through deep paths under `target\`; under a long root,
   cl.exe stops with "Cannot open source file" (its 260-character limit).
@@ -101,7 +111,10 @@ production when the variable is unset).
    `--print-ticket` prints the party ticket once (testing only; a real
    map-server never prints tickets). The companion window opens; join voice
    and check that it shows the character name. A ticket is valid for 120
-   seconds and for one use: attach it right away.
+   seconds and for one use: attach it right away. A wrong but well-formed
+   key passes connect and fails at the first session create with status 7,
+   code `server/authentication_required`; a malformed or unreadable key
+   file fails at `gs_credential_from_file` with status 2.
 3. **Your map-server and client, two players in a party.** Add the packets
    of `rathena-packets.md` to your map-server and client. The opcodes
    `0x0CF0`–`0x0CF8` are **placeholders**: replace them with free opcodes in

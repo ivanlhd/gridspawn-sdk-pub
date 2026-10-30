@@ -723,6 +723,8 @@ pub unsafe extern "C" fn gs_client_options_init(options: *mut GsClientOptions) {
 }
 
 /// Checks bootstrap and returns a client. Always consumes credential.
+/// Bootstrap does not check the key: the key is checked by the first
+/// authenticated call.
 #[no_mangle]
 pub unsafe extern "C" fn gs_client_connect(
     options: *const GsClientOptions,

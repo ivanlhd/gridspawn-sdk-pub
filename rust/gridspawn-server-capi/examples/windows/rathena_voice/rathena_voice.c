@@ -192,7 +192,8 @@ int main(int argc, char **argv) {
   }
   printf("gridspawn-server-capi %s (map-server %s)\n", gs_version(), map_server);
 
-  // 1. Connect (bootstrap checks the app, the environment and the key).
+  // 1. Connect (bootstrap checks the app id, the environment and the protocol;
+  //    the key is checked by the first authenticated call).
   GsError *error = NULL;
   GsClientOptions options;
   gs_client_options_init(&options);

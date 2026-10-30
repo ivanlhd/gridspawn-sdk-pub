@@ -319,6 +319,8 @@ void gs_credential_free(struct GsCredential *credential);
 void gs_client_options_init(struct GsClientOptions *options);
 
 // Checks bootstrap and returns a client. Always consumes credential.
+// Bootstrap does not check the key: the key is checked by the first
+// authenticated call.
 enum GsStatus gs_client_connect(const struct GsClientOptions *options,
                                 struct GsCredential *credential,
                                 struct GsClient **out,
