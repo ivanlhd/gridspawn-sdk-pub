@@ -76,6 +76,7 @@ The header is the contract.
 | Session | `gs_rag_attach(ticket)` (02 §5 ticket from the server), `gs_rag_detach()` | `on_attached(display_name, roster)`, `on_detached(reason)`: `"replaced"` or `"requested"` |
 | Voice | `gs_rag_voice_join()`, `_leave()`, `_set_muted(b)`, `_set_deafened(b)`, `_set_transmit_mode(vad\|ptt)`, `_set_transmitting(b)` (push-to-talk key), `_set_volume(participant, 0..2)`, `_set_participant_muted(participant, b)` (local only), `_list_devices()`, `_select_device(input\|output, name)` | `on_voice_state(state)`, `on_participant(joined/left, id, display_name)`, `on_speaking(id, b)`, `on_local_speaking(b)`, `on_server_muted(id or self, b)`, `on_devices(kind, names, selected)` |
 | Presence (signed-in players only) | `gs_rag_presence_set(details, state)`, `gs_rag_presence_clear()` | refused for guests (03: guests have no presence) |
+| Companion window (since 0.1.1) | `gs_rag_show_window(b)` (§7) | `on_error("companion/no_window")` without a window |
 | Errors | — | `on_error(code, message)`; codes are the SDK's (`voice/server_muted`, …) |
 
 - **One session at a time.** `gs_rag_attach` while a session is attached
@@ -136,6 +137,20 @@ nested panels. The game can drive all of it through the DLL too.
 the window shows "Not attached" until the game attaches the next ticket; the
 window cannot attach by itself, since tickets come from the game server.
 
+The window is shown only when `GsRagConfig.show_window` is non-zero. Voice
+follows the game, not the window:
+
+- **Closing hides it.** The window's close button only hides the window.
+  Voice, the attached session and the companion go on.
+- **The game shows it again.** `gs_rag_show_window(1)` shows the window (for
+  example from a game menu or key) and `gs_rag_show_window(0)` hides it. It
+  works while the window is hidden. With `show_window` 0 at init there is no
+  window, and the call is refused (`on_error("companion/no_window")`). A
+  companion older than 0.1.1 refuses it with `companion/unknown_op`.
+- **Voice ends with the game.** On `gs_rag_shutdown`, the game process
+  ending (also a crash) or the pipes closing, the companion leaves voice and
+  its process exits, whatever the window's state; the window goes with it.
+
 ## 8. Example
 
 A Visual Studio x86 project (`examples/windows/rathena_client`): load the DLL
@@ -148,7 +163,10 @@ explicit test flag (`--print-ticket`).
 Testing-only switches (not for shipped clients): `test_tone` in
 `GsRagConfig` (`--tone`: a 440 Hz tone instead of the microphone, nothing
 played, the received level logged each second) and the example's
-`--next-ticket-file` (stands in for the map-server's switch packet).
+`--next-ticket-file` (stands in for the map-server's switch packet) and
+`--show-window-file` (stands in for a game key that shows the window, §7)
+and `--no-shutdown` (the process exits without `gs_rag_shutdown`, as a game
+that just exits).
 `gridspawn-companion/examples/two_client_voice.rs` uses both: two guests in
 one party session hear each other, then one switches to a guild session.
 In a testing build, two environment variables (inherited from the game

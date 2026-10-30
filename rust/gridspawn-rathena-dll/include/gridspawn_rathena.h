@@ -74,7 +74,7 @@ typedef struct GsRagConfig {
   const char *sdk_base_url;   /* NULL = https://sdk.gridspawn.net */
   const char *companion_path; /* NULL = gridspawn-companion.exe next to the DLL */
   const char *log_path;       /* NULL = no log; else the companion appends its log here */
-  int32_t show_window;        /* non-zero: show the companion's voice window */
+  int32_t show_window;        /* non-zero: show the companion's voice window (gs_rag_show_window) */
   uint32_t init_timeout_ms;   /* 0 = 10000 */
   int32_t test_tone;          /* testing only: a tone instead of the microphone, nothing played */
 } GsRagConfig;
@@ -144,6 +144,14 @@ GS_RAG_API int32_t GS_RAG_CALL gs_rag_voice_select_device(int32_t kind, const ch
 /* Presence (signed-in players only) */
 GS_RAG_API int32_t GS_RAG_CALL gs_rag_presence_set(const char *details, const char *state);
 GS_RAG_API int32_t GS_RAG_CALL gs_rag_presence_clear(void);
+
+/* Companion window (show_window non-zero at init). Its close button only
+   hides it: voice and the attached session go on, and end with the game
+   (gs_rag_shutdown, or the game process ending). visible non-zero shows it
+   again (for example from a game menu or key), 0 hides it. on_error
+   "companion/no_window" when show_window was 0 at init;
+   "companion/unknown_op" from a companion older than 0.1.1. */
+GS_RAG_API int32_t GS_RAG_CALL gs_rag_show_window(int32_t visible);
 
 /* Function pointer types for LoadLibrary / GetProcAddress. */
 typedef int32_t(GS_RAG_CALL *gs_rag_init_fn)(const GsRagConfig *, const GsRagCallbacks *, void *);

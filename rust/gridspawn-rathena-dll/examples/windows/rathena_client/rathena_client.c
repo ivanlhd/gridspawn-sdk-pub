@@ -5,13 +5,18 @@
 //   set GRIDSPAWN_APP_ID=game-...
 //   set GRIDSPAWN_ENVIRONMENT=production   (unset = production)
 //   rathena_client.exe <ticket> [--seconds N] [--ptt] [--window] [--tone] [--log <file>]
-//                      [--next-ticket-file <file>]
+//                      [--next-ticket-file <file>] [--show-window-file <file>] [--no-shutdown]
 //
 // gridspawn_rathena.dll and gridspawn-companion.exe sit next to this exe.
 // --tone is for tests: a tone instead of the microphone, nothing played.
 // --next-ticket-file stands in for the map-server's "switch group" packet:
 // when the file appears, its ticket is attached (the previous session is
 // detached first and voice is joined again in the new one).
+// --show-window-file stands in for a game menu or key that shows the voice
+// window again after the player closed (hid) it: when the file appears,
+// "1" shows the window and "0" hides it (with --window).
+// --no-shutdown ends the process without gs_rag_detach / gs_rag_shutdown, as
+// a game that just exits: the companion still leaves voice and exits.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -135,7 +140,8 @@ int main(int argc, char **argv) {
   const char *ticket = NULL;
   const char *log_path = NULL;
   const char *next_ticket_file = NULL;
-  int seconds = 20, ptt = 0, window = 0, tone = 0;
+  const char *show_window_file = NULL;
+  int seconds = 20, ptt = 0, window = 0, tone = 0, no_shutdown = 0;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--seconds") == 0 && i + 1 < argc) seconds = atoi(argv[++i]);
     else if (strcmp(argv[i], "--ptt") == 0) ptt = 1;
@@ -143,12 +149,15 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[i], "--tone") == 0) tone = 1;
     else if (strcmp(argv[i], "--log") == 0 && i + 1 < argc) log_path = argv[++i];
     else if (strcmp(argv[i], "--next-ticket-file") == 0 && i + 1 < argc) next_ticket_file = argv[++i];
+    else if (strcmp(argv[i], "--show-window-file") == 0 && i + 1 < argc) show_window_file = argv[++i];
+    else if (strcmp(argv[i], "--no-shutdown") == 0) no_shutdown = 1;
     else ticket = argv[i];
   }
   const char *app_id = getenv("GRIDSPAWN_APP_ID");
   if (ticket == NULL || app_id == NULL) {
     fprintf(stderr, "usage: set GRIDSPAWN_APP_ID, then %s <ticket> [--seconds N] [--ptt] "
-                    "[--window] [--tone] [--log file] [--next-ticket-file file]\n", argv[0]);
+                    "[--window] [--tone] [--log file] [--next-ticket-file file] "
+                    "[--show-window-file file] [--no-shutdown]\n", argv[0]);
     return 2;
   }
   InitializeCriticalSection(&g_lock);
@@ -168,6 +177,15 @@ int main(int argc, char **argv) {
   LOAD(gs_rag_int_fn, gs_rag_voice_set_transmitting);
   LOAD(gs_rag_void_fn, gs_rag_voice_list_devices);
   LOAD(gs_rag_shutdown_fn, gs_rag_shutdown);
+  // Since 0.1.1; only looked up when used, so older DLLs still run the rest.
+  gs_rag_int_fn gs_rag_show_window = NULL;
+  if (show_window_file != NULL) {
+    gs_rag_show_window = (gs_rag_int_fn)(void *)GetProcAddress(dll, "gs_rag_show_window");
+    if (gs_rag_show_window == NULL) {
+      fprintf(stderr, "gridspawn_rathena.dll has no gs_rag_show_window (older than 0.1.1)\n");
+      return 2;
+    }
+  }
   printf("gridspawn_rathena %s\n", gs_rag_version());
 
   // 2. Initialise: starts the companion and connects (blocking, bounded).
@@ -233,11 +251,28 @@ int main(int argc, char **argv) {
         }
       }
     }
+    if (show_window_file != NULL && t % 5 == 0) {
+      FILE *file = fopen(show_window_file, "rb");
+      if (file != NULL) {
+        int c = fgetc(file);
+        fclose(file);
+        remove(show_window_file);
+        int visible = c != '0';
+        printf("%s the voice window\n", visible ? "showing" : "hiding");
+        gs_rag_show_window(visible);
+      }
+    }
     Sleep(100);
+  }
+
+  if (no_shutdown) {
+    printf("exiting without shutdown\n");
+    ExitProcess(0);
   }
 
   // 5. Leave voice and detach (as on the server's "voice ended" packet), then
   //    stop the companion.
+  printf("closing\n");
   InterlockedExchange(&g_detached, 0);
   gs_rag_detach();
   for (int waited = 0; !g_detached && !g_lost && waited < 3000; waited += 50) Sleep(50);

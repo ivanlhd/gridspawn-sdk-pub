@@ -564,7 +564,7 @@ pub extern "C" fn gs_rag_shutdown(timeout_ms: u32) -> i32 {
     })
 }
 
-/// "0.1.0". Static; do not free.
+/// The crate version, e.g. "0.1.1". Static; do not free.
 #[no_mangle]
 pub extern "C" fn gs_rag_version() -> *const c_char {
     concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr().cast()
@@ -732,4 +732,12 @@ pub unsafe extern "C" fn gs_rag_presence_set(details: *const c_char, state: *con
 #[no_mangle]
 pub extern "C" fn gs_rag_presence_clear() -> i32 {
     guard(|| request("presence_clear", json!({})))
+}
+
+/// Shows (non-zero) or hides (0) the companion's voice window; its close
+/// button only hides it. Refused (`companion/no_window`) when `show_window`
+/// was 0 at init; a companion older than 0.1.1 answers `companion/unknown_op`.
+#[no_mangle]
+pub extern "C" fn gs_rag_show_window(visible: i32) -> i32 {
+    guard(|| request("show_window", json!({"visible": visible != 0})))
 }

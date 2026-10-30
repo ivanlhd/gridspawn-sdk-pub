@@ -119,11 +119,23 @@ fn main() {
     }
     core::watch_game(launch.game_pid, cmd_tx.clone());
 
+    // The process ends when the core does (game exit, gs_rag_shutdown, pipe
+    // closed), whatever the window's state: the window never ends it, and a
+    // hidden window would not see a request to close (it gets no repaint).
+    let finisher = std::thread::Builder::new()
+        .name("gridspawn-companion-exit".into())
+        .spawn(move || {
+            let _ = runtime.block_on(done_rx);
+            tracing::info!("companion exiting");
+            runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+            std::process::exit(0);
+        });
+    let Ok(finisher) = finisher else {
+        std::process::exit(3);
+    };
     if launch.show_window {
         ui::run(model.clone(), cmd_tx.clone());
     }
-    let _ = runtime.block_on(done_rx);
-    tracing::info!("companion exiting");
-    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    let _ = finisher.join();
     std::process::exit(0);
 }

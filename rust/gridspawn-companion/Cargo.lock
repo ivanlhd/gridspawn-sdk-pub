@@ -1581,12 +1581,13 @@ dependencies = [
 
 [[package]]
 name = "gridspawn-companion"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "eframe",
  "gridspawn-client",
  "gridspawn-server",
  "gridspawn-voice",
+ "raw-window-handle",
  "serde_json",
  "tokio",
  "tracing",

@@ -124,7 +124,6 @@ pub async fn run(
             }
             Err(error) => {
                 tracing::error!(%error, "pipes not established");
-                lock(&model).quit = true;
                 return;
             }
         }
@@ -163,7 +162,6 @@ pub async fn run(
             other => core.handle(other).await,
         }
     }
-    lock(&core.model).quit = true;
 }
 
 #[cfg(windows)]
@@ -770,6 +768,17 @@ impl Core {
                         return self.fail(id, &e.code(), &e.to_string());
                     }
                 }
+                self.ok(id);
+            }
+            "show_window" => {
+                if !self.launch.show_window {
+                    return self.fail(
+                        id,
+                        "companion/no_window",
+                        "The companion runs without a window (show_window = 0 at init).",
+                    );
+                }
+                crate::ui::show(&self.model, arg_bool(args, "visible"));
                 self.ok(id);
             }
             "shutdown" => {

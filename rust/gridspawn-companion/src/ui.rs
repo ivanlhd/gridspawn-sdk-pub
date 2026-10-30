@@ -39,7 +39,50 @@ pub struct Model {
     pub outputs: Vec<String>,
     pub input: Option<String>,
     pub output: Option<String>,
-    pub quit: bool,
+    /// The voice window once it exists (None: no window).
+    pub window: Option<Window>,
+    /// Show (true) or hide (false) the window: set by the game's
+    /// `show_window`, applied by the window's next update.
+    pub show_request: Option<bool>,
+}
+
+/// The voice window, as the core reaches it from its own thread.
+#[derive(Clone, Debug)]
+pub struct Window {
+    ctx: egui::Context,
+    /// The Win32 window handle (0: unknown).
+    #[cfg(windows)]
+    hwnd: isize,
+}
+
+/// Shows or hides the window (the game's `show_window`); nothing happens
+/// without a window. The window's next update applies it. A hidden window
+/// gets no repaint (Windows sends no WM_PAINT to it), so its update does not
+/// run: showing it also asks Windows directly, and the update that follows
+/// completes it (egui's own state, focus).
+pub fn show(model: &Mutex<Model>, visible: bool) {
+    let mut m = model.lock().unwrap_or_else(|p| p.into_inner());
+    m.show_request = Some(visible);
+    let Some(window) = &m.window else { return };
+    #[cfg(windows)]
+    if visible && window.hwnd != 0 {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindowAsync, SW_SHOWNORMAL};
+        // SAFETY: `window` is set while the window exists and cleared under
+        // this lock as soon as run_native returns (see run), so the handle
+        // is never used once eframe let go of the window. ShowWindowAsync
+        // only posts to the window's thread (no wait while holding the lock).
+        unsafe { ShowWindowAsync(window.hwnd as _, SW_SHOWNORMAL) };
+    }
+    window.ctx.request_repaint();
+}
+
+#[cfg(windows)]
+fn win32_handle(cc: &eframe::CreationContext<'_>) -> isize {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match cc.window_handle().map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::Win32(handle)) => handle.hwnd.get(),
+        _ => 0,
+    }
 }
 
 struct App {
@@ -85,9 +128,21 @@ fn device_picker(
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let snapshot = {
-            let m = self.model.lock().unwrap_or_else(|p| p.into_inner());
-            if m.quit {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            let mut m = self.model.lock().unwrap_or_else(|p| p.into_inner());
+            if ctx.input(|i| i.viewport().close_requested()) {
+                // The close button only hides the window: voice and the
+                // attached session follow the game, not the window (the
+                // process ends with the game, see main).
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                tracing::info!("voice window hidden (close button)");
+            } else if let Some(visible) = m.show_request.take() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
+                if visible {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                tracing::info!(visible, "voice window shown or hidden by the game");
             }
             (
                 m.status.clone(),
@@ -218,7 +273,9 @@ impl eframe::App for App {
     }
 }
 
-/// Runs the window on this (the main) thread until it is closed.
+/// Runs the window on this (the main) thread; it returns only if the window
+/// cannot open. The close button hides it; the game shows it again
+/// (`show_window`); the process ends with the game (see main).
 pub fn run(model: Arc<Mutex<Model>>, cmd: UnboundedSender<Cmd>) {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -226,11 +283,26 @@ pub fn run(model: Arc<Mutex<Model>>, cmd: UnboundedSender<Cmd>) {
             .with_inner_size([360.0, 420.0]),
         ..Default::default()
     };
+    let app_model = model.clone();
     let result = eframe::run_native(
         "Gridspawn voice",
         options,
-        Box::new(move |_cc| Ok(Box::new(App { model, cmd }))),
+        Box::new(move |cc| {
+            let window = Window {
+                ctx: cc.egui_ctx.clone(),
+                #[cfg(windows)]
+                hwnd: win32_handle(cc),
+            };
+            app_model.lock().unwrap_or_else(|p| p.into_inner()).window = Some(window);
+            Ok(Box::new(App {
+                model: app_model,
+                cmd,
+            }))
+        }),
     );
+    // The window is gone (also after an error mid-run): its handle must not
+    // be used again (show).
+    model.lock().unwrap_or_else(|p| p.into_inner()).window = None;
     if let Err(error) = result {
         tracing::warn!(%error, "voice window could not open; running without it");
     }
