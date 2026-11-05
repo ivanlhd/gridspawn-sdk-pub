@@ -82,6 +82,7 @@ impl ClientBuilder {
                 idempotency_key: None,
                 headers: &[],
                 retry: true,
+                timeout: None,
             })
             .await?;
         if !bootstrap.ok {
@@ -261,8 +262,40 @@ impl Client {
                 idempotency_key: idempotency_key.map(IdempotencyKey::as_str),
                 headers,
                 retry,
+                timeout: None,
             })
             .await
+    }
+
+    /// A connection pool of its own, with this client's settings (the action
+    /// receiver, which may run on another runtime than the client).
+    pub(crate) fn fresh_http(&self) -> Result<Http, Error> {
+        self.inner.http.fresh()
+    }
+
+    /// One POST to the SDK edge through `http`, without retry (the caller
+    /// loops), with `timeout` instead of the client's when given.
+    pub(crate) async fn edge_post_on<T: DeserializeOwned>(
+        &self,
+        http: &Http,
+        route: &'static str,
+        path: &str,
+        body: &Value,
+        timeout: Option<Duration>,
+    ) -> Result<T, Error> {
+        http.send(Call {
+            service: Service::Edge,
+            method: Method::POST,
+            url: endpoint(&self.inner.sdk_base, path),
+            route,
+            auth: Auth::Server(&self.inner.credential),
+            body: Some(body),
+            idempotency_key: None,
+            headers: &[],
+            retry: false,
+            timeout,
+        })
+        .await
     }
 }
 

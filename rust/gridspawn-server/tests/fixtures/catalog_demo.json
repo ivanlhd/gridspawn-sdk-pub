@@ -1,0 +1,589 @@
+{
+  "about": "The catalog block demo shop (docs/catalog-block.md section 7.2), in write order: the pages, then the index, then the open signal with its TTL. One source of truth: the SDK live publisher (tests/live.rs, live_catalog_demo) and the app tests read this file.",
+  "documents": [
+    {
+      "key": "shop.demo.p0",
+      "value": {
+        "records": [
+          {
+            "id": "iron-sword",
+            "name": "Iron sword",
+            "price": 120,
+            "stock": 4,
+            "merchant": "smith",
+            "type": [
+              "weapon"
+            ],
+            "about": "A plain, dependable blade.",
+            "listed": "2026-10-01T12:00:00Z"
+          },
+          {
+            "id": "battle-axe",
+            "name": "Battle axe",
+            "price": 180,
+            "stock": 0,
+            "merchant": "smith",
+            "type": [
+              "weapon"
+            ],
+            "about": "Heavy, slow, hits hard.",
+            "listed": "2026-10-02T12:00:00Z"
+          },
+          {
+            "id": "chain-mail",
+            "name": "Chain mail",
+            "price": 240,
+            "stock": 2,
+            "merchant": "smith",
+            "type": [
+              "armor"
+            ],
+            "about": "Rings of iron, well oiled.",
+            "listed": "2026-10-03T12:00:00Z"
+          },
+          {
+            "id": "steel-dagger",
+            "name": "Steel dagger",
+            "price": 60,
+            "stock": 9,
+            "merchant": "smith",
+            "type": [
+              "weapon"
+            ],
+            "about": "Quick and easy to hide.",
+            "listed": "2026-10-04T12:00:00Z"
+          },
+          {
+            "id": "war-hammer",
+            "name": "War hammer",
+            "price": 210,
+            "stock": 1,
+            "merchant": "smith",
+            "type": [
+              "weapon"
+            ],
+            "about": "Breaks shields and doors.",
+            "listed": "2026-10-05T12:00:00Z"
+          },
+          {
+            "id": "iron-shield",
+            "name": "Iron shield",
+            "price": 140,
+            "stock": 3,
+            "merchant": "smith",
+            "type": [
+              "armor"
+            ],
+            "about": "Round, dented, still holds.",
+            "listed": "2026-10-06T12:00:00Z"
+          },
+          {
+            "id": "steel-helm",
+            "name": "Steel helm",
+            "price": 95,
+            "stock": 5,
+            "merchant": "smith",
+            "type": [
+              "armor"
+            ],
+            "about": "Keeps your head on.",
+            "listed": "2026-10-07T12:00:00Z"
+          },
+          {
+            "id": "short-spear",
+            "name": "Short spear",
+            "price": 75,
+            "stock": null,
+            "merchant": "smith",
+            "type": [
+              "weapon"
+            ],
+            "about": "Good reach for a small price.",
+            "listed": "2026-10-08T12:00:00Z"
+          },
+          {
+            "id": "greatsword",
+            "name": "Greatsword",
+            "price": 320,
+            "stock": 1,
+            "merchant": "smith",
+            "type": [
+              "weapon"
+            ],
+            "about": "Two hands, one swing.",
+            "listed": "2026-10-09T12:00:00Z"
+          },
+          {
+            "id": "iron-greaves",
+            "name": "Iron greaves",
+            "price": 110,
+            "stock": 0,
+            "merchant": "smith",
+            "type": [
+              "armor"
+            ],
+            "about": "Heavy steps, safe shins.",
+            "listed": "2026-10-10T12:00:00Z"
+          },
+          {
+            "id": "mail-gloves",
+            "name": "Mail gloves",
+            "price": 65,
+            "stock": 7,
+            "merchant": "smith",
+            "type": [
+              "armor"
+            ],
+            "about": "Grip a blade without fear.",
+            "listed": "2026-10-11T12:00:00Z"
+          },
+          {
+            "id": "hand-axe",
+            "name": "Hand axe",
+            "price": 45,
+            "stock": 12,
+            "merchant": "smith",
+            "type": [
+              "weapon"
+            ],
+            "about": "For wood, or for trouble.",
+            "listed": "2026-10-12T12:00:00Z"
+          },
+          {
+            "id": "tower-shield",
+            "name": "Tower shield",
+            "price": 260,
+            "stock": 2,
+            "merchant": "smith",
+            "type": [
+              "armor"
+            ],
+            "about": "A wall you can carry.",
+            "listed": "2026-10-13T12:00:00Z"
+          },
+          {
+            "id": "throwing-knives",
+            "name": "Throwing knives",
+            "price": 35,
+            "stock": null,
+            "merchant": "smith",
+            "type": [
+              "weapon"
+            ],
+            "about": "Sold by the set of five.",
+            "listed": "2026-10-14T12:00:00Z"
+          },
+          {
+            "id": "healing-potion",
+            "name": "Healing potion",
+            "price": 15,
+            "stock": null,
+            "merchant": "alch",
+            "type": [
+              "potion"
+            ],
+            "about": "Restores a little health.",
+            "listed": "2026-10-15T12:00:00Z"
+          },
+          {
+            "id": "mana-potion",
+            "name": "Mana potion",
+            "price": 20,
+            "stock": 12,
+            "merchant": "alch",
+            "type": [
+              "potion"
+            ],
+            "about": "Restores a little mana.",
+            "listed": "2026-10-16T12:00:00Z"
+          },
+          {
+            "id": "antidote",
+            "name": "Antidote",
+            "price": 18,
+            "stock": 8,
+            "merchant": "alch",
+            "type": [
+              "potion"
+            ],
+            "about": "Cures common poisons.",
+            "listed": "2026-10-17T12:00:00Z"
+          },
+          {
+            "id": "fire-flask",
+            "name": "Fire flask",
+            "price": 40,
+            "stock": 3,
+            "merchant": "alch",
+            "type": [
+              "potion"
+            ],
+            "about": "Throw it, then step back.",
+            "listed": "2026-10-18T12:00:00Z"
+          },
+          {
+            "id": "night-eye-draught",
+            "name": "Night-eye draught",
+            "price": 30,
+            "stock": 0,
+            "merchant": "alch",
+            "type": [
+              "potion"
+            ],
+            "about": "See in the dark for an hour.",
+            "listed": "2026-10-19T12:00:00Z"
+          },
+          {
+            "id": "stamina-tonic",
+            "name": "Stamina tonic",
+            "price": 22,
+            "stock": 10,
+            "merchant": "alch",
+            "type": [
+              "potion"
+            ],
+            "about": "Run a little longer.",
+            "listed": "2026-10-20T12:00:00Z"
+          }
+        ]
+      }
+    },
+    {
+      "key": "shop.demo.p1",
+      "value": {
+        "records": [
+          {
+            "id": "frost-oil",
+            "name": "Frost oil",
+            "price": 28,
+            "stock": 4,
+            "merchant": "alch",
+            "type": [
+              "potion"
+            ],
+            "about": "Coat a blade with cold.",
+            "listed": "2026-10-21T12:00:00Z"
+          },
+          {
+            "id": "luck-elixir",
+            "name": "Luck elixir",
+            "price": 90,
+            "stock": 1,
+            "merchant": "alch",
+            "type": [
+              "potion"
+            ],
+            "about": "Results may vary.",
+            "listed": "2026-10-22T12:00:00Z"
+          },
+          {
+            "id": "greater-healing",
+            "name": "Greater healing potion",
+            "price": 45,
+            "stock": 6,
+            "merchant": "alch",
+            "type": [
+              "potion"
+            ],
+            "about": "Restores much of your health.",
+            "listed": "2026-10-23T12:00:00Z"
+          },
+          {
+            "id": "smoke-bomb",
+            "name": "Smoke bomb",
+            "price": 25,
+            "stock": null,
+            "merchant": "alch",
+            "type": [
+              "potion"
+            ],
+            "about": "Leave the room unseen.",
+            "listed": "2026-10-24T12:00:00Z"
+          },
+          {
+            "id": "iron-skin-salve",
+            "name": "Iron-skin salve",
+            "price": 55,
+            "stock": 2,
+            "merchant": "alch",
+            "type": [
+              "potion"
+            ],
+            "about": "Hardens skin for a fight.",
+            "listed": "2026-10-25T12:00:00Z"
+          },
+          {
+            "id": "calm-tea",
+            "name": "Calm tea",
+            "price": 8,
+            "stock": 20,
+            "merchant": "alch",
+            "type": [
+              "potion"
+            ],
+            "about": "For nerves before a duel.",
+            "listed": "2026-10-26T12:00:00Z"
+          },
+          {
+            "id": "wool-cloak",
+            "name": "Wool cloak",
+            "price": 35,
+            "stock": 6,
+            "merchant": "tailor",
+            "type": [
+              "cloth"
+            ],
+            "about": "Warm on cold nights.",
+            "listed": "2026-10-27T12:00:00Z"
+          },
+          {
+            "id": "silk-gloves",
+            "name": "Silk gloves",
+            "price": 50,
+            "stock": 1,
+            "merchant": "tailor",
+            "type": [
+              "cloth"
+            ],
+            "about": "Light and soft.",
+            "listed": "2026-10-28T12:00:00Z"
+          },
+          {
+            "id": "leather-cap",
+            "name": "Leather cap",
+            "price": 25,
+            "stock": 0,
+            "merchant": "tailor",
+            "type": [
+              "armor"
+            ],
+            "about": "Better than nothing.",
+            "listed": "2026-10-29T12:00:00Z"
+          },
+          {
+            "id": "linen-shirt",
+            "name": "Linen shirt",
+            "price": 12,
+            "stock": 15,
+            "merchant": "tailor",
+            "type": [
+              "cloth"
+            ],
+            "about": "Cool in the summer sun.",
+            "listed": "2026-10-30T12:00:00Z"
+          },
+          {
+            "id": "travel-boots",
+            "name": "Travel boots",
+            "price": 40,
+            "stock": 5,
+            "merchant": "tailor",
+            "type": [
+              "armor"
+            ],
+            "about": "Made for long roads.",
+            "listed": "2026-10-01T12:00:00Z"
+          },
+          {
+            "id": "velvet-hat",
+            "name": "Velvet hat",
+            "price": 33,
+            "stock": 2,
+            "merchant": "tailor",
+            "type": [
+              "cloth"
+            ],
+            "about": "A feather, extra.",
+            "listed": "2026-10-02T12:00:00Z"
+          },
+          {
+            "id": "padded-vest",
+            "name": "Padded vest",
+            "price": 58,
+            "stock": 4,
+            "merchant": "tailor",
+            "type": [
+              "armor"
+            ],
+            "about": "Soft on the outside.",
+            "listed": "2026-10-03T12:00:00Z"
+          },
+          {
+            "id": "rain-hood",
+            "name": "Rain hood",
+            "price": 18,
+            "stock": null,
+            "merchant": "tailor",
+            "type": [
+              "cloth"
+            ],
+            "about": "Waxed against the weather.",
+            "listed": "2026-10-04T12:00:00Z"
+          },
+          {
+            "id": "dancing-shoes",
+            "name": "Dancing shoes",
+            "price": 27,
+            "stock": 0,
+            "merchant": "tailor",
+            "type": [
+              "cloth"
+            ],
+            "about": "For the harbor festival.",
+            "listed": "2026-10-05T12:00:00Z"
+          },
+          {
+            "id": "leather-belt",
+            "name": "Leather belt",
+            "price": 15,
+            "stock": 9,
+            "merchant": "tailor",
+            "type": [
+              "cloth"
+            ],
+            "about": "Pouches sold separately.",
+            "listed": "2026-10-06T12:00:00Z"
+          },
+          {
+            "id": "fur-mantle",
+            "name": "Fur mantle",
+            "price": 85,
+            "stock": 1,
+            "merchant": "tailor",
+            "type": [
+              "cloth"
+            ],
+            "about": "For the northern passes.",
+            "listed": "2026-10-07T12:00:00Z"
+          },
+          {
+            "id": "scout-jacket",
+            "name": "Scout jacket",
+            "price": 62,
+            "stock": 3,
+            "merchant": "tailor",
+            "type": [
+              "armor"
+            ],
+            "about": "Many pockets, quiet seams.",
+            "listed": "2026-10-08T12:00:00Z"
+          },
+          {
+            "id": "wool-socks",
+            "name": "Wool socks",
+            "price": 6,
+            "stock": null,
+            "merchant": "tailor",
+            "type": [
+              "cloth"
+            ],
+            "about": "A pair. Always a pair.",
+            "listed": "2026-10-09T12:00:00Z"
+          },
+          {
+            "id": "silk-scarf",
+            "name": "Silk scarf",
+            "price": 29,
+            "stock": 7,
+            "merchant": "tailor",
+            "type": [
+              "cloth"
+            ],
+            "about": "Dyed in harbor blue.",
+            "listed": "2026-10-10T12:00:00Z"
+          }
+        ]
+      }
+    },
+    {
+      "key": "shop.demo",
+      "value": {
+        "catalog": 1,
+        "title": "Demo shop",
+        "currency": {
+          "code": "gold",
+          "label": "Gold"
+        },
+        "groups": [
+          {
+            "id": "smith",
+            "name": "Blacksmith"
+          },
+          {
+            "id": "alch",
+            "name": "Alchemist"
+          },
+          {
+            "id": "tailor",
+            "name": "Tailor"
+          }
+        ],
+        "fields": [
+          {
+            "id": "name",
+            "type": "text",
+            "label": "Name"
+          },
+          {
+            "id": "price",
+            "type": "currency",
+            "label": "Price"
+          },
+          {
+            "id": "stock",
+            "type": "stock",
+            "label": "Stock"
+          },
+          {
+            "id": "merchant",
+            "type": "group",
+            "label": "Merchant"
+          },
+          {
+            "id": "type",
+            "type": "tag",
+            "label": "Type",
+            "values": [
+              {
+                "id": "weapon",
+                "label": "Weapons"
+              },
+              {
+                "id": "armor",
+                "label": "Armor"
+              },
+              {
+                "id": "potion",
+                "label": "Potions"
+              },
+              {
+                "id": "cloth",
+                "label": "Cloth"
+              }
+            ]
+          },
+          {
+            "id": "about",
+            "type": "text",
+            "label": "Description"
+          },
+          {
+            "id": "listed",
+            "type": "timestamp",
+            "label": "Listed"
+          }
+        ],
+        "pages": [
+          "shop.demo.p0",
+          "shop.demo.p1"
+        ],
+        "live": "shop.demo.live"
+      }
+    },
+    {
+      "key": "shop.demo.live",
+      "value": true,
+      "ttlSeconds": 60
+    }
+  ]
+}

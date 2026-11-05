@@ -7,10 +7,11 @@ use std::{sync::Arc, time::Duration};
 use serde_json::Value;
 
 use crate::{
-    AdmitGuest, AdmitParticipant, ClientBuilder, ClientTicket, CreateSession, DataAck, DataBatch,
-    DataListing, Error, EventReceipt, IdempotencyKey, Lease, Module, Participant, ParticipantId,
-    ParticipantRef, Post, PostReceipt, Presence, PresenceAck, Session, VoiceAck, VoiceConfig,
-    VoicePlayerState, VoicePosition,
+    Action, ActionReceiverOptions, ActionReply, ActionStats, AdmitGuest, AdmitParticipant,
+    ClientBuilder, ClientTicket, CreateSession, DataAck, DataBatch, DataListing, Error,
+    EventReceipt, IdempotencyKey, Lease, Module, Participant, ParticipantId, ParticipantRef, Post,
+    PostReceipt, Presence, PresenceAck, Session, VoiceAck, VoiceConfig, VoicePlayerState,
+    VoicePosition,
 };
 
 pub struct Client {
@@ -174,6 +175,124 @@ impl Client {
                 .block_on(events.emit_with_id(name, payload, id)),
             None => self.runtime.block_on(events.emit(name, payload)),
         }
+    }
+}
+
+impl Client {
+    /// As [`crate::Client::spawn_action_receiver`], with a plain function.
+    /// The receiver runs on its own thread with its own runtime; each accepted
+    /// action calls `handler` on a blocking-pool thread, at most
+    /// `concurrency` at once. Dedupe on [`crate::Action::id`] as the async
+    /// receiver documents.
+    pub fn spawn_action_receiver_blocking<F>(
+        &self,
+        options: ActionReceiverOptions,
+        handler: F,
+    ) -> Result<ActionReceiver, Error>
+    where
+        F: Fn(Action) -> ActionReply + Send + Sync + 'static,
+    {
+        let client = self.client.clone();
+        let handler = Arc::new(handler);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<Duration>();
+        let thread = std::thread::Builder::new()
+            .name("gridspawn-actions".into())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(Error::Runtime(Arc::new(error))));
+                        return 0;
+                    }
+                };
+                runtime.block_on(async move {
+                    let receiver = client.spawn_action_receiver(options, move |action| {
+                        let handler = handler.clone();
+                        async move {
+                            match tokio::task::spawn_blocking(move || handler(action)).await {
+                                Ok(reply) => reply,
+                                // Passed on, so the receiver treats it as the
+                                // async one does: nothing is posted.
+                                Err(error) => match error.try_into_panic() {
+                                    Ok(panic) => std::panic::resume_unwind(panic),
+                                    // Cancelled: only when the runtime shuts down.
+                                    Err(_) => std::future::pending::<ActionReply>().await,
+                                },
+                            }
+                        }
+                    });
+                    let receiver = match receiver {
+                        Ok(receiver) => Arc::new(receiver),
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(error));
+                            return 0;
+                        }
+                    };
+                    let _ = ready_tx.send(Ok(receiver.clone()));
+                    // Until stop() or the handle is dropped (the sender goes).
+                    let timeout = stop_rx.await.unwrap_or(Duration::ZERO);
+                    receiver.stop(timeout).await
+                })
+            })
+            .map_err(|error| Error::Runtime(Arc::new(error)))?;
+        let receiver = ready_rx
+            .recv()
+            .map_err(|_| Error::InvalidResponse("the action receiver thread ended early"))??;
+        Ok(ActionReceiver {
+            receiver,
+            stop: Some(stop_tx),
+            thread: Some(thread),
+        })
+    }
+}
+
+/// The blocking receiver's handle. Dropping it stops the receiver without
+/// waiting for running handlers.
+pub struct ActionReceiver {
+    receiver: Arc<crate::ActionReceiver>,
+    stop: Option<tokio::sync::oneshot::Sender<Duration>>,
+    thread: Option<std::thread::JoinHandle<usize>>,
+}
+
+impl ActionReceiver {
+    pub fn stats(&self) -> ActionStats {
+        self.receiver.stats()
+    }
+
+    pub fn last_error(&self) -> Option<Error> {
+        self.receiver.last_error()
+    }
+
+    /// As [`crate::ActionReceiver::stop`]: blocks up to `timeout` (plus the
+    /// edge's stop call) and returns how many handlers were still running.
+    pub fn stop(mut self, timeout: Duration) -> usize {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(timeout);
+        }
+        self.thread
+            .take()
+            .and_then(|thread| thread.join().ok())
+            .unwrap_or(0)
+    }
+}
+
+impl Drop for ActionReceiver {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(Duration::ZERO);
+        }
+    }
+}
+
+impl std::fmt::Debug for ActionReceiver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("blocking::ActionReceiver")
+            .field(&self.receiver)
+            .finish()
     }
 }
 

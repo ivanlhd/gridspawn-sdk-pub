@@ -220,6 +220,7 @@ impl Client {
                     idempotency_key: Some(idempotency_key.as_str()),
                     headers: &[],
                     retry: true,
+                    timeout: None,
                 })
                 .await;
             match result {

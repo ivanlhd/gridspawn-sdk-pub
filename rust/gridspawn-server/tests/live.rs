@@ -6,6 +6,11 @@
 //!   (GRIDSPAWN_TEST_SERVER_CREDENTIAL_FILE, the ops smokes' name, works too.)
 //! Gate 2, a real game's development key (posts a real test message to its club):
 //!   GRIDSPAWN_TEST_GAME_CREDENTIAL_FILE=… GRIDSPAWN_TEST_GAME_APP_ID=game-… GRIDSPAWN_TEST_FEATURE=smoke
+//! The catalog block demo shop on the test application's development data
+//! (writes live data: run only when asked to):
+//!   GRIDSPAWN_TEST_APP_ID=… GRIDSPAWN_TEST_CREDENTIAL_FILE=… GRIDSPAWN_TEST_FEATURE=catalog-demo \
+//!   [GRIDSPAWN_TEST_CATALOG_MINUTES=5] [GRIDSPAWN_TEST_CATALOG_KEEP=1] \
+//!   cargo test --test live live_catalog_demo -- --nocapture
 
 use gridspawn_server::{
     AdmitGuest, Client, CreateSession, Credential, Environment, Error, ErrorCode, IdempotencyKey,
@@ -573,4 +578,128 @@ async fn live_game_post() {
         .unwrap_err();
     assert_eq!(code(error), ErrorCode::FeatureNotFound);
     eprintln!("game post ok: {} then duplicate", first.id);
+}
+
+/// The catalog block demo shop (docs/catalog-block.md section 7.2) on the
+/// test application's development data: publishes
+/// tests/fixtures/catalog_demo.json as one batch in its write order (pages,
+/// index, open signal with its TTL), then every 30 s republishes one page
+/// with changed stock and refreshes the open signal, for
+/// GRIDSPAWN_TEST_CATALOG_MINUTES (default 5), and removes the shop at the
+/// end unless GRIDSPAWN_TEST_CATALOG_KEEP=1. Skipped unless
+/// GRIDSPAWN_TEST_FEATURE=catalog-demo and the test application is
+/// configured: it writes live data. A panic mid-run skips the removal and
+/// leaves the demo shop's pages and index published on the test
+/// application's development data (the open signal lapses with its TTL), to
+/// be removed by hand.
+#[tokio::test]
+async fn live_catalog_demo() {
+    use gridspawn_server::DataBatch;
+    use serde_json::{json, Value};
+    use std::time::Duration;
+    if env(&["GRIDSPAWN_TEST_FEATURE"]).as_deref() != Some("catalog-demo") {
+        eprintln!("skipped: GRIDSPAWN_TEST_FEATURE is not catalog-demo");
+        return;
+    }
+    let (Some(path), Some(app_id)) = (
+        env(&[
+            "GRIDSPAWN_TEST_CREDENTIAL_FILE",
+            "GRIDSPAWN_TEST_SERVER_CREDENTIAL_FILE",
+        ]),
+        env(&["GRIDSPAWN_TEST_APP_ID"]),
+    ) else {
+        eprintln!("skipped: GRIDSPAWN_TEST_CREDENTIAL_FILE / GRIDSPAWN_TEST_APP_ID not set");
+        return;
+    };
+    let fixture: Value = serde_json::from_str(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/catalog_demo.json"
+        ))
+        .expect("fixture"),
+    )
+    .expect("fixture json");
+    let documents = fixture["documents"].as_array().expect("documents").clone();
+    let client = Client::builder(
+        app_id,
+        Environment::Development,
+        Credential::from_file(&path).expect("credential"),
+    )
+    .connect()
+    .await
+    .expect("bootstrap");
+    let data = client.game().data();
+
+    let mut batch = DataBatch::new();
+    for document in &documents {
+        let key = document["key"].as_str().expect("key");
+        let value = document["value"].clone();
+        batch = match document["ttlSeconds"].as_u64() {
+            Some(ttl) => batch.set_with_ttl(key, value, Duration::from_secs(ttl)),
+            None => batch.set(key, value),
+        };
+    }
+    let ack = data.set_many(&batch).await.expect("publish the demo shop");
+    assert!(ack.rejected.is_empty(), "{ack:?}");
+    assert!(ack.skipped.is_empty(), "{ack:?}");
+    eprintln!("published: {:?}", ack.accepted);
+
+    let pages: Vec<(String, Value)> = documents
+        .iter()
+        .filter(|document| document["value"].get("records").is_some())
+        .map(|document| {
+            (
+                document["key"].as_str().expect("key").to_owned(),
+                document["value"].clone(),
+            )
+        })
+        .collect();
+    let (signal, signal_ttl) = documents
+        .iter()
+        .find_map(|document| {
+            Some((
+                document["key"].as_str()?.to_owned(),
+                document["ttlSeconds"].as_u64()?,
+            ))
+        })
+        .expect("the open signal");
+    let minutes = env(&["GRIDSPAWN_TEST_CATALOG_MINUTES"])
+        .and_then(|minutes| minutes.parse::<u64>().ok())
+        .unwrap_or(5);
+    for round in 0..minutes * 2 {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let (key, page) = &pages[round as usize % pages.len()];
+        let mut page = page.clone();
+        // Counted stock moves; unlimited (null) stays unlimited.
+        for (index, record) in page["records"]
+            .as_array_mut()
+            .expect("records")
+            .iter_mut()
+            .enumerate()
+        {
+            if record["stock"].is_number() {
+                record["stock"] = json!((index as u64 + round) % 7);
+            }
+        }
+        let ack = data
+            .set_many(&DataBatch::new().set(key.as_str(), page).set_with_ttl(
+                signal.as_str(),
+                json!(true),
+                Duration::from_secs(signal_ttl),
+            ))
+            .await
+            .expect("republish");
+        assert!(ack.rejected.is_empty(), "{ack:?}");
+        eprintln!("round {round}: republished {key}");
+    }
+
+    if env(&["GRIDSPAWN_TEST_CATALOG_KEEP"]).as_deref() == Some("1") {
+        eprintln!("kept: the demo shop stays published");
+        return;
+    }
+    let mut removal = DataBatch::new();
+    for document in documents.iter().rev() {
+        removal = removal.remove(document["key"].as_str().expect("key"));
+    }
+    data.set_many(&removal).await.expect("remove the demo shop");
 }

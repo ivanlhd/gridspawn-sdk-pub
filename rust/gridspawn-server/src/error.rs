@@ -201,8 +201,23 @@ pub enum ErrorCode {
     GameDataQuotaExceeded,
     /// `data/unavailable` (503): the store is unreachable; nothing was stored.
     GameDataUnavailable,
+    /// `actions/disabled` (403): actions are off for the application and
+    /// environment (the `actions` module).
+    ActionsDisabled,
+    /// `actions/invalid` (400): a poll, ack or result body the edge refused.
+    ActionsInvalid,
+    /// `actions/not_found` (404): no such action for this credential (a
+    /// result for an action another credential confirmed, or unknown).
+    ActionsNotFound,
+    /// `actions/result_too_late` (409): the result window (60 s after the
+    /// deadline) has closed.
+    ActionsResultTooLate,
+    /// `actions/unavailable` (503): actions are off on this edge, or its
+    /// store is unreachable.
+    ActionsUnavailable,
     /// `rate_limited`, `presence/rate_limited`, `voice/rate_limited`,
-    /// `data/rate_limited`, or any 429 without a code (nginx).
+    /// `data/rate_limited`, `actions/rate_limited`, or any 429 without a code
+    /// (nginx).
     RateLimited,
     /// Any other code, kept verbatim.
     Other(String),
@@ -264,10 +279,16 @@ impl ErrorCode {
             "data/module_disabled" => Self::GameDataModuleDisabled,
             "data/quota_exceeded" => Self::GameDataQuotaExceeded,
             "data/unavailable" => Self::GameDataUnavailable,
+            "actions/disabled" => Self::ActionsDisabled,
+            "actions/invalid" => Self::ActionsInvalid,
+            "actions/not_found" => Self::ActionsNotFound,
+            "actions/result_too_late" => Self::ActionsResultTooLate,
+            "actions/unavailable" => Self::ActionsUnavailable,
             "rate_limited"
             | "presence/rate_limited"
             | "voice/rate_limited"
-            | "data/rate_limited" => Self::RateLimited,
+            | "data/rate_limited"
+            | "actions/rate_limited" => Self::RateLimited,
             other if CONTENT_CODES.contains(&other) => Self::ContentRejected(other.to_owned()),
             other => Self::Other(other.to_owned()),
         }
@@ -314,6 +335,11 @@ impl ErrorCode {
             Self::GameDataModuleDisabled => "data/module_disabled",
             Self::GameDataQuotaExceeded => "data/quota_exceeded",
             Self::GameDataUnavailable => "data/unavailable",
+            Self::ActionsDisabled => "actions/disabled",
+            Self::ActionsInvalid => "actions/invalid",
+            Self::ActionsNotFound => "actions/not_found",
+            Self::ActionsResultTooLate => "actions/result_too_late",
+            Self::ActionsUnavailable => "actions/unavailable",
             Self::RateLimited => "rate_limited",
         }
     }
@@ -369,6 +395,11 @@ mod tests {
             "data/module_disabled",
             "data/quota_exceeded",
             "data/unavailable",
+            "actions/disabled",
+            "actions/invalid",
+            "actions/not_found",
+            "actions/result_too_late",
+            "actions/unavailable",
             "rate_limited",
         ] {
             let mapped = ErrorCode::from_wire(code);
@@ -393,6 +424,7 @@ mod tests {
             ("voice/rate_limited", ErrorCode::RateLimited),
             ("data/browser_forbidden", ErrorCode::BrowserForbidden),
             ("data/rate_limited", ErrorCode::RateLimited),
+            ("actions/rate_limited", ErrorCode::RateLimited),
         ] {
             assert_eq!(ErrorCode::from_wire(alias), code, "{alias}");
         }

@@ -118,7 +118,25 @@ typedef enum GsErrorCode {
   GS_ERROR_CODE_GAME_DATA_QUOTA_EXCEEDED = 34,
   // data/unavailable (503), retryable; nothing was stored.
   GS_ERROR_CODE_GAME_DATA_UNAVAILABLE = 35,
+  // actions/disabled (403): actions are off for the app and environment.
+  GS_ERROR_CODE_ACTIONS_DISABLED = 36,
+  // actions/invalid (400): a poll, ack or result body the edge refused.
+  GS_ERROR_CODE_ACTIONS_INVALID = 37,
+  // actions/not_found (404): no such action for this credential.
+  GS_ERROR_CODE_ACTIONS_NOT_FOUND = 38,
+  // actions/result_too_late (409): the result window has closed.
+  GS_ERROR_CODE_ACTIONS_RESULT_TOO_LATE = 39,
+  // actions/unavailable (503), retryable.
+  GS_ERROR_CODE_ACTIONS_UNAVAILABLE = 40,
 } GsErrorCode;
+
+// One action, owned by the game until replied to or freed. The strings its
+// accessors return live until then. It keeps the client's runtime alive.
+typedef struct GsAction GsAction;
+
+// The background action receiver. gs_actions_stop stops it cleanly;
+// gs_action_receiver_free stops it at once.
+typedef struct GsActionReceiver GsActionReceiver;
 
 // A connected client. Thread-safe. Free with gs_client_free.
 typedef struct GsClient GsClient;
@@ -277,6 +295,13 @@ typedef struct GsDataQuota {
   uint64_t bytes;
   uint64_t max_bytes;
 } GsDataQuota;
+
+// Called on a runtime worker thread for each action the edge confirmed. The
+// game owns `action`: reply with exactly one gs_action_reply_* (from any
+// thread, at any time inside the result window) or free it with
+// gs_action_free. Do not call blocking gs_* functions from here; queue the
+// action to your main loop if the work takes time.
+typedef void (*GsActionCallback)(void *user_data, struct GsAction *action);
 
 #ifdef __cplusplus
 extern "C" {
@@ -677,6 +702,107 @@ enum GsStatus gs_game_event_publisher_shutdown(struct GsEventPublisher *publishe
 // Stops the publisher at once (queued events are lost; see
 // gs_game_event_publisher_shutdown) and frees it. NULL is ignored.
 void gs_game_event_publisher_free(struct GsEventPublisher *publisher);
+
+// Starts receiving the actions in names[0..names_len] (1-16 names, letters,
+// digits, . and _). concurrency: callbacks whose actions are not yet replied
+// to, 1-64 (0 = 4). The edge confirms each action before on_action is
+// called: the game must still dedupe on gs_action_id durably (the README).
+enum GsStatus gs_actions_start(struct GsClient *client,
+                               const char *const *names,
+                               size_t names_len,
+                               uint32_t concurrency,
+                               GsActionCallback on_action,
+                               void *user_data,
+                               struct GsActionReceiver **out,
+                               struct GsError **error);
+
+// Stops polling, tells the edge, and waits up to timeout_ms for the actions
+// the game holds to be replied to. GS_STATUS_TIMEOUT when some were not:
+// their later replies return GS_STATUS_RUNTIME and post nothing (the edge
+// ends them as "unknown"); free them with gs_action_free. Blocks: not from
+// a Gridspawn callback. Free the receiver with gs_action_receiver_free.
+enum GsStatus gs_actions_stop(struct GsActionReceiver *receiver,
+                              uint32_t timeout_ms,
+                              struct GsError **error);
+
+// Counters as a JSON object ("polls", "received", "accepted", "refused",
+// "expired", "coalesced", "resultsPosted", "resultsDuplicate",
+// "resultsFailed", "invalidReplies", "running"); NULL for NULL or a stopped
+// receiver. Free with gs_string_free.
+char *gs_action_receiver_stats_json(const struct GsActionReceiver *receiver);
+
+// The last failure (poll, ack, result, an invalid reply or a panicked
+// handler): a new GsError to free with gs_error_free, or NULL.
+struct GsError *gs_action_receiver_last_error(const struct GsActionReceiver *receiver);
+
+// Stops the receiver at once (without telling the edge) and frees it. Actions
+// the game still holds can no longer be replied to; free them. NULL is
+// ignored.
+void gs_action_receiver_free(struct GsActionReceiver *receiver);
+
+// The action id ("gsa1.…"): the game's durable dedupe key. NULL for NULL.
+const char *gs_action_id(const struct GsAction *action);
+
+const char *gs_action_name(const struct GsAction *action);
+
+// 0 for NULL.
+uint32_t gs_action_version(const struct GsAction *action);
+
+// 1, or 2 on the single redelivery. 0 for NULL.
+uint32_t gs_action_attempt(const struct GsAction *action);
+
+// The payload, a JSON object of at most 4 KiB. Never trusted.
+const char *gs_action_payload_json(const struct GsAction *action);
+
+// The player's pairwise subject ("gss_…"), as the game got it at sign-in.
+const char *gs_action_subject(const struct GsAction *action);
+
+// Where the press came from: {"kind": "club_block", "clubId"?, "channelId"?,
+// "blockId"?}.
+const char *gs_action_source_json(const struct GsAction *action);
+
+// The deadline as the edge sent it, in milliseconds since 1970 on the
+// edge's clock: for display and logs only. The receiver never compares it
+// with this machine's clock; use gs_action_remaining_ms. -1 for NULL or
+// unreadable.
+int64_t gs_action_deadline_unix_ms(const struct GsAction *action);
+
+// Milliseconds left until the deadline hint, measured on this machine's
+// monotonic clock from when the action arrived; 0 once past (replying later
+// is allowed, for 60 s more). 0 for NULL.
+uint64_t gs_action_remaining_ms(const struct GsAction *action);
+
+// Replies "ok". data_json: NULL, or a JSON object of at most 1 KiB the
+// block may show (for example {"balance": 120}). Never blocks; safe from the
+// callback and from any thread. On GS_STATUS_OK or GS_STATUS_RUNTIME the
+// action is consumed; on GS_STATUS_INVALID_ARGUMENT it is not (fix and
+// reply again, or free it).
+enum GsStatus gs_action_reply_ok(struct GsAction *action,
+                                 const char *data_json,
+                                 struct GsError **error);
+
+// Replies "declined": a game reason. code: "game/snake_case" (3-64);
+// user_message: plain text the person sees (at most 160 characters);
+// detail: NULL, or developer-only text (at most 500). Never blocks. A reply
+// that breaks these bounds is posted as error "game/invalid_reply" (see
+// gs_action_receiver_last_error). Consumes the action as gs_action_reply_ok.
+enum GsStatus gs_action_reply_declined(struct GsAction *action,
+                                       const char *code,
+                                       const char *user_message,
+                                       const char *detail,
+                                       struct GsError **error);
+
+// Replies "error": the game could not process it. code: "game/snake_case";
+// detail: NULL or developer-only text (at most 500). Never blocks. Consumes
+// the action as gs_action_reply_ok.
+enum GsStatus gs_action_reply_error(struct GsAction *action,
+                                    const char *code,
+                                    const char *detail,
+                                    struct GsError **error);
+
+// Frees an action without replying: the receiver posts error
+// "game/no_reply" (nothing after gs_actions_stop). NULL is ignored.
+void gs_action_free(struct GsAction *action);
 
 enum GsStatus gs_error_status(const struct GsError *error);
 

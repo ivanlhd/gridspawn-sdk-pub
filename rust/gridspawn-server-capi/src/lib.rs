@@ -13,8 +13,11 @@ use std::{
     future::Future,
     panic::{catch_unwind, AssertUnwindSafe},
     ptr,
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, Weak,
+    },
+    time::{Duration, Instant},
 };
 
 use gridspawn_server as gs;
@@ -101,6 +104,16 @@ pub enum GsErrorCode {
     GameDataQuotaExceeded = 34,
     /// data/unavailable (503), retryable; nothing was stored.
     GameDataUnavailable = 35,
+    /// actions/disabled (403): actions are off for the app and environment.
+    ActionsDisabled = 36,
+    /// actions/invalid (400): a poll, ack or result body the edge refused.
+    ActionsInvalid = 37,
+    /// actions/not_found (404): no such action for this credential.
+    ActionsNotFound = 38,
+    /// actions/result_too_late (409): the result window has closed.
+    ActionsResultTooLate = 39,
+    /// actions/unavailable (503), retryable.
+    ActionsUnavailable = 40,
 }
 
 #[repr(C)]
@@ -403,6 +416,12 @@ impl GsError {
             }
             | gs::Error::CredentialUnreadable(_)
             | gs::Error::CredentialFileTooOpen { .. } => GsStatus::Credential,
+            // A panic while an action was handed over (actions.rs): not the
+            // caller's argument.
+            gs::Error::InvalidInput {
+                field: "action handler",
+                ..
+            } => GsStatus::Internal,
             gs::Error::InvalidInput { .. } => GsStatus::InvalidArgument,
             gs::Error::Network(_) => GsStatus::Network,
             gs::Error::Timeout => GsStatus::Timeout,
@@ -466,6 +485,11 @@ fn error_code(code: &gs::ErrorCode) -> GsErrorCode {
         C::GameDataModuleDisabled => GsErrorCode::GameDataModuleDisabled,
         C::GameDataQuotaExceeded => GsErrorCode::GameDataQuotaExceeded,
         C::GameDataUnavailable => GsErrorCode::GameDataUnavailable,
+        C::ActionsDisabled => GsErrorCode::ActionsDisabled,
+        C::ActionsInvalid => GsErrorCode::ActionsInvalid,
+        C::ActionsNotFound => GsErrorCode::ActionsNotFound,
+        C::ActionsResultTooLate => GsErrorCode::ActionsResultTooLate,
+        C::ActionsUnavailable => GsErrorCode::ActionsUnavailable,
         _ => GsErrorCode::Other,
     }
 }
@@ -2516,6 +2540,472 @@ pub unsafe extern "C" fn gs_game_event_publisher_free(publisher: *mut GsEventPub
     });
 }
 
+// ---- game actions ----------------------------------------------------------
+
+/// Called on a runtime worker thread for each action the edge confirmed. The
+/// game owns `action`: reply with exactly one gs_action_reply_* (from any
+/// thread, at any time inside the result window) or free it with
+/// gs_action_free. Do not call blocking gs_* functions from here; queue the
+/// action to your main loop if the work takes time.
+pub type GsActionCallback =
+    Option<unsafe extern "C" fn(user_data: *mut c_void, action: *mut GsAction)>;
+
+/// One action, owned by the game until replied to or freed. The strings its
+/// accessors return live until then. It keeps the client's runtime alive.
+pub struct GsAction {
+    id: CString,
+    name: CString,
+    version: u32,
+    attempt: u32,
+    payload_json: CString,
+    subject: CString,
+    source_json: CString,
+    deadline_unix_ms: i64,
+    /// The deadline hint on this machine's monotonic clock.
+    deadline: Instant,
+    reply: Option<tokio::sync::oneshot::Sender<gs::ActionReply>>,
+    stopped: Arc<AtomicBool>,
+    _rt: Arc<Rt>,
+}
+
+/// The background action receiver. gs_actions_stop stops it cleanly;
+/// gs_action_receiver_free stops it at once.
+pub struct GsActionReceiver {
+    receiver: Mutex<Option<Arc<gs::ActionReceiver>>>,
+    stopped: Arc<AtomicBool>,
+    rt: Arc<Rt>,
+}
+
+/// The game's callback and its user_data, shared by every action.
+struct ActionTarget {
+    callback: unsafe extern "C" fn(user_data: *mut c_void, action: *mut GsAction),
+    user_data: *mut c_void,
+}
+// SAFETY: the caller hands user_data to the library to pass back on runtime
+// threads; that is the documented contract of gs_actions_start.
+unsafe impl Send for ActionTarget {}
+// SAFETY: as above; the library never dereferences user_data.
+unsafe impl Sync for ActionTarget {}
+
+fn source_json(source: &gs::ActionSource) -> String {
+    let mut value = serde_json::json!({"kind": "club_block"});
+    for (field, place) in [
+        ("clubId", &source.club_id),
+        ("channelId", &source.channel_id),
+        ("blockId", &source.block_id),
+    ] {
+        if let Some(place) = place {
+            value[field] = serde_json::Value::from(place.clone());
+        }
+    }
+    value.to_string()
+}
+
+/// Starts receiving the actions in names[0..names_len] (1-16 names, letters,
+/// digits, . and _). concurrency: callbacks whose actions are not yet replied
+/// to, 1-64 (0 = 4). The edge confirms each action before on_action is
+/// called: the game must still dedupe on gs_action_id durably (the README).
+#[no_mangle]
+pub unsafe extern "C" fn gs_actions_start(
+    client: *mut GsClient,
+    names: *const *const c_char,
+    names_len: usize,
+    concurrency: u32,
+    on_action: GsActionCallback,
+    user_data: *mut c_void,
+    out: *mut *mut GsActionReceiver,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        require(out, "out")?;
+        let callback = on_action.ok_or_else(|| GsError::invalid("on_action is NULL"))?;
+        // SAFETY: header contract.
+        let client = unsafe { handle(client, "client") }?;
+        if names_len == 0 || names_len > 16 {
+            return Err(GsError::invalid("names_len must be 1-16"));
+        }
+        require(names, "names")?;
+        let mut list = Vec::with_capacity(names_len);
+        for index in 0..names_len {
+            // SAFETY: names holds names_len pointers (header contract).
+            let name = unsafe { *names.add(index) };
+            // SAFETY: header contract.
+            list.push(unsafe { text(name, "names[i]") }?.to_owned());
+        }
+        let concurrency = if concurrency == 0 {
+            4
+        } else {
+            concurrency as usize
+        };
+        let options = gs::ActionReceiverOptions::new(list).concurrency(concurrency);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let target = Arc::new(ActionTarget {
+            callback,
+            user_data,
+        });
+        // Weak: the receiver's tasks live in this runtime and must not keep it.
+        let runtime: Weak<Rt> = Arc::downgrade(&client.rt);
+        let flag = stopped.clone();
+        let handler = move |action: gs::Action| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let stopped = flag.clone();
+            if let Some(rt) = runtime.upgrade() {
+                let owned = GsAction {
+                    id: cstring(action.id.clone()),
+                    name: cstring(action.name.clone()),
+                    version: action.version,
+                    attempt: u32::from(action.attempt),
+                    payload_json: cstring(action.payload.to_string()),
+                    subject: cstring(action.actor.subject.clone()),
+                    source_json: cstring(source_json(&action.source)),
+                    deadline_unix_ms: action.deadline_unix_ms().unwrap_or(-1),
+                    deadline: action.deadline_instant(),
+                    reply: Some(tx),
+                    stopped: stopped.clone(),
+                    _rt: rt,
+                };
+                let pointer = Box::into_raw(Box::new(owned));
+                // SAFETY: the game's callback with its own user_data; the game
+                // now owns pointer (header contract).
+                unsafe { (target.callback)(target.user_data, pointer) };
+            }
+            async move {
+                match rx.await {
+                    Ok(reply) => reply,
+                    // Replied after gs_actions_stop, or freed then: post nothing.
+                    Err(_) if stopped.load(Ordering::SeqCst) => {
+                        std::future::pending::<gs::ActionReply>().await
+                    }
+                    Err(_) => gs::ActionReply::error(
+                        "game/no_reply",
+                        "the game freed the action without replying",
+                    ),
+                }
+            }
+        };
+        let receiver = {
+            let _entered = client.rt.get().enter();
+            sdk(client.client.spawn_action_receiver(options, handler))?
+        };
+        let handle = GsActionReceiver {
+            receiver: Mutex::new(Some(Arc::new(receiver))),
+            stopped,
+            rt: client.rt.clone(),
+        };
+        // SAFETY: checked non-NULL above.
+        unsafe { put(out, Box::into_raw(Box::new(handle))) };
+        Ok(())
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// Stops polling, tells the edge, and waits up to timeout_ms for the actions
+/// the game holds to be replied to. GS_STATUS_TIMEOUT when some were not:
+/// their later replies return GS_STATUS_RUNTIME and post nothing (the edge
+/// ends them as "unknown"); free them with gs_action_free. Blocks: not from
+/// a Gridspawn callback. Free the receiver with gs_action_receiver_free.
+#[no_mangle]
+pub unsafe extern "C" fn gs_actions_stop(
+    receiver: *mut GsActionReceiver,
+    timeout_ms: u32,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        // SAFETY: header contract.
+        let handle = unsafe { handle(receiver, "receiver") }?;
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(GsError::invalid(
+                "blocking call from a Gridspawn callback or from inside an async runtime",
+            ));
+        }
+        let receiver =
+            take(&handle.receiver).ok_or_else(|| GsError::invalid("receiver stopped"))?;
+        let timeout = Duration::from_millis(u64::from(timeout_ms));
+        let running = block_on(&handle.rt, receiver.stop(timeout))?;
+        handle.stopped.store(true, Ordering::SeqCst);
+        if running > 0 {
+            return Err(GsError::new(
+                GsStatus::Timeout,
+                format!("{running} action(s) were not replied to before the timeout"),
+            ));
+        }
+        Ok(())
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// Counters as a JSON object ("polls", "received", "accepted", "refused",
+/// "expired", "coalesced", "resultsPosted", "resultsDuplicate",
+/// "resultsFailed", "invalidReplies", "running"); NULL for NULL or a stopped
+/// receiver. Free with gs_string_free.
+#[no_mangle]
+pub unsafe extern "C" fn gs_action_receiver_stats_json(
+    receiver: *const GsActionReceiver,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: NULL or a live handle (header contract).
+        let Some(stats) = unsafe { receiver.as_ref() }
+            .and_then(|r| live(&r.receiver))
+            .map(|r| r.stats())
+        else {
+            return ptr::null_mut();
+        };
+        let value = serde_json::json!({
+            "polls": stats.polls,
+            "received": stats.received,
+            "accepted": stats.accepted,
+            "refused": stats.refused,
+            "expired": stats.expired,
+            "coalesced": stats.coalesced,
+            "resultsPosted": stats.results_posted,
+            "resultsDuplicate": stats.results_duplicate,
+            "resultsFailed": stats.results_failed,
+            "invalidReplies": stats.invalid_replies,
+            "running": stats.running,
+        });
+        cstring(value.to_string()).into_raw()
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// The last failure (poll, ack, result, an invalid reply or a panicked
+/// handler): a new GsError to free with gs_error_free, or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn gs_action_receiver_last_error(
+    receiver: *const GsActionReceiver,
+) -> *mut GsError {
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: NULL or a live handle (header contract).
+        unsafe { receiver.as_ref() }
+            .and_then(|r| live(&r.receiver))
+            .and_then(|r| r.last_error())
+            .map_or(ptr::null_mut(), |error| {
+                Box::into_raw(Box::new(GsError::from_sdk(&error)))
+            })
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// Stops the receiver at once (without telling the edge) and frees it. Actions
+/// the game still holds can no longer be replied to; free them. NULL is
+/// ignored.
+#[no_mangle]
+pub unsafe extern "C" fn gs_action_receiver_free(receiver: *mut GsActionReceiver) {
+    if receiver.is_null() {
+        return;
+    }
+    quietly(|| {
+        // SAFETY: allocated by the library, freed once (header contract).
+        let receiver = unsafe { Box::from_raw(receiver) };
+        receiver.stopped.store(true, Ordering::SeqCst);
+        drop(take(&receiver.receiver));
+    });
+}
+
+/// SAFETY: `action` is NULL or a live GsAction for `'a`.
+unsafe fn action_ref<'a>(action: *const GsAction) -> Option<&'a GsAction> {
+    // SAFETY: per the contract.
+    unsafe { action.as_ref() }
+}
+
+/// The action id ("gsa1.…"): the game's durable dedupe key. NULL for NULL.
+#[no_mangle]
+pub unsafe extern "C" fn gs_action_id(action: *const GsAction) -> *const c_char {
+    // SAFETY: header contract.
+    unsafe { action_ref(action) }.map_or(ptr::null(), |a| a.id.as_ptr())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gs_action_name(action: *const GsAction) -> *const c_char {
+    // SAFETY: header contract.
+    unsafe { action_ref(action) }.map_or(ptr::null(), |a| a.name.as_ptr())
+}
+
+/// 0 for NULL.
+#[no_mangle]
+pub unsafe extern "C" fn gs_action_version(action: *const GsAction) -> u32 {
+    // SAFETY: header contract.
+    unsafe { action_ref(action) }.map_or(0, |a| a.version)
+}
+
+/// 1, or 2 on the single redelivery. 0 for NULL.
+#[no_mangle]
+pub unsafe extern "C" fn gs_action_attempt(action: *const GsAction) -> u32 {
+    // SAFETY: header contract.
+    unsafe { action_ref(action) }.map_or(0, |a| a.attempt)
+}
+
+/// The payload, a JSON object of at most 4 KiB. Never trusted.
+#[no_mangle]
+pub unsafe extern "C" fn gs_action_payload_json(action: *const GsAction) -> *const c_char {
+    // SAFETY: header contract.
+    unsafe { action_ref(action) }.map_or(ptr::null(), |a| a.payload_json.as_ptr())
+}
+
+/// The player's pairwise subject ("gss_…"), as the game got it at sign-in.
+#[no_mangle]
+pub unsafe extern "C" fn gs_action_subject(action: *const GsAction) -> *const c_char {
+    // SAFETY: header contract.
+    unsafe { action_ref(action) }.map_or(ptr::null(), |a| a.subject.as_ptr())
+}
+
+/// Where the press came from: {"kind": "club_block", "clubId"?, "channelId"?,
+/// "blockId"?}.
+#[no_mangle]
+pub unsafe extern "C" fn gs_action_source_json(action: *const GsAction) -> *const c_char {
+    // SAFETY: header contract.
+    unsafe { action_ref(action) }.map_or(ptr::null(), |a| a.source_json.as_ptr())
+}
+
+/// The deadline as the edge sent it, in milliseconds since 1970 on the
+/// edge's clock: for display and logs only. The receiver never compares it
+/// with this machine's clock; use gs_action_remaining_ms. -1 for NULL or
+/// unreadable.
+#[no_mangle]
+pub unsafe extern "C" fn gs_action_deadline_unix_ms(action: *const GsAction) -> i64 {
+    // SAFETY: header contract.
+    unsafe { action_ref(action) }.map_or(-1, |a| a.deadline_unix_ms)
+}
+
+/// Milliseconds left until the deadline hint, measured on this machine's
+/// monotonic clock from when the action arrived; 0 once past (replying later
+/// is allowed, for 60 s more). 0 for NULL.
+#[no_mangle]
+pub unsafe extern "C" fn gs_action_remaining_ms(action: *const GsAction) -> u64 {
+    // SAFETY: header contract.
+    unsafe { action_ref(action) }.map_or(0, |a| {
+        u64::try_from(
+            a.deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX)
+    })
+}
+
+/// Consumes `action` and hands `reply` to the receiver. GS_STATUS_RUNTIME
+/// after gs_actions_stop or gs_action_receiver_free (nothing posted; the
+/// action is freed all the same).
+///
+/// SAFETY: `action` is a live GsAction the caller owns.
+unsafe fn send_reply(action: *mut GsAction, reply: gs::ActionReply) -> Result<(), GsError> {
+    // SAFETY: allocated by the library, consumed once (header contract).
+    let mut owned = unsafe { Box::from_raw(action) };
+    if owned.stopped.load(Ordering::SeqCst) {
+        return Err(GsError::new(
+            GsStatus::Runtime,
+            "the action receiver was stopped; nothing was posted",
+        ));
+    }
+    let sent = owned.reply.take().map(|tx| tx.send(reply).is_ok());
+    if sent != Some(true) {
+        return Err(GsError::new(
+            GsStatus::Runtime,
+            "the action receiver is gone; nothing was posted",
+        ));
+    }
+    Ok(())
+}
+
+/// Replies "ok". data_json: NULL, or a JSON object of at most 1 KiB the
+/// block may show (for example {"balance": 120}). Never blocks; safe from the
+/// callback and from any thread. On GS_STATUS_OK or GS_STATUS_RUNTIME the
+/// action is consumed; on GS_STATUS_INVALID_ARGUMENT it is not (fix and
+/// reply again, or free it).
+#[no_mangle]
+pub unsafe extern "C" fn gs_action_reply_ok(
+    action: *mut GsAction,
+    data_json: *const c_char,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        require(action, "action")?;
+        // SAFETY: header contract.
+        let reply = match unsafe { optional_text(data_json, "data_json") }? {
+            None => gs::ActionReply::ok_empty(),
+            Some(text) => gs::ActionReply::ok(
+                serde_json::from_str(text)
+                    .map_err(|_| GsError::invalid("data_json is not JSON"))?,
+            ),
+        };
+        // SAFETY: non-NULL and owned by the caller (header contract).
+        unsafe { send_reply(action, reply) }
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// Replies "declined": a game reason. code: "game/snake_case" (3-64);
+/// user_message: plain text the person sees (at most 160 characters);
+/// detail: NULL, or developer-only text (at most 500). Never blocks. A reply
+/// that breaks these bounds is posted as error "game/invalid_reply" (see
+/// gs_action_receiver_last_error). Consumes the action as gs_action_reply_ok.
+#[no_mangle]
+pub unsafe extern "C" fn gs_action_reply_declined(
+    action: *mut GsAction,
+    code: *const c_char,
+    user_message: *const c_char,
+    detail: *const c_char,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        require(action, "action")?;
+        // SAFETY: header contract.
+        let (code, message, detail) = unsafe {
+            (
+                text(code, "code")?,
+                text(user_message, "user_message")?,
+                optional_text(detail, "detail")?,
+            )
+        };
+        let mut reply = gs::ActionReply::declined(code, message);
+        if let Some(detail) = detail {
+            reply = reply.with_detail(detail);
+        }
+        // SAFETY: non-NULL and owned by the caller (header contract).
+        unsafe { send_reply(action, reply) }
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// Replies "error": the game could not process it. code: "game/snake_case";
+/// detail: NULL or developer-only text (at most 500). Never blocks. Consumes
+/// the action as gs_action_reply_ok.
+#[no_mangle]
+pub unsafe extern "C" fn gs_action_reply_error(
+    action: *mut GsAction,
+    code: *const c_char,
+    detail: *const c_char,
+    error: *mut *mut GsError,
+) -> GsStatus {
+    let body = || {
+        require(action, "action")?;
+        // SAFETY: header contract.
+        let (code, detail) = unsafe { (text(code, "code")?, optional_text(detail, "detail")?) };
+        let reply = gs::ActionReply::error(code, detail.unwrap_or_default());
+        // SAFETY: non-NULL and owned by the caller (header contract).
+        unsafe { send_reply(action, reply) }
+    };
+    // SAFETY: header contract for `error`.
+    unsafe { boundary(error, body) }
+}
+
+/// Frees an action without replying: the receiver posts error
+/// "game/no_reply" (nothing after gs_actions_stop). NULL is ignored.
+#[no_mangle]
+pub unsafe extern "C" fn gs_action_free(action: *mut GsAction) {
+    if action.is_null() {
+        return;
+    }
+    quietly(|| {
+        // SAFETY: allocated by the library, freed once (header contract).
+        drop(unsafe { Box::from_raw(action) });
+    });
+}
+
 // ---- errors ----------------------------------------------------------------
 
 /// SAFETY: NULL or a live GsError.
@@ -2631,5 +3121,24 @@ mod tests {
             assert_eq!(message, "internal error");
             gs_error_free(error);
         }
+    }
+
+    #[test]
+    fn a_panicked_action_handler_is_internal_not_an_invalid_argument() {
+        let panicked = GsError::from_sdk(&gs::Error::InvalidInput {
+            field: "action handler",
+            reason: "game/handler_panicked: the action handler panicked; nothing was posted",
+        });
+        assert_eq!(panicked.status, GsStatus::Internal);
+        assert!(panicked
+            .message
+            .to_str()
+            .unwrap()
+            .contains("game/handler_panicked"));
+        let reply = GsError::from_sdk(&gs::Error::InvalidInput {
+            field: "action reply",
+            reason: "code",
+        });
+        assert_eq!(reply.status, GsStatus::InvalidArgument);
     }
 }

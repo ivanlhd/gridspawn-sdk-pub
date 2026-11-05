@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.6.0 (unreleased)
+
+Added (game actions, protocol 07, not deployed yet):
+- `Client::spawn_action_receiver(options, handler)` and `ActionReceiver`
+  (`stop(timeout)`, `stats()`, `last_error()`, `instance_id()`); `Action`,
+  `ActionActor`, `ActionSource`, `ActionReply` (`ok`, `ok_empty`, `declined`,
+  `error`, `with_detail`, `with_user_message`), `ActionReceiverOptions`
+  (`concurrency`, `poll_wait`) and `ActionStats`.
+  - The handler starts only after the edge accepts the ack; acks are retried
+    until answered; results until the window closes.
+  - Handlers are never cancelled. A repeated id is not run twice in one
+    process (the last 1,000 results are kept and posted again). Durable
+    dedupe across processes is the game's duty (README).
+  - Every timer uses the monotonic clock from the poll answer: the
+    envelope's absolute times are never compared with this machine's clock.
+  - Polls only with a free handler slot, asking for at most the free slots;
+    each delivered action holds its slot from the poll answer on.
+  - A reply that breaks the bounds is posted as `game/invalid_reply`; an
+    action past its deadline once accepted and given a slot as
+    `game/expired` without running. A panicking handler posts nothing (the
+    press ends `actions/unknown`); `last_error()` names
+    `game/handler_panicked`.
+- `blocking::Client::spawn_action_receiver_blocking` and
+  `blocking::ActionReceiver`.
+- `ErrorCode::ActionsDisabled`, `ActionsInvalid`, `ActionsNotFound`,
+  `ActionsResultTooLate`, `ActionsUnavailable`; `actions/rate_limited` maps to
+  `RateLimited`.
+
 ## 0.5.0 (2026-10-24)
 
 Breaking:

@@ -364,6 +364,64 @@ game.events().emit_with_id("round.won", json!({"round": 4}), "round-4-of-match-8
   and 256 KiB in total; values up to 4 KiB; 10 events a second; the listing
   10 per 10 s. The publisher stays within them by itself.
 
+## Do things for players (game actions)
+
+Not deployed yet (protocol 07 is Proposed). A club block can ask your game
+server to do something for the player who pressed it, for example buy an
+item with the game's own currency. The receiver polls the edge, confirms
+each action and posts your answer:
+
+```rust,no_run
+use gridspawn_server::{Action, ActionReceiverOptions, ActionReply};
+use serde_json::json;
+# async fn run(client: gridspawn_server::Client) -> Result<(), gridspawn_server::Error> {
+let receiver = client.spawn_action_receiver(
+    ActionReceiverOptions::new(["shop.buy"]).concurrency(4),
+    |action: Action| async move {
+        // Look the player up by action.actor.subject (the gss_… your game
+        // stored when they signed in with Gridspawn), check action.payload,
+        // then charge and deliver in ONE transaction keyed by action.id.
+        ActionReply::ok(json!({ "balance": 120 }))
+        // or ActionReply::declined("game/not_enough_gold", "Not enough gold.")
+        // or ActionReply::error("game/internal", "inventory store timeout")
+    },
+)?;
+// On shutdown: tell the edge and wait for running handlers.
+let still_running = receiver.stop(std::time::Duration::from_secs(10)).await;
+# let _ = still_running; Ok(()) }
+```
+
+- **Deduplicate on `action.id`, durably. This is required.** The receiver
+  never runs one id twice in this process, but after a restart, or on another
+  instance, the same id can reach a handler again. Insert `action.id` into a
+  uniquely keyed table in the same database transaction as the charge, before
+  anything else, in storage every instance shares. If the insert hits the
+  unique key, answer what you answered the first time.
+- Your handler runs only after the edge accepted the ack. It is never
+  cancelled: `action.remaining()` is a hint of how long the player is likely
+  to wait, and a later answer is still taken for 60 s more.
+- Times are measured on this machine's monotonic clock from when the action
+  arrived; the envelope's `issuedAt`/`deadline` are never compared with your
+  clock, so a skewed clock changes nothing.
+- The receiver polls only when a handler slot is free and asks for at most
+  the free slots, so an action never waits for a slot after its ack unless
+  the edge sends more than asked. An
+  action that is past its deadline once accepted and given a slot is
+  answered `game/expired` without running. A reply that breaks the bounds
+  (code `game/snake_case`, message ≤ 160 characters, detail ≤ 500, data an
+  object ≤ 1 KiB) is posted as `game/invalid_reply`, and
+  `receiver.last_error()` says why.
+- **A handler that panics posts nothing.** The player sees "could not
+  confirm" (`actions/unknown`) when the result window ends; only
+  `receiver.last_error()` names `game/handler_panicked`. The same id is not
+  run again in this process.
+- `receiver.stats()` counts polls, accepted and refused acks, results posted.
+- **Fallback you might not expect:** when the envelope's `issuedAt` or
+  `deadline` cannot be read, or `deadline - issuedAt` is negative or more
+  than 600 s, the deadline is 10 s from arrival.
+- The blocking facade has `spawn_action_receiver_blocking` with a plain
+  function, run on its own thread.
+
 ## Retries
 
 - Network errors, timeouts and HTTP 5xx are retried (`RetryPolicy`: 3

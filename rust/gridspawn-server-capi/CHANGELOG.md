@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.0 (unreleased)
+
+Mirrors `gridspawn-server` 0.6.0 (game actions, protocol 07, not deployed
+yet). Added only; no existing function, struct or enum value changed, and
+`GS_ABI_VERSION` stays 1.
+- `GsActionCallback`, `GsAction`, `GsActionReceiver`.
+- `gs_actions_start`, `gs_actions_stop`, `gs_action_receiver_free`,
+  `gs_action_receiver_stats_json`, `gs_action_receiver_last_error`.
+- `gs_action_id`, `_name`, `_version`, `_attempt`, `_payload_json`,
+  `_subject`, `_source_json`, `_remaining_ms` (monotonic) and
+  `_deadline_unix_ms` (display only).
+- `gs_action_reply_ok`, `_declined`, `_error` (never block) and
+  `gs_action_free` (posts `game/no_reply`).
+- `GsErrorCode` values 36–40: `GS_ERROR_CODE_ACTIONS_DISABLED`,
+  `_ACTIONS_INVALID`, `_ACTIONS_NOT_FOUND`, `_ACTIONS_RESULT_TOO_LATE`,
+  `_ACTIONS_UNAVAILABLE`.
+
 ## 0.4.0 (2026-10-24)
 
 Mirrors `gridspawn-server` 0.5.0.

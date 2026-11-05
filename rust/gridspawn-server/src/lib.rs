@@ -11,7 +11,10 @@
 //! - posts to the game's club with a club grant —
 //!   `docs/protocol/05-club.md`;
 //! - live game data and events for the club's pages ([`Client::game`]) —
-//!   `docs/protocol/06-game-data.md`.
+//!   `docs/protocol/06-game-data.md`;
+//! - game actions: the platform asks the game to do something for a
+//!   signed-in player ([`Client::spawn_action_receiver`]) —
+//!   `docs/protocol/07-game-actions.md`.
 //!
 //! ```no_run
 //! use gridspawn_server::{Client, Credential, Environment, IdempotencyKey, Post};
@@ -39,6 +42,7 @@
 //! answers are retried with the same Idempotency-Key ([`RetryPolicy`]); 429 is
 //! returned to the caller.
 
+mod actions;
 mod client;
 mod club;
 mod credential;
@@ -53,6 +57,10 @@ mod voice;
 #[cfg(feature = "blocking")]
 pub mod blocking;
 
+pub use actions::{
+    Action, ActionActor, ActionReceiver, ActionReceiverOptions, ActionReply, ActionSource,
+    ActionStats,
+};
 pub use client::{Client, ClientBuilder};
 pub use club::{Link, Post, PostReceipt};
 pub use credential::Credential;

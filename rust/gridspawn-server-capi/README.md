@@ -231,6 +231,79 @@ gs_string_free(event_id);
   - `_queued`, `_last_error`, `_flush`, `_shutdown` and `_free` work as for
     documents.
 
+## Game actions (do things for players)
+
+Not deployed yet (protocol 07 is Proposed). A club block can ask your game
+server to do something for the player who pressed it, for example buy an
+item with the game's own currency.
+
+```c
+static void on_action(void *user_data, GsAction *action) {
+    /* A runtime worker thread: queue the action to your main loop. */
+    my_queue_push(user_data, action);
+}
+
+GsActionReceiver *receiver = NULL;
+const char *names[] = { "shop.buy" };
+gs_actions_start(client, names, 1, 4, on_action, my_queue, &receiver, &error);
+
+/* Later, on your main loop (or any thread): */
+GsAction *action = my_queue_pop(my_queue);
+/* gs_action_id, _name, _version, _attempt, _payload_json, _subject,
+   _source_json, _remaining_ms */
+gs_action_reply_ok(action, "{\"balance\": 120}", &error);
+/* or gs_action_reply_declined(action, "game/not_enough_gold", "Not enough gold.", NULL, &error);
+   or gs_action_reply_error(action, "game/internal", "inventory store timeout", &error); */
+
+gs_actions_stop(receiver, 10000, &error);   /* blocks; not from the callback */
+gs_action_receiver_free(receiver);
+```
+
+- **Deduplicate on `gs_action_id`, durably. This is required.** The library
+  never runs one id twice in this process, but after a restart, or on
+  another instance, the same id can reach your callback again. Insert the id
+  into a uniquely keyed table in the same database transaction as the charge,
+  before anything else, in storage every instance shares.
+- **The callback** runs on a runtime worker thread, only after the edge
+  accepted the ack. It must not call blocking `gs_*` functions (they are
+  refused there).
+- **The game owns each `GsAction`.** Reply with exactly one
+  `gs_action_reply_*`, from any thread, at any time inside the result window
+  (60 s after the deadline). A reply never blocks: it copies its arguments,
+  hands the result to the runtime and frees the action.
+  - `GS_STATUS_INVALID_ARGUMENT` (a NULL code, data that is not JSON) leaves
+    the action yours: fix the arguments, or free it.
+  - A reply that breaks the bounds (code `game/snake_case`, message ≤ 160
+    characters, detail ≤ 500, data an object ≤ 1 KiB) is posted as
+    `game/invalid_reply`; `gs_action_receiver_last_error` says why.
+  - `gs_action_free` without a reply posts `error` with `game/no_reply`.
+- **After `gs_actions_stop`** (or `gs_action_receiver_free`) a reply returns
+  `GS_STATUS_RUNTIME` and posts nothing, and still frees the action.
+  `gs_actions_stop` waits up to its timeout for held actions and returns
+  `GS_STATUS_TIMEOUT` when some were not replied to.
+- **Time:** use `gs_action_remaining_ms`, measured on this machine's
+  monotonic clock from when the action arrived. `gs_action_deadline_unix_ms`
+  is the edge's own timestamp, for display and logs only; the library never
+  compares it with your clock.
+- `gs_action_receiver_stats_json` gives counters (`polls`, `accepted`,
+  `refused`, `resultsPosted`, …).
+- **Slots:** the library polls only while fewer than `concurrency` actions
+  are held, and asks for at most the free slots. An action that is past its
+  deadline once accepted and given a slot is answered `game/expired`
+  without calling `on_action`.
+- **A panic inside the library while it hands an action over posts
+  nothing.** The player sees "could not confirm" (`actions/unknown`) when
+  the result window ends; only `gs_action_receiver_last_error` names
+  `game/handler_panicked` (in its message, status `GS_STATUS_INTERNAL`). Never let a C++ exception leave `on_action`
+  (undefined behaviour, not a panic the library can catch).
+- **Behaviour you might not expect:**
+  - When the envelope's `issuedAt` or `deadline` cannot be read, or
+    `deadline - issuedAt` is negative or more than 600 s, the deadline is
+    10 s from arrival.
+  - After `gs_actions_stop` times out, the replies to the actions still held
+    are dropped: they return `GS_STATUS_RUNTIME`, nothing is posted, and the
+    platform ends those presses as `actions/unknown`.
+
 ## Rules in short
 
 - Fallible functions return `GsStatus`. The last parameter, `GsError **`, may

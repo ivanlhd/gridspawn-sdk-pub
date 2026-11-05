@@ -39,6 +39,8 @@ pub(crate) struct Call<'a> {
     pub headers: &'a [(&'static str, &'static str)],
     /// Retry network errors, timeouts and 5xx per the policy.
     pub retry: bool,
+    /// This call's timeout instead of the client's (the action long poll).
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Clone)]
@@ -46,6 +48,7 @@ pub(crate) struct Http {
     // The crate's own client: no default headers, so never an Origin header.
     client: reqwest::Client,
     retry: RetryPolicy,
+    timeout: Duration,
 }
 
 impl Http {
@@ -56,7 +59,17 @@ impl Http {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| Error::Network(Arc::new(error)))?;
-        Ok(Self { client, retry })
+        Ok(Self {
+            client,
+            retry,
+            timeout,
+        })
+    }
+
+    /// The same settings with its own connection pool (pooled connections
+    /// belong to the runtime that opened them).
+    pub fn fresh(&self) -> Result<Self, Error> {
+        Self::new(self.timeout, self.retry.clone())
     }
 
     pub async fn send<T: DeserializeOwned>(&self, call: Call<'_>) -> Result<T, Error> {
@@ -116,6 +129,9 @@ impl Http {
         }
         for (name, value) in call.headers {
             request = request.header(*name, *value);
+        }
+        if let Some(timeout) = call.timeout {
+            request = request.timeout(timeout);
         }
         if let Some(body) = call.body {
             let bytes = serde_json::to_vec(body).map_err(|_| Error::InvalidInput {
