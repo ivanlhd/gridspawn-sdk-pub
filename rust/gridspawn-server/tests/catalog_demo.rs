@@ -1,5 +1,5 @@
 //! The catalog block demo shop fixture (tests/fixtures/catalog_demo.json,
-//! docs/catalog-block.md section 7.2), offline: it is one batch the service
+//! protocol 08-catalogs.md §9), offline: it is one batch the service
 //! accepts, written in the catalog contract's order (pages, then the index,
 //! then the open signal with its TTL). The live publisher is
 //! `live_catalog_demo` in tests/live.rs; the app tests read the same file.

@@ -5,7 +5,8 @@
 //! pairwise subject), and answers `ok` with the new balance, or `declined`
 //! with `game/not_enough_gold`. It takes two payloads:
 //! - `{"itemId": "...", "quantity": n}`;
-//! - a catalog block's press (docs/catalog-block.md §5.1): `{"shop",
+//! - a catalog block's press (game actions, protocol 07-game-actions.md,
+//!   Proposed; this payload is not in the protocol yet): `{"shop",
 //!   "recordId", "quantity", "expectedPrice", "currency": "gold", "fields"}`.
 //!   A press made at a price that has since changed is declined with
 //!   `game/price_changed`.

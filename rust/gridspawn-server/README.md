@@ -7,7 +7,8 @@ your game's club, and live game data for your club's pages. Server-side only
 
 It speaks the wire protocol one to one: `02-sessions.md` (sessions,
 admission, tickets), `05-club.md` (club posts) and `06-game-data.md` (game
-data) in the protocol docs (`docs/protocol/` in the public repository).
+data, with catalogs in `08-catalogs.md`) in the protocol docs
+(`docs/protocol/` in the public repository).
 Requests never carry an `Origin` header.
 
 Status: 0.5.0, source only, not on crates.io yet. Licence: MIT OR Apache-2.0
@@ -333,6 +334,14 @@ game.events().emit_with_id("round.won", json!({"round": 4}), "round-4-of-match-8
   - **Every update sends the whole set;** an empty set shows nothing.
   - **Checked here:** at most 64 markers, finite coordinates, a `kind` of at
     most 32 characters, and 4 KiB in all (about 60 bytes per marker).
+- **A shop for your club (catalogs, protocol `08-catalogs.md`):** an index
+  document (`shop.<name>`), pages of records (`shop.<name>.p0`, `.p1`, …)
+  and an optional open signal (`shop.<name>.live`) that a club's catalog
+  block lists with filters, search and sorting. They are plain documents,
+  published with the calls above; protocol 08 gives their shapes, the size
+  budget (about 1,200 to 1,500 records per environment) and the write order
+  (pages before the index that lists them). The test fixture
+  `tests/fixtures/catalog_demo.json` is a complete demo shop of 40 items.
 - **`list()` is for start-up and checks, not for polling** (10 per 10 s).
 - The `blocking` client has `game_data_set`, `game_data_remove`,
   `game_data_set_many`, `game_data_list` and `game_event_emit` (no background

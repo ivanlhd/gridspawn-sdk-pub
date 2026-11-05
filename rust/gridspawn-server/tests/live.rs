@@ -580,7 +580,7 @@ async fn live_game_post() {
     eprintln!("game post ok: {} then duplicate", first.id);
 }
 
-/// The catalog block demo shop (docs/catalog-block.md section 7.2) on the
+/// The catalog block demo shop (protocol 08-catalogs.md §9) on the
 /// test application's development data: publishes
 /// tests/fixtures/catalog_demo.json as one batch in its write order (pages,
 /// index, open signal with its TTL), then every 30 s republishes one page

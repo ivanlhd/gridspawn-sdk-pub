@@ -1,5 +1,5 @@
 {
-  "about": "The catalog block demo shop (docs/catalog-block.md section 7.2), in write order: the pages, then the index, then the open signal with its TTL. One source of truth: the SDK live publisher (tests/live.rs, live_catalog_demo) and the app tests read this file.",
+  "about": "The catalog block demo shop (protocol 08-catalogs.md section 9), in write order: the pages, then the index, then the open signal with its TTL. One source of truth: the SDK live publisher (tests/live.rs, live_catalog_demo) and the app tests read this file.",
   "documents": [
     {
       "key": "shop.demo.p0",

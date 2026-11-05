@@ -159,6 +159,13 @@ objectives or events.
 - **Status:** storing and reading markers is live. Drawing them on club pages
   comes with the next Gridspawn app release.
 
+### 2.4 Catalogs (Current)
+
+A **catalog** (a shop, or any list of records that club pages list with
+filters, search and sorting) is a set of ordinary documents: an index,
+pages of records, and an optional open signal. Its keys, shapes, size
+budget and write order are in [08 Catalogs on club pages](08-catalogs.md).
+
 ## 3. Ordering — Current
 
 - **`seq`:** each `set` and `remove` entry carries its own integer, chosen
