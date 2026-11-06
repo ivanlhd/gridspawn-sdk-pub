@@ -96,6 +96,35 @@ No `Origin` header and no client authentication. Response 200:
 - Reject the response unless `token_type == "Bearer"`, both tokens are non-empty
   strings, `expires_in > 0`, and `user.subject`/`user.displayName` are strings (`auth.ts:267-293`).
 
+### From a browser page
+
+A web page, or an Electron renderer, calls the token, refresh, revoke and
+player-assertion routes with an `Origin` header. They answer with CORS only for
+an origin registered for the environment; any other origin gets 403
+`access_denied` (`sdk-auth-rs/src/http/handlers.rs`). The edge's bootstrap,
+session and presence routes, the Voice gateway and the SFU accept the same
+registered origin and bind it into the grants they issue (03, 04).
+
+A registered origin is one of (`sdk-storage-rs/src/models.rs`
+`canonical_origin`; the same rule in `voice-gateway-rs/src/auth/sdk_grant.rs`
+and `sfu/lib/sfu-auth.js`):
+
+- `https://<host>[:port]` or `http://<host>[:port]`, as the browser sends it
+  (lower case, default port dropped). The SFU accepts `http` only on
+  `localhost`, `127.0.0.1` and `[::1]`.
+- An app's own scheme, such as an Electron page served from `app://localhost`:
+  `<scheme>://<host>`, where the scheme is lower case, matches
+  `^[a-z][a-z0-9+.-]*$` and is not `http`, `https`, `ws`, `wss`, `ftp`,
+  `file`, `data`, `blob`, `javascript` or `about`; the host is 1 to 253
+  characters of `[a-z0-9.-]`; there is no port.
+
+No origin has a path other than `/`, a query, a fragment or userinfo. A
+request's `Origin` must equal a registered origin exactly. Origins are
+registered by the Gridspawn team on request; the developer console does not
+edit them yet. An origin is not a redirect URI: an Electron game receives the
+callback on a reverse-domain scheme (`com.studio.game:/oauth`) or on the
+loopback described in §1.
+
 ## 3. Refresh
 
 ```
