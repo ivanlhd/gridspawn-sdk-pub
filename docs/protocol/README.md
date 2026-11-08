@@ -20,7 +20,7 @@ Status legend used in every file:
 | [04 Voice](04-voice.md) | Current | `voice-gateway-rs`, `sfu/`, `sdk-api-edge-rs` |
 | [05 Club posts from game servers](05-club.md) | Current | `sdk-api-edge-rs`, `gridspawn-core-rs`, `chat-gateway-rs` |
 | [06 Game data from game servers](06-game-data.md) | Current | `sdk-api-edge-rs`, `app-rt-gateway-rs` |
-| [07 Game actions](07-game-actions.md) | Proposed | `sdk-api-edge-rs` |
+| [07 Game actions](07-game-actions.md) | Current | `sdk-api-edge-rs`, `app-rt-gateway-rs`, the Gridspawn app |
 | [08 Catalogs on club pages](08-catalogs.md) | Current | game data (06), the Gridspawn app |
 
 ## Hosts

@@ -119,11 +119,13 @@ and `sfu/lib/sfu-auth.js`):
   characters of `[a-z0-9.-]`; there is no port.
 
 No origin has a path other than `/`, a query, a fragment or userinfo. A
-request's `Origin` must equal a registered origin exactly. Origins are
-registered by the Gridspawn team on request; the developer console does not
-edit them yet. An origin is not a redirect URI: an Electron game receives the
-callback on a reverse-domain scheme (`com.studio.game:/oauth`) or on the
-loopback described in §1.
+request's `Origin` must equal a registered origin exactly. The game's owner
+adds origins per environment in the Dev Hub, in the game's client settings
+(Sign-in and modules, "Browser origins"): up to 10 per environment, stored in
+the form above and refused with a reason when they break these rules or repeat
+one already in the list. An origin is not a redirect URI: an Electron game
+receives the callback on a reverse-domain scheme (`com.studio.game:/oauth`) or
+on the loopback described in §1.
 
 ## 3. Refresh
 

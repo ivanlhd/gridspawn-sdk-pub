@@ -28,7 +28,7 @@ here; each commit names the upstream commit it came from.
 | `godot/gridspawn` | Godot 4.3+ addon (GDExtension) over the client SDKs: the `Gridspawn` autoload with sign-in, assertions, attach and presence as signals, and the `GridspawnVoice` node for in-game voice. Windows x86_64 and Linux x86_64. Prebuilt addon zips (Windows, Linux) with SHA-256 sums: [release godot-v0.4.0](https://github.com/ivanlhd/gridspawn-sdk-pub/releases/tag/godot-v0.4.0) (with voice, the game server's voice rules, and presence; [godot-v0.1.0](https://github.com/ivanlhd/gridspawn-sdk-pub/releases/tag/godot-v0.1.0) has sign-in and attach only); or build it from source (`godot/gridspawn/README.md`). |
 | `godot/example` | Minimal Godot project used by the addon's headless tests. |
 | `docs/protocol` | The wire protocol: login (01), sessions and module grants (02), presence (03), voice (04), club posts from game servers (05), live game data (06). |
-| `docs/platforms` | Platform guides: `rathena-companion.md` (the DLL and companion design and C surface) and `rathena-packets.md` (the proposed packet contract between an rAthena map-server and its client for party and guild voice). |
+| `docs/platforms` | Platform guides: `electron.md` (an Electron game with the npm packages), `rathena-companion.md` (the DLL and companion design and C surface) and `rathena-packets.md` (the proposed packet contract between an rAthena map-server and its client for party and guild voice). |
 
 ## Install (Rust)
 
@@ -51,6 +51,17 @@ Godot: `godot/gridspawn/addons/gridspawn/README.md`. rAthena / Ragexe:
 
 Your server key comes from the Gridspawn Dev Hub (Game servers → New server
 key). It is a secret for your game server only: never ship it in a game client.
+
+## Browser and Electron (JavaScript)
+
+The JavaScript SDK for browser and Electron game clients is on npm, not in
+this repository: [`@gridspawn/core`](https://www.npmjs.com/package/@gridspawn/core)
+(sign-in, player assertions, session attach) and
+[`@gridspawn/voice`](https://www.npmjs.com/package/@gridspawn/voice) (in-game
+voice). Each package's README covers its API. For an Electron game, read
+`docs/platforms/electron.md`. The game's page origin (`https://...`, or
+`app://localhost` for an Electron page) is added in the Dev Hub, in the game's
+client settings (Sign-in and modules, "Browser origins").
 
 ## Third-party code
 
@@ -83,4 +94,4 @@ dual licensed as above, without any additional terms or conditions.
 
 ---
 
-Synced from upstream commit `1ef23d52a`.
+Synced from upstream commit `d742d8ccb`.

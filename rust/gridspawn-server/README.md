@@ -375,10 +375,12 @@ game.events().emit_with_id("round.won", json!({"round": 4}), "round-4-of-match-8
 
 ## Do things for players (game actions)
 
-Not deployed yet (protocol 07 is Proposed). A club block can ask your game
-server to do something for the player who pressed it, for example buy an
-item with the game's own currency. The receiver polls the edge, confirms
-each action and posts your answer:
+Live since 2026-11-05 (protocol `docs/protocol/07-game-actions.md`,
+Current). A club block can ask your game server to do something for the
+player who pressed it: anything your game defines by an action name,
+for example buy an item with the game's own currency or register a game
+account from a club's form (07, "Actions from club pages"). The receiver polls the edge, confirms each action and
+posts your answer:
 
 ```rust,no_run
 use gridspawn_server::{Action, ActionReceiverOptions, ActionReply};

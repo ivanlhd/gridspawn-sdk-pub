@@ -233,9 +233,11 @@ gs_string_free(event_id);
 
 ## Game actions (do things for players)
 
-Not deployed yet (protocol 07 is Proposed). A club block can ask your game
-server to do something for the player who pressed it, for example buy an
-item with the game's own currency.
+Live since 2026-11-05 (protocol `docs/protocol/07-game-actions.md`,
+Current). A club block can ask your game server to do something for the
+player who pressed it: anything your game defines by an action name,
+for example buy an item with the game's own currency or register a game
+account from a club's form (07, "Actions from club pages").
 
 ```c
 static void on_action(void *user_data, GsAction *action) {

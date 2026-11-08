@@ -13,10 +13,10 @@ quotas, rates, `seq`, public by nature). This part says which documents make
 a catalog, what they hold, the order to write them in, and what a club page
 shows.
 
-**Not built yet:** buying from a row. A row has no button; that waits for
-game actions (07, Proposed). An index may already carry `actions` (§2), but
-no page uses it, so leave it out until 07 is Current. Images are not shown
-either (§3.2, `image`).
+**Not built yet:** buying from a row. A row has no button: game actions
+(07) are live, but the catalog block does not send one yet. An index may
+already carry `actions` (§2), but no page uses it, so leave it out until the
+catalog block does. Images are not shown either (§3.2, `image`).
 
 ## 1. The keys (Current)
 
@@ -77,7 +77,7 @@ A catalog is up to three kinds of documents of one app and one environment:
 | `fields` | no | The record schema: `[{ "id", "type", "label"?, "values"? }]`, at most 32 (§3.2). Without it, the app guesses (§3.3) |
 | `pages` | no | The page keys, in order (§1). This order, then each page's record order, is the catalog's "game order". A key listed twice counts once |
 | `live` | no | The open signal's key (§4) |
-| `actions` | no | Reserved for game actions (07, Proposed). Leave it out |
+| `actions` | no | Reserved for game actions (07); the catalog block does not use it yet. Leave it out |
 
 - **Ids** (record, field, group, tag value and currency `code`): text of 1
   to 64 characters, with no whitespace at the start or end and no line

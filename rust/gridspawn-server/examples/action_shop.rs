@@ -1,12 +1,12 @@
-//! A small shop that answers game actions (docs/game-sdk/game-actions.md;
-//! the A5 rehearsal, docs/game-sdk/a5-rehearsal.md).
+//! A small shop that answers game actions (protocol
+//! docs/protocol/07-game-actions.md).
 //!
 //! It receives `shop.buy`, keeps each player's gold in memory (keyed by the
 //! pairwise subject), and answers `ok` with the new balance, or `declined`
 //! with `game/not_enough_gold`. It takes two payloads:
 //! - `{"itemId": "...", "quantity": n}`;
-//! - a catalog block's press (game actions, protocol 07-game-actions.md,
-//!   Proposed; this payload is not in the protocol yet): `{"shop",
+//! - a catalog block's press (a game action, protocol 07-game-actions.md;
+//!   this payload is not described in the protocol yet): `{"shop",
 //!   "recordId", "quantity", "expectedPrice", "currency": "gold", "fields"}`.
 //!   A press made at a price that has since changed is declined with
 //!   `game/price_changed`.

@@ -1,6 +1,6 @@
 # Electron integration
 
-Status: **`@gridspawn/core` 0.2.0 and `@gridspawn/voice` 0.3.0 are implemented but unpublished. They are written for an Electron renderer with `contextIsolation` on, but have not been run in an Electron app yet.** The same packages serve the game's plain browser build (§6).
+Status: **`@gridspawn/core` 0.2.1 and `@gridspawn/voice` 0.3.1 on npm. A studio has run them in an Electron renderer with `contextIsolation` on: bootstrap, session attach and joining Voice work. Joining Voice needs core 0.2.1 (0.2.0 failed there with "Illegal invocation").** The same packages serve the game's plain browser build (§6).
 
 The renderer uses the browser packages as they are; they import no Node modules. Everything Electron-specific stays in the app's main process and preload script: serving the game, opening the sign-in page, and passing the OAuth callback back to the page over the app's own IPC.
 
@@ -38,8 +38,8 @@ app.whenReady().then(() => {
 
 ## 2. What to register
 
-- **Browser origin:** `app://localhost` (the page's `window.location.origin`), for each environment the game uses, plus the https origin of the plain browser build. Origins are registered by the Gridspawn team on request; the developer console does not edit them yet. Until it is registered, bootstrap answers 403 `config/origin_not_allowed`.
-- **Redirect URI**, in the developer console's client settings, one of:
+- **Browser origin:** `app://localhost` (the page's `window.location.origin`), for each environment the game uses, plus the https origin of the plain browser build. The game's owner adds them in the Dev Hub, in the game's client settings (Sign-in and modules, "Browser origins"). Until it is registered, bootstrap answers 403 `config/origin_not_allowed`.
+- **Redirect URI**, in the same Dev Hub client settings, one of:
   - a reverse-domain scheme the game owns, such as `com.studio.game:/oauth` (a scheme with a dot, then `:/` and a path);
   - Desktop sign-in (the loopback switch): `http://127.0.0.1<path>`, any port.
 
