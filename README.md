@@ -94,4 +94,4 @@ dual licensed as above, without any additional terms or conditions.
 
 ---
 
-Synced from upstream commit `d742d8ccb`.
+Synced from upstream commit `47f435d13`.

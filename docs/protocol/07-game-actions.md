@@ -255,7 +255,8 @@ In the Dev Hub, for your application:
 In the club, your game must be connected with its data shown in that
 environment; otherwise the press is refused before it reaches your server.
 The club's creator then puts the action on the page: in a Form block's Sending
-tab (the game, "Action name", "Version", then "Taking answers" on), or as a
+tab (the game, "Action name", the "Version" under "Advanced", then
+"Taking answers" on), or as a
 "Send game action" on a node.
 
 ## Reference client
